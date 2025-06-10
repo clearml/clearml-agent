@@ -141,7 +141,7 @@ DAEMON_ARGS = dict({
         'action': 'store_true',
     },
     '--use-owner-token': {
-        'help': 'Run the task under the identity of the task\'s owner: all calls made by the task code during execution '
+        'help': 'Run tasks under the identity of each task\'s owner: all calls made by the task code during execution '
                 'will use the owner\'s credentials instead of the agent\'s. This feature is available under the ClearML '
                 'Enterprise plan.',
         'action': 'store_true',
