@@ -1,5 +1,5 @@
 from os.path import expanduser
-from pathlib2 import Path
+from .._vendor.pathlib2 import Path
 
 from ..backend_config.environment import EnvEntry
 
@@ -40,6 +40,8 @@ ENV_CONFIG_PATH_OVERRIDE_VAR = EnvEntry('CLEARML_CONFIG_PATH', 'TRAINS_CONFIG_PA
 """ 
 Environment-related config path override environment variable. If this is set, no other env config path will be used. 
 """
+
+ENV_CONFIG_VERBOSE = EnvEntry("CLEARML_AGENT_CONFIG_VERBOSE", default=False, converter=bool)
 
 
 class Environment(object):

@@ -1,23 +1,31 @@
 import json
 import re
 import shlex
+from copy import copy
 
 from clearml_agent.backend_api.session import Request
+from clearml_agent.helper.docker_args import DockerArgsSanitizer
 from clearml_agent.helper.package.requirements import (
     RequirementsManager, MarkerRequirement,
     compare_version_rules, )
 
 
-def resolve_default_container(session, task_id, container_config):
+def resolve_default_container(session, task_id, container_config, ignore_match_rules=False):
     container_lookup = session.config.get('agent.default_docker.match_rules', None)
     if not session.check_min_api_version("2.13") or not container_lookup:
-        return container_config
+        return container_config, None
 
     # check backend support before sending any more requests (because they will fail and crash the Task)
     try:
         session.verify_feature_set('advanced')
     except ValueError:
-        return container_config
+        # ignoring matching rules only supported in higher tiers
+        return container_config, None
+
+    if ignore_match_rules:
+        print("INFO: default docker command line override, ignoring default docker container match rules")
+        # ignoring matching rules only supported in higher tiers
+        return container_config, None
 
     result = session.send_request(
         service='tasks',
@@ -26,7 +34,7 @@ def resolve_default_container(session, task_id, container_config):
         json={'id': [task_id],
               'only_fields': ['script.requirements', 'script.binary',
                               'script.repository', 'script.branch',
-                              'project', 'container'],
+                              'project', 'container', 'tags', 'user'],
               'search_hidden': True},
         method=Request.def_method,
         async_enable=False,
@@ -34,7 +42,7 @@ def resolve_default_container(session, task_id, container_config):
     try:
         task_info = result.json()['data']['tasks'][0] if result.ok else {}
     except (ValueError, TypeError):
-        return container_config
+        return container_config, None
 
     from clearml_agent.external.requirements_parser.requirement import Requirement
 
@@ -64,62 +72,50 @@ def resolve_default_container(session, task_id, container_config):
         except (ValueError, TypeError):
             pass
 
+    match_term_lookup = {
+        "project": project_full_name,
+        "project_id": task_info.get('project', ''),
+        "script.repository": repository,
+        "script.branch": branch,
+        "script.binary": binary,
+        "user_id": task_info.get('user', ""),
+        "container": requested_container.get('image', ''),
+        "tags": task_info.get('tags', []),
+    }
+
     task_packages_lookup = {}
     for entry in container_lookup:
         match = entry.get('match', None)
         if not match:
             continue
-        if match.get('project', None):
-            # noinspection PyBroadException
-            try:
-                if not re.search(match.get('project', None), project_full_name):
-                    continue
-            except Exception:
-                print('Failed parsing regular expression \"{}\" in rule: {}'.format(
-                    match.get('project', None), entry))
-                continue
-
-        if match.get('script.repository', None):
-            # noinspection PyBroadException
-            try:
-                if not re.search(match.get('script.repository', None), repository):
-                    continue
-            except Exception:
-                print('Failed parsing regular expression \"{}\" in rule: {}'.format(
-                    match.get('script.repository', None), entry))
-                continue
-
-        if match.get('script.branch', None):
-            # noinspection PyBroadException
-            try:
-                if not re.search(match.get('script.branch', None), branch):
-                    continue
-            except Exception:
-                print('Failed parsing regular expression \"{}\" in rule: {}'.format(
-                    match.get('script.branch', None), entry))
-                continue
-
-        if match.get('script.binary', None):
-            # noinspection PyBroadException
-            try:
-                if not re.search(match.get('script.binary', None), binary):
-                    continue
-            except Exception:
-                print('Failed parsing regular expression \"{}\" in rule: {}'.format(
-                    match.get('script.binary', None), entry))
-                continue
-
-        # if match.get('image', None):
-        #     # noinspection PyBroadException
-        #     try:
-        #         if not re.search(match.get('image', None), requested_container.get('image', '')):
-        #             continue
-        #     except Exception:
-        #         print('Failed parsing regular expression \"{}\" in rule: {}'.format(
-        #             match.get('image', None), entry))
-        #         continue
 
         matched = True
+        for key, value in match_term_lookup.items():
+            term = match.get(key, None)
+            if not term:
+                continue
+            values = [value] if not isinstance(value, (list, tuple)) else value
+            # noinspection PyBroadException
+            try:
+                terms = [term] if not isinstance(term, (list, tuple)) else term
+                # we fail if we didn't find ANY match in the list
+                if all(any(bool(re.search(t, v)) for v in values) for t in terms):
+                    # we found a match, go to the next match term
+                    pass
+                else:
+                    # no match, stop, and we should go to the next rule
+                    matched = False
+                    break
+            except Exception:
+                print('Failed parsing regular expression \"{}\" in rule: {}'.format(term, entry))
+                matched = False
+                break
+
+        # we had at least a single key that was Not matched in this rule, go to the next one
+        if not matched:
+            continue
+
+        # look for the complicated stuff (i.e. requirements)
         for req_section in ['script.requirements.pip', 'script.requirements.conda']:
             if not match.get(req_section, None):
                 continue
@@ -155,14 +151,29 @@ def resolve_default_container(session, task_id, container_config):
             matched = False
             break
 
+        # if we found a match in the rulebook
         if matched:
-            if not container_config.get('image'):
-                container_config['image'] = entry.get('image', None)
-            if not container_config.get('arguments'):
-                container_config['arguments'] = entry.get('arguments', None)
-                container_config['arguments'] = shlex.split(str(container_config.get('arguments') or '').strip())
-            print('Matching default container with rule:\n{}'.format(json.dumps(entry)))
-            return container_config
+            allow_override = bool(entry.get('force_container_rules', None))
+            container_config["force_container_rules"] = allow_override
 
-    return container_config
+            if not container_config.get('image') or allow_override:
+                container_config['image'] = entry.get('image', None) or ''
+
+            if not container_config.get('arguments') or allow_override:
+                container_config['arguments'] = entry.get('arguments', None) or ''
+
+            if not container_config.get('setup_shell_script') or allow_override:
+                container_config['setup_shell_script'] = entry.get('setup_shell_script', None) or ''
+                if isinstance(container_config['setup_shell_script'], (list, tuple)):
+                    container_config['setup_shell_script'] = "\n".join(container_config['setup_shell_script'])
+
+            update_back_task = entry.get('update_back_task', None)
+            if update_back_task is None:
+                update_back_task = session.config.get('agent.default_docker.update_back_task', None)
+
+            container_config['update_back_task'] = update_back_task
+
+            return container_config, entry
+
+    return container_config, None
 

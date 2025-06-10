@@ -9,9 +9,9 @@ from threading import Thread, Event
 from time import time
 from typing import Sequence, List, Union, Dict, Optional
 
-import attr
+from .._vendor import attr
 import psutil
-from pathlib2 import Path
+from .._vendor.pathlib2 import Path
 
 from clearml_agent.definitions import ENV_WORKER_TAGS, ENV_GPU_FRACTIONS
 from clearml_agent.session import Session
@@ -401,6 +401,7 @@ class ResourceMonitor(object):
                         fractions = self._fractions_handler.fractions
                         stats["gpu_fraction_{}".format(report_index)] = \
                             (fractions[i] if i < len(fractions) else fractions[-1]) if fractions else 1.0
+                    report_index += 1
 
             except Exception as ex:
                 # something happened and we can't use gpu stats,
@@ -438,24 +439,34 @@ class ResourceMonitor(object):
 class GpuFractionsHandler:
     _number_re = re.compile(r"^clear\.ml/fraction(-\d+)?$")
     _mig_re = re.compile(r"^nvidia\.com/mig-(?P<compute>[0-9]+)g\.(?P<memory>[0-9]+)gb$")
+    _frac_gpu_injector_re = re.compile(r"^clearml-injector/fraction$")
 
     _gpu_name_to_memory_gb = {
-        "A30": 24,
-        "NVIDIA A30": 24,
-        "A100-SXM4-40GB": 40,
-        "NVIDIA-A100-40GB-PCIe": 40,
-        "NVIDIA A100-40GB-PCIe": 40,
+        "NVIDIA-A30": 24,
+        "NVIDIA-A100-40GB-PCIE": 40,
         "NVIDIA-A100-SXM4-40GB": 40,
-        "NVIDIA A100-SXM4-40GB": 40,
         "NVIDIA-A100-SXM4-80GB": 79,
-        "NVIDIA A100-SXM4-80GB": 79,
-        "NVIDIA-A100-80GB-PCIe": 79,
-        "NVIDIA A100-80GB-PCIe": 79,
+        "NVIDIA-A100-80GB-PCIE": 79,
+        "NVIDIA-A100-PCIE-40GB": 40,
+        "NVIDIA-H100-80GB-HBM3": 80,
+        "NVIDIA-H100-PCIE": 80,
+        "NVIDIA-H100-SXM5-94GB": 94,
+        "NVIDIA-H100-SXM5-96GB": 96,
+        "NVIDIA-H100-PCIE-94GB": 94,
+        "NVIDIA-H100-PCIE-96GB": 96,
+        "NVIDIA-H100-SXM5-64GB": 64,
+        "NVIDIA-H100-SXM5-80GB": 80,
+        "NVIDIA-H800-PCIE-94GB": 94,
+        "NVIDIA-H800-PCIE-80GB": 80,
+        "NVIDIA-L40S": 48,
+        "NVIDIA-L40": 48,
+        "NVIDIA-L4": 48,
     }
 
     def __init__(self):
         self._total_memory_gb = [
-            self._gpu_name_to_memory_gb.get(name, 0)
+            (self._gpu_name_to_memory_gb.get(name.upper().replace(" ", "-")) or
+             self._gpu_name_to_memory_gb.get("NVIDIA-"+name.upper().replace(" ", "-"), 0))
             for name in (self._get_gpu_names() or [])
         ]
         self._fractions = self._get_fractions()
@@ -514,10 +525,14 @@ class GpuFractionsHandler:
         return 0
 
     @classmethod
-    def encode_fractions(cls, limits: dict) -> str:
-        if any(cls._number_re.match(x) for x in (limits or {})):
-            return ",".join(str(v) for k, v in sorted(limits.items()) if cls._number_re.match(k))
-        return ",".join(("{}:{}".format(k, v) for k, v in (limits or {}).items() if cls._mig_re.match(k)))
+    def encode_fractions(cls, limits: dict, annotations: dict) -> str:
+        if limits:
+            if any(cls._number_re.match(x) for x in (limits or {})):
+                return ",".join(str(v) for k, v in sorted(limits.items()) if cls._number_re.match(k))
+            return ",".join(("{}:{}".format(k, v) for k, v in (limits or {}).items() if cls._mig_re.match(k)))
+        elif annotations:
+            if any(cls._frac_gpu_injector_re.match(x) for x in (annotations or {})):
+                return ",".join(str(v) for k, v in sorted(annotations.items()) if cls._frac_gpu_injector_re.match(k))
 
     @staticmethod
     def decode_fractions(fractions: str) -> Union[List[float], Dict[str, int]]:

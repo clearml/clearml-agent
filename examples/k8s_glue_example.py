@@ -1,6 +1,6 @@
 """
 This example assumes you have preconfigured services with selectors in the form of
- "ai.allegro.agent.serial=pod-<number>" and a targetPort of 10022.
+ "ai.clearml.agent.serial=pod-<number>" and a targetPort of 10022.
 The K8sIntegration component will label each pod accordingly.
 """
 from argparse import ArgumentParser
@@ -22,7 +22,7 @@ def parse_args():
         action="store_true",
         default=False,
         help="Ports-Mode will add a label to the pod which can be used as service, in order to expose ports"
-             "Should not be used with max-pods"
+        "Should not be used with max-pods",
     )
     parser.add_argument(
         "--num-of-services",
@@ -34,15 +34,15 @@ def parse_args():
         "--base-port",
         type=int,
         help="Used in conjunction with ports-mode, specifies the base port exposed by the services. "
-             "For pod #X, the port will be <base-port>+X. Note that pod number is calculated based on base-pod-num"
-             "e.g. if base-port=20000 and base-pod-num=3, the port for the first pod will be 20003"
+        "For pod #X, the port will be <base-port>+X. Note that pod number is calculated based on base-pod-num"
+        "e.g. if base-port=20000 and base-pod-num=3, the port for the first pod will be 20003",
     )
     parser.add_argument(
         "--base-pod-num",
         type=int,
         default=1,
         help="Used in conjunction with ports-mode and base-port, specifies the base pod number to be used by the "
-             "service (default: %(default)s)"
+        "service (default: %(default)s)",
     )
     parser.add_argument(
         "--gateway-address",
@@ -62,7 +62,7 @@ def parse_args():
         "--template-yaml",
         type=str,
         help="YAML file containing pod template. If provided pod will be scheduled with kubectl apply "
-             "and overrides are ignored, otherwise it will be scheduled with kubectl run"
+        "and overrides are ignored, otherwise it will be scheduled with kubectl run",
     )
     parser.add_argument(
         "--ssh-server-port",
@@ -80,7 +80,7 @@ def parse_args():
         "--max-pods",
         type=int,
         help="Limit the maximum number of pods that this service can run at the same time."
-             "Should not be used with ports-mode"
+        "Should not be used with ports-mode",
     )
     parser.add_argument(
         "--use-owner-token",

@@ -17,17 +17,21 @@ def parse(reqstr, cwd=None):
     :param cwd: Optional current working dir for -r file.txt loading
     :returns: a *generator* of Requirement objects
     """
-    filename = getattr(reqstr, 'name', None)
-    try:
-        # Python 2.x compatibility
-        if not isinstance(reqstr, basestring):  # noqa
-            reqstr = reqstr.read()
-    except NameError:
-        # Python 3.x only
-        if not isinstance(reqstr, str):
-            reqstr = reqstr.read()
+    if isinstance(reqstr, list) and reqstr and isinstance(reqstr[0], str):
+        lines = reqstr
+    else:
+        filename = getattr(reqstr, 'name', None)
+        try:
+            # Python 2.x compatibility
+            if not isinstance(reqstr, basestring):  # noqa
+                reqstr = reqstr.read()
+        except NameError:
+            # Python 3.x only
+            if not isinstance(reqstr, str):
+                reqstr = reqstr.read()
+        lines = reqstr.splitlines()
 
-    for line in reqstr.splitlines():
+    for line in lines:
         line = line.strip()
         if line == '':
             continue

@@ -5,10 +5,10 @@ import sys
 from collections.abc import Iterable
 from typing import List, Dict, Text, Any
 
-from attr import attrs, attrib
+from .._vendor.attr import attrs, attrib
 
-import six
-from six import binary_type, text_type
+from .._vendor import six
+from .._vendor.six import binary_type, text_type
 from clearml_agent.helper.base import nonstrict_in_place_sort
 
 

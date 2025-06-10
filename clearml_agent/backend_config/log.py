@@ -1,6 +1,6 @@
 import logging.config
 
-from pathlib2 import Path
+from .._vendor.pathlib2 import Path
 
 
 def logger(path=None):

@@ -1,10 +1,8 @@
 from time import sleep
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List
 
 from clearml_agent.backend_api.session import Request
 from clearml_agent.glue.utilities import get_bash_output
-
-from clearml_agent.helper.process import stringify_bash_output
 
 from .daemon import K8sDaemon
 from .utilities import get_path
@@ -38,7 +36,11 @@ class PendingPodsDaemon(K8sDaemon):
         return get_path(pod, "metadata", "name")
 
     def _get_task_id(self, pod: dict):
-        return self._get_k8s_resource_name(pod).rpartition('-')[-1]
+        prefix, _, value = self._get_k8s_resource_name(pod).rpartition('-')
+        if len(value) > 4:
+            return value
+        # we assume this is a multi-node rank x (>0) pod
+        return prefix.rpartition('-')[-1] or value
 
     @staticmethod
     def _get_k8s_resource_namespace(pod: dict):
@@ -238,6 +240,11 @@ class PendingPodsDaemon(K8sDaemon):
             if not result.ok:
                 result_msg = get_path(result.json(), 'meta', 'result_msg')
                 raise Exception(result_msg or result.text)
+
+            self._agent.send_logs(
+                task_id, ["Kubernetes Pod status: {}".format(msg)],
+                session=self._session
+            )
 
             # update last msg for this task
             self._last_tasks_msgs[task_id] = msg

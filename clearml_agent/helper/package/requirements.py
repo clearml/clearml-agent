@@ -10,16 +10,16 @@ from operator import itemgetter
 from os import path
 from typing import Text, List, Type, Optional, Tuple, Dict
 
-from pathlib2 import Path
+from ..._vendor.pathlib2 import Path
 from clearml_agent.external.pyhocon import ConfigTree
 
-import six
-from six.moves.urllib.parse import unquote
+from ..._vendor import six
+from ..._vendor.six.moves.urllib.parse import unquote  # noqa
 import logging
 from clearml_agent.definitions import PIP_EXTRA_INDICES
 from clearml_agent.helper.base import (
     warning, is_conda, which, join_lines, is_windows_platform,
-    convert_cuda_version_to_int_10_base_str, )
+    convert_cuda_version_to_int_10_base_str, dump_yaml, )
 from clearml_agent.helper.process import Argv, PathLike
 from clearml_agent.helper.gpu.gpustat import get_driver_cuda_version
 from clearml_agent.session import Session, normalize_cuda_version
@@ -94,6 +94,12 @@ class MarkerRequirement(object):
     def __repr__(self):
         return '{self.__class__.__name__}[{self}]'.format(self=self)
 
+    def __eq__(self, other):
+        return isinstance(other, MarkerRequirement) and str(self) == str(other)
+
+    def __hash__(self):
+        return str(self).__hash__()
+
     def format_specs(self, num_parts=None, max_num_parts=None):
         max_num_parts = max_num_parts or num_parts
         if max_num_parts is None or not self.specs:
@@ -115,6 +121,10 @@ class MarkerRequirement(object):
     @property
     def specs(self):  # type: () -> List[Tuple[Text, Text]]
         return self.req.specs
+
+    @property
+    def version(self):  # type: () -> Text
+        return self.specs[0][1] if self.specs else ""
 
     @specs.setter
     def specs(self, value):  # type: (List[Tuple[Text, Text]]) -> None
@@ -143,6 +153,8 @@ class MarkerRequirement(object):
         If the requested version is 1.2 the self.spec should be 1.2*
         etc.
 
+        usage: it returns the value of the following comparison: requested_version "op" self.version
+
         :param str requested_version:
         :param str op: '==', '>', '>=', '<=', '<', '~='
         :param int num_parts: number of parts to compare
@@ -152,7 +164,7 @@ class MarkerRequirement(object):
         if not self.specs:
             return True
 
-        version = self.specs[0][1]
+        version = self.version
         op = (op or self.specs[0][0]).strip()
 
         return SimpleVersion.compare_versions(
@@ -170,11 +182,21 @@ class MarkerRequirement(object):
         self.req.local_file = False
         return True
 
-    def validate_local_file_ref(self):
+    def is_local_package_ref(self):
         # if local file does not exist, remove the reference to it
         if self.vcs or self.editable or self.path or not self.local_file or not self.name or \
                 not self.uri or not self.uri.startswith("file://"):
+            return False
+        return True
+
+    def is_vcs_ref(self):
+        return bool(self.vcs)
+
+    def validate_local_file_ref(self):
+        # if local file does not exist, remove the reference to it
+        if not self.is_local_package_ref():
             return
+
         local_path = Path(self.uri[len("file://"):])
         if not local_path.exists():
             local_path = Path(unquote(self.uri)[len("file://"):])
@@ -220,6 +242,19 @@ class SimpleVersion:
     """
     _local_version_separators = re.compile(r"[\._-]")
     _regex = re.compile(r"^\s*" + VERSION_PATTERN + r"\s*$", re.VERBOSE | re.IGNORECASE)
+
+    @classmethod
+    def split_op_version(cls, line):
+        """
+        Split a string in the form of ">=1.2.3" into a (op, version), i.e. (">=", "1.2.3")
+        Notice is calling with only a version string (e.g. "1.2.3") default operator is "=="
+        which means you get ("==", "1.2.3")
+        :param line: string examples: "<=0.1.2"
+        :return: tuple of (op, version) example ("<=", "0.1.2")
+        """
+        match = r"\s*([>=<~!]*)\s*(\S*)\s*"
+        groups = re.match(match, line).groups()
+        return groups[0] or "==", groups[1]
 
     @classmethod
     def compare_versions(cls, version_a, op, version_b, ignore_sub_versions=True, num_parts=3):
@@ -624,13 +659,53 @@ class RequirementsManager(object):
                 return handler.replace(req)
         return None
 
-    def replace(self, requirements):  # type: (Text) -> Text
+    def replace(
+            self,
+            requirements,  # type: Text
+            existing_packages=None,  # type: List[MarkerRequirement]
+            pkg_skip_existing_local=True,  # type: bool
+            pkg_skip_existing_vcs=True,  # type: bool
+            pkg_skip_existing=True,  # type: bool
+    ):  # type: (...) -> Text
         parsed_requirements = self.parse_requirements_section_to_marker_requirements(
-            requirements=requirements, cwd=self._cwd)
+            requirements=requirements, cwd=self._cwd, skip_local_file_validation=True)
 
+        if parsed_requirements and existing_packages:
+            skipped_packages = None
+            if pkg_skip_existing:
+                skipped_packages = set(parsed_requirements) & set(existing_packages)
+            elif pkg_skip_existing_local or pkg_skip_existing_vcs:
+                existing_packages = [
+                    p for p in existing_packages if (
+                        (pkg_skip_existing_local and p.is_local_package_ref()) or
+                        (pkg_skip_existing_vcs and p.is_vcs_ref())
+                    )
+                ]
+                skipped_packages = set(parsed_requirements) & set(existing_packages)
+
+            if skipped_packages:
+                # maintain order
+                num_skipped_packages = len(parsed_requirements)
+                parsed_requirements = [p for p in parsed_requirements if p not in skipped_packages]
+                num_skipped_packages -= len(parsed_requirements)
+                print("Skipping {} pre-installed packages:\n{}Remaining {} additional packages to install".format(
+                    num_skipped_packages,
+                    dump_yaml(sorted([str(p) for p in skipped_packages])),
+                    len(parsed_requirements)
+                ))
+
+                # nothing to install!
+                if not parsed_requirements:
+                    return ""
+
+        # sanity check
         if not parsed_requirements:
             # return the original requirements just in case
             return requirements
+
+        # remove local file reference that do not exist
+        for p in parsed_requirements:
+            p.validate_local_file_ref()
 
         def replace_one(i, req):
             # type: (int, MarkerRequirement) -> Optional[Text]
@@ -711,6 +786,13 @@ class RequirementsManager(object):
                 requirements=requirements, cwd=self._cwd)
         for h in self.handlers:
             h.set_is_already_installed_cb(self._callback_is_already_installed)
+
+    def get_installed_packages_state(self):
+        """
+        Return the internal Installed Packages objects, the one used internally so that later we can detect
+        :return requirements: is the list of requirements objects updated via self.update_installed_packages_state
+        """
+        return self._installed_parsed_packages
 
     def _callback_is_already_installed(self, req):
         for p in (self._installed_parsed_packages or []):
@@ -805,7 +887,7 @@ class RequirementsManager(object):
                 normalize_cuda_version(cudnn_version or 0))
 
     @staticmethod
-    def parse_requirements_section_to_marker_requirements(requirements, cwd=None):
+    def parse_requirements_section_to_marker_requirements(requirements, cwd=None, skip_local_file_validation=False):
         def safe_parse(req_str):
             # noinspection PyBroadException
             try:
@@ -815,7 +897,8 @@ class RequirementsManager(object):
 
         def create_req(x):
             r = MarkerRequirement(x)
-            r.validate_local_file_ref()
+            if not skip_local_file_validation:
+                r.validate_local_file_ref()
             return r
 
         if not requirements:

@@ -14,10 +14,10 @@ from time import sleep
 from typing import Union, Text, Sequence, Any, TypeVar, Callable
 
 import psutil
-from furl import furl
-from pathlib2 import Path
+from .._vendor.furl import furl
+from .._vendor.pathlib2 import Path
 
-import six
+from .._vendor import six
 from clearml_agent.definitions import PROGRAM_NAME, CONFIG_FILE
 from clearml_agent.helper.base import bash_c, is_windows_platform, select_for_platform, chain_map
 
@@ -89,13 +89,20 @@ def kill_all_child_processes(pid=None, include_parent=True):
     print("\nLeaving process id {}".format(pid))
     try:
         parent = psutil.Process(pid)
-    except psutil.Error:
-        # could not find parent process id
+    except psutil.Error as ex:
+        # could not find process id
+        print("ERROR: could not find process id {}: {}".format(pid, ex))
         return
     for child in parent.children(recursive=True):
-        child.kill()
+        try:
+            child.kill()
+        except:
+            print("ERROR: could not kill child process id {}".format(child))
     if include_parent:
-        parent.kill()
+        try:
+            parent.kill()
+        except:
+            print("ERROR: could not kill parent process id {}".format(parent))
 
 
 def terminate_all_child_processes(pid=None, timeout=10., include_parent=True):
@@ -106,7 +113,7 @@ def terminate_all_child_processes(pid=None, timeout=10., include_parent=True):
     try:
         parent = psutil.Process(pid)
     except psutil.Error:
-        # could not find parent process id
+        # could not find process id
         return
     for child in parent.children(recursive=False):
         print('Terminating child process {}'.format(child.pid))
@@ -226,6 +233,8 @@ class Argv(Executable):
         """
         self.argv = argv
         self._log = kwargs.pop("log", None)
+        self._env = kwargs.pop("env", None)
+        self._cwd = kwargs.pop("cwd", None)
         self._display_argv = kwargs.pop("display_argv", argv)
         if not self._log:
             self._log = logging.getLogger(__name__)
@@ -241,6 +250,14 @@ class Argv(Executable):
 
     def call_subprocess(self, func, censor_password=False, *args, **kwargs):
         self._log.debug("running: %s: %s", func.__name__, list(self))
+        if self._env:
+            env = copy(self._env)
+            kwargs = copy(kwargs)
+            env.update(kwargs.get("env", {}))
+            kwargs["env"] = env
+        if self._cwd and not kwargs.get("cwd"):
+            kwargs["cwd"] = self._cwd
+
         with self.normalize_exception(censor_password):
             return func(list(self), *args, **kwargs)
 

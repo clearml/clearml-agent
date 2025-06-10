@@ -3,12 +3,12 @@ debug service
 
 Debugging utilities
 """
-import six
+from ...._vendor import six
 import types
 from datetime import datetime
 import enum
 
-from dateutil.parser import parse as parse_datetime
+from ...._vendor.dateutil.parser import parse as parse_datetime
 
 from ....backend_api.session import Request, BatchRequest, Response, DataModel, NonStrictDataModel, CompoundRequest, schema_property, StringEnum
 

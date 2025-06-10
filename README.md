@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="https://github.com/allegroai/clearml-agent/blob/master/docs/clearml_agent_logo.png?raw=true" width="250px">
+<img src="https://github.com/clearml/clearml-agent/blob/master/docs/clearml_agent_logo.png?raw=true" width="250px">
 
 **ClearML Agent - MLOps/LLMOps made easy  
 MLOps/LLMOps scheduler & orchestration solution supporting Linux, macOS and Windows**
 
-[![GitHub license](https://img.shields.io/github/license/allegroai/clearml-agent.svg)](https://img.shields.io/github/license/allegroai/clearml-agent.svg)
+[![GitHub license](https://img.shields.io/github/license/clearml/clearml-agent.svg)](https://img.shields.io/github/license/clearml/clearml-agent.svg)
 [![PyPI pyversions](https://img.shields.io/pypi/pyversions/clearml-agent.svg)](https://img.shields.io/pypi/pyversions/clearml-agent.svg)
 [![PyPI version shields.io](https://img.shields.io/pypi/v/clearml-agent.svg)](https://img.shields.io/pypi/v/clearml-agent.svg)
 [![PyPI Downloads](https://pepy.tech/badge/clearml-agent/month)](https://pypi.org/project/clearml-agent/)
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/allegroai)](https://artifacthub.io/packages/search?repo=allegroai)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/clearml)](https://artifacthub.io/packages/search?repo=clearml)
 
 `🌟 ClearML is open-source - Leave a star to support the project! 🌟`
 
@@ -33,21 +33,21 @@ It is a zero configuration fire-and-forget execution agent, providing a full ML/
 
 **Full Automation in 5 steps**
 
-1. ClearML Server [self-hosted](https://github.com/allegroai/clearml-server)
+1. ClearML Server [self-hosted](https://github.com/clearml/clearml-server)
    or [free tier hosting](https://app.clear.ml)
 2. `pip install clearml-agent` ([install](#installing-the-clearml-agent) the ClearML Agent on any GPU machine:
    on-premises / cloud / ...)
 3. Create a [job](https://clear.ml/docs/latest/docs/apps/clearml_task) or
-   add [ClearML](https://github.com/allegroai/clearml) to your code with just 2 lines of code
+   add [ClearML](https://github.com/clearml/clearml) to your code with just 2 lines of code
 4. Change the [parameters](#using-the-clearml-agent) in the UI & schedule for [execution](#using-the-clearml-agent) (or
    automate with an [AutoML pipeline](#automl-and-orchestration-pipelines-))
 5. :chart_with_downwards_trend: :chart_with_upwards_trend: :eyes:  :beer:
 
 "All the Deep/Machine-Learning DevOps your research needs, and then some... Because ain't nobody got time for that"
 
-**Try ClearML now** [Self Hosted](https://github.com/allegroai/clearml-server)
+**Try ClearML now** [Self Hosted](https://github.com/clearml/clearml-server)
 or [Free tier Hosting](https://app.clear.ml)
-<a href="https://app.clear.ml"><img src="https://github.com/allegroai/clearml-agent/blob/master/docs/screenshots.gif?raw=true" width="100%"></a>
+<a href="https://app.clear.ml"><img src="https://github.com/clearml/clearml-agent/blob/master/docs/screenshots.gif?raw=true" width="100%"></a>
 
 ### Simple, Flexible Experiment Orchestration
 
@@ -71,7 +71,7 @@ or [Free tier Hosting](https://app.clear.ml)
 We think Kubernetes is awesome, but it is not a must to get started with remote execution agents and cluster management.
 We designed `clearml-agent` so you can run both bare-metal and on top of Kubernetes, in any combination that fits your environment.
 
-You can find the Dockerfiles in the [docker folder](./docker) and the helm Chart in https://github.com/allegroai/clearml-helm-charts
+You can find the Dockerfiles in the [docker folder](./docker) and the helm Chart in https://github.com/clearml/clearml-helm-charts
 
 #### Benefits of integrating existing Kubernetes cluster with ClearML
 
@@ -86,8 +86,8 @@ You can find the Dockerfiles in the [docker folder](./docker) and the helm Chart
 - **Enterprise Features**: RBAC, vault, multi-tenancy, scheduler, quota management, fractional GPU support 
 
 **Run the agent in Kubernetes Glue mode an map ClearML jobs directly to K8s jobs:**
-- Use the [ClearML Agent Helm Chart](https://github.com/allegroai/clearml-helm-charts/tree/main/charts/clearml-agent) to spin an agent pod acting as a controller
-  - Or run the [clearml-k8s glue](https://github.com/allegroai/clearml-agent/blob/master/examples/k8s_glue_example.py) on
+- Use the [ClearML Agent Helm Chart](https://github.com/clearml/clearml-helm-charts/tree/main/charts/clearml-agent) to spin an agent pod acting as a controller
+  - Or run the [clearml-k8s glue](https://github.com/clearml/clearml-agent/blob/master/examples/k8s_glue_example.py) on
     a Kubernetes cpu node
 - The clearml-k8s glue pulls jobs from the ClearML job execution queue and prepares a Kubernetes job (based on provided
   yaml template)
@@ -151,7 +151,7 @@ The ClearML Agent executes experiments using the following process:
 
 #### System Design & Flow
 
-<img src="https://github.com/allegroai/clearml-agent/blob/master/docs/clearml_architecture.png" width="100%" alt="clearml-architecture">
+<img src="https://github.com/clearml/clearml-agent/blob/master/docs/clearml_architecture.png" width="100%" alt="clearml-architecture">
 
 #### Installing the ClearML Agent
 
@@ -279,7 +279,7 @@ clearml-agent daemon --detached --gpus 0 --queue default --docker nvidia/cuda:11
 
 ### How do I create an experiment on the ClearML Server? <a name="from-scratch"></a>
 
-* Integrate [ClearML](https://github.com/allegroai/clearml) with your code
+* Integrate [ClearML](https://github.com/clearml/clearml) with your code
 * Execute the code on your machine (Manually / PyCharm / Jupyter Notebook)
 * As your code is running, **ClearML** creates an experiment logging all the necessary execution information:
     - Git repository link and commit ID (or an entire jupyter notebook)
@@ -326,21 +326,21 @@ The ClearML Agent can also be used to implement AutoML orchestration and Experim
 ClearML package.
 
 Sample AutoML & Orchestration examples can be found in the
-ClearML [example/automation](https://github.com/allegroai/clearml/tree/master/examples/automation) folder.
+ClearML [example/automation](https://github.com/clearml/clearml/tree/master/examples/automation) folder.
 
 AutoML examples:
 
-- [Toy Keras training experiment](https://github.com/allegroai/clearml/blob/master/examples/optimization/hyper-parameter-optimization/base_template_keras_simple.py)
+- [Toy Keras training experiment](https://github.com/clearml/clearml/blob/master/examples/optimization/hyper-parameter-optimization/base_template_keras_simple.py)
     - In order to create an experiment-template in the system, this code must be executed once manually
-- [Random Search over the above Keras experiment-template](https://github.com/allegroai/clearml/blob/master/examples/automation/manual_random_param_search_example.py)
+- [Random Search over the above Keras experiment-template](https://github.com/clearml/clearml/blob/master/examples/automation/manual_random_param_search_example.py)
     - This example will create multiple copies of the Keras experiment-template, with different hyperparameter
       combinations
 
 Experiment Pipeline examples:
 
-- [First step experiment](https://github.com/allegroai/clearml/blob/master/examples/automation/task_piping_example.py)
+- [First step experiment](https://github.com/clearml/clearml/blob/master/examples/automation/task_piping_example.py)
     - This example will "process data", and once done, will launch a copy of the 'second step' experiment-template
-- [Second step experiment](https://github.com/allegroai/clearml/blob/master/examples/automation/toy_base_task.py)
+- [Second step experiment](https://github.com/clearml/clearml/blob/master/examples/automation/toy_base_task.py)
     - In order to create an experiment-template in the system, this code must be executed once manually
 
 ### License

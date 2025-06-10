@@ -1,8 +1,8 @@
 import itertools
 import re
 
-import attr
-import six
+from ..._vendor import attr
+from ..._vendor import six
 
 from clearml_agent.external import pyhocon
 

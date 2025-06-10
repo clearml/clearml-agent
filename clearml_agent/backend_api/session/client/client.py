@@ -12,7 +12,7 @@ from operator import itemgetter
 from types import ModuleType
 from typing import Dict, Text, Tuple, Type, Any, Sequence
 
-import six
+from ...._vendor import six
 from ... import services as api_services
 from ....backend_api.session import CallResult
 from ....backend_api.session import Session, Request as APIRequest

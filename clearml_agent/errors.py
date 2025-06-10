@@ -1,7 +1,7 @@
 from typing import Union, Optional, Text
 
 import requests
-import six
+from ._vendor import six
 from .backend_api import CallResult
 from .backend_api.session.client import APIError as ClientAPIError
 from .backend_api.session.response import ResponseMeta

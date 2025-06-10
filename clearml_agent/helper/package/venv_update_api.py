@@ -1,9 +1,9 @@
 from typing import Optional, Text
 
 import requests
-from pathlib2 import Path
+from ..._vendor.pathlib2 import Path
 
-import six
+from ..._vendor import six
 from clearml_agent.definitions import CONFIG_DIR
 from clearml_agent.helper.process import Argv, DEVNULL
 from .pip_api.venv import VirtualenvPip

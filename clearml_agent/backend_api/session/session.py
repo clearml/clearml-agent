@@ -8,12 +8,12 @@ from random import SystemRandom
 from socket import gethostname
 from typing import Optional
 
-import jwt
+from ..._vendor import jwt
 import requests
-import six
+from ..._vendor import six
 from requests import RequestException
 from requests.auth import HTTPBasicAuth
-from six.moves.urllib.parse import urlparse, urlunparse
+from ..._vendor.six.moves.urllib.parse import urlparse, urlunparse
 
 from clearml_agent.external.pyhocon import ConfigTree, ConfigFactory
 from .callresult import CallResult
@@ -64,6 +64,8 @@ class Session(TokenManager):
     default_key = "EGRTCO8JMSIGI6S39GTP43NFWXDQOW"
     default_secret = "x!XTov_G-#vspE*Y(h$Anm&DIc5Ou-F)jsl$PdOyj5wG1&E!Z8"
     force_max_api_version = ENV_FORCE_MAX_API_VERSION.get()
+    server_version = "1.0.0"
+    user_id = None
 
     # TODO: add requests.codes.gateway_timeout once we support async commits
     _retry_codes = [
@@ -191,6 +193,8 @@ class Session(TokenManager):
 
             Session.api_version = str(api_version)
             Session.feature_set = str(token_dict.get('feature_set', self.feature_set) or "basic")
+            Session.server_version = token_dict.get('server_version', self.server_version)
+            Session.user_id = (token_dict.get("identity") or {}).get("user") or ""
         except (jwt.DecodeError, ValueError):
             pass
 
@@ -256,8 +260,9 @@ class Session(TokenManager):
         def parse(vault):
             # noinspection PyBroadException
             try:
-                print("Loaded {} vault: {}".format(
+                print("Loaded {} vault{}: {}".format(
                     vault.get("scope", ""),
+                    "" if not self.user_id else " for user {}".format(self.user_id),
                     (vault.get("description", None) or "")[:50] or vault.get("id", ""))
                 )
                 d = vault.get("data", None)
@@ -325,6 +330,7 @@ class Session(TokenManager):
             if version
             else "{host}/{service}.{action}"
         ).format(**locals())
+        res = None
 
         while True:
             if data and len(data) > self._write_session_data_size:
@@ -337,15 +343,16 @@ class Session(TokenManager):
             try:
                 res = self.__http_session.request(
                     method, url, headers=headers, auth=auth, data=data, json=json, timeout=timeout, params=params)
-            except RequestException as ex:
+            except Exception as ex:
                 if self._propagate_exceptions_on_send:
                     raise
                 sleep_time = sys_random.uniform(*self._request_exception_retry_timeout)
-                self._logger.error(
-                    "{} exception sending {} {}: {} (retrying in {:.1f}sec)".format(
-                        type(ex).__name__, method.upper(), url, str(ex), sleep_time
+                if self._logger:
+                    self._logger.error(
+                        "{} exception sending {} {}: {} (retrying in {:.1f}sec)".format(
+                            type(ex).__name__, method.upper(), url, str(ex), sleep_time
+                        )
                     )
-                )
                 time.sleep(sleep_time)
                 continue
 
@@ -364,11 +371,12 @@ class Session(TokenManager):
                 res.status_code == requests.codes.service_unavailable
                 and self.config.get("api.http.wait_on_maintenance_forever", True)
             ):
-                self._logger.warning(
-                    "Service unavailable: {} is undergoing maintenance, retrying...".format(
-                        host
+                if self._logger:
+                    self._logger.warning(
+                        "Service unavailable: {} is undergoing maintenance, retrying...".format(
+                            host
+                        )
                     )
-                )
                 continue
             break
         self._session_requests += 1
@@ -649,11 +657,14 @@ class Session(TokenManager):
         """
         Return True if Session.api_version is greater or equal >= to min_api_version
         """
-        def version_tuple(v):
-            v = tuple(map(int, (v.split("."))))
-            return v + (0,) * max(0, 3 - len(v))
         return version_tuple(cls.api_version) >= version_tuple(str(min_api_version))
 
+    @classmethod
+    def check_min_server_version(cls, min_server_version):
+        """
+        Return True if Session.server_version is greater or equal >= to min_server_version
+        """
+        return version_tuple(cls.server_version) >= version_tuple(str(min_server_version))
     def _do_refresh_token(self, current_token, exp=None):
         """ TokenManager abstract method implementation.
             Here we ignore the old token and simply obtain a new token.
@@ -731,3 +742,8 @@ class Session(TokenManager):
     def propagate_exceptions_on_send(self, value):
         # type: (bool) -> None
         self._propagate_exceptions_on_send = value
+
+
+def version_tuple(v):
+    v = tuple(map(int, (v.split("."))))
+    return v + (0,) * max(0, 3 - len(v))

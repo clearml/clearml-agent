@@ -12,11 +12,11 @@ from random import random
 from threading import Lock
 from typing import Text, Sequence, Mapping, Iterable, TypeVar, Callable, Tuple, Optional
 
-import attr
-from furl import furl
-from pathlib2 import Path
+from .._vendor import attr
+from .._vendor.furl import furl
+from .._vendor.pathlib2 import Path
 
-import six
+from .._vendor import six
 
 from clearml_agent.definitions import ENV_AGENT_GIT_USER, ENV_AGENT_GIT_PASS, ENV_AGENT_GIT_HOST, ENV_GIT_CLONE_VERBOSE
 from clearml_agent.helper.console import ensure_text, ensure_binary
@@ -598,7 +598,7 @@ class Git(VCS):
 
     def pull(self):
         self._set_ssh_url()
-        self.call("fetch", "--all", "--recurse-submodules", cwd=self.location)
+        self.call("fetch", "--all", "--tags", "--recurse-submodules", cwd=self.location)
 
     def _git_pass_auth_wrapper(self, func, *args, **kwargs):
         try:
@@ -936,7 +936,7 @@ def _locate_future_import(lines):
 
 
 def patch_add_task_init_call(local_filename):
-    if not local_filename or not Path(local_filename).is_file():
+    if not local_filename or not Path(local_filename).is_file() or not str(local_filename).lower().endswith(".py"):
         return
 
     idx_a = 0

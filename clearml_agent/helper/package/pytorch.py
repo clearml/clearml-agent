@@ -3,16 +3,16 @@ from __future__ import unicode_literals
 import re
 import sys
 import platform
-from furl import furl
+from ..._vendor.furl import furl
 import urllib.parse
 from operator import itemgetter
 from html.parser import HTMLParser
 from typing import Text, Optional, Dict
 
-import attr
+from ..._vendor import attr
 import requests
 
-import six
+from ..._vendor import six
 from .requirements import (
     SimpleSubstitution, FatalSpecsResolutionError, SimpleVersion, MarkerRequirement,
     compare_version_rules, )

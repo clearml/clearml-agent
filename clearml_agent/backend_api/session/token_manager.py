@@ -2,9 +2,9 @@ import sys
 from abc import ABCMeta, abstractmethod
 from time import time
 
-import jwt
-from jwt.algorithms import get_default_algorithms
-import six
+from ..._vendor import jwt
+from ..._vendor.jwt.algorithms import get_default_algorithms
+from ..._vendor import six
 
 
 @six.add_metaclass(ABCMeta)

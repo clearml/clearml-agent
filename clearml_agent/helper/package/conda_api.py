@@ -9,11 +9,11 @@ from functools import partial
 from itertools import chain
 from typing import Text, Iterable, Union, Dict, Set, Sequence, Any
 
-import six
-import yaml
+from ..._vendor import six
+from ..._vendor import pyyaml as yaml
 from time import time
-from attr import attrs, attrib, Factory
-from pathlib2 import Path
+from ..._vendor.attr import attrs, attrib, Factory
+from ..._vendor.pathlib2 import Path
 from clearml_agent.external.requirements_parser import parse
 from clearml_agent.external.requirements_parser.requirement import Requirement
 

@@ -1,6 +1,6 @@
 from collections import OrderedDict
-from pyparsing import lineno
-from pyparsing import col
+from ..._vendor.pyparsing import lineno
+from ..._vendor.pyparsing import col
 try:
     basestring
 except NameError:  # pragma: no cover

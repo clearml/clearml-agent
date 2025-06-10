@@ -1,10 +1,10 @@
 from copy import deepcopy
 from functools import wraps
 
-import attr
+from ..._vendor import attr
 import sys
 import os
-from pathlib2 import Path
+from ..._vendor.pathlib2 import Path
 
 from clearml_agent.definitions import ENV_AGENT_FORCE_POETRY
 from clearml_agent.helper.process import Argv, DEVNULL, check_if_command_exists

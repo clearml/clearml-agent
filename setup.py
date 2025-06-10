@@ -1,7 +1,7 @@
 """
-ClearML - Artificial Intelligence Version Control
+ClearML Inc.
 CLEARML-AGENT DevOps for machine/deep learning
-https://github.com/allegroai/clearml-agent
+https://github.com/clearml/clearml-agent
 """
 
 import os.path
@@ -39,9 +39,9 @@ setup(
     long_description=long_description,
     long_description_content_type='text/markdown',
     # The project's main homepage.
-    url='https://github.com/allegroai/clearml-agent',
-    author='Allegroai',
-    author_email='clearml@allegro.ai',
+    url='https://github.com/clearml/clearml-agent',
+    author='clearml',
+    author_email='clearml@clearml.ai',
     license='Apache License 2.0',
     classifiers=[
         'Development Status :: 5 - Production/Stable',
@@ -56,7 +56,6 @@ setup(
         'Topic :: Scientific/Engineering :: Image Recognition',
         'Topic :: System :: Logging',
         'Topic :: System :: Monitoring',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
@@ -64,6 +63,7 @@ setup(
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
         'License :: OSI Approved :: Apache Software License',
     ],
 
@@ -75,7 +75,7 @@ setup(
     extras_require={
     },
     package_data={
-         'clearml_agent': ['backend_api/config/default/*.conf']
+         'clearml_agent': ['backend_api/config/default/*.conf', '_vendor/jsonschema/schemas/*.json']
     },
     include_package_data=True,
     # To provide executable scripts, use entry points in preference to the

@@ -5,8 +5,8 @@ import argparse
 from copy import deepcopy
 from functools import partial
 
-import six
-from pathlib2 import Path
+from .._vendor import six
+from .._vendor.pathlib2 import Path
 
 from clearml_agent import definitions
 from clearml_agent.session import Session

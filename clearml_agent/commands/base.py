@@ -12,7 +12,7 @@ from typing import Text
 from clearml_agent.helper.console import ListFormatter, print_text
 from clearml_agent.helper.dicts import filter_keys
 
-import six
+from .._vendor import six
 from clearml_agent.backend_api import services
 
 from clearml_agent.errors import APIError, CommandFailedError
@@ -327,7 +327,7 @@ class ServiceCommandSection(BaseCommandSection):
     def get_service(self, service_class):
         return service_class(config=self._session.config)
 
-    def _resolve_name(self, name, service=None):
+    def _resolve_name(self, name, service=None, search_hidden=False):
         """
         Resolve an object name to an object ID.
         Operation:
@@ -349,7 +349,11 @@ class ServiceCommandSection(BaseCommandSection):
         except AttributeError:
             raise NameResolutionError('Name resolution unavailable for {}'.format(service))
 
-        request = request_cls.from_dict(dict(name=re.escape(name), only_fields=['name', 'id']))
+        req_dict = {"name": re.escape(name), "only_fields": ['name', 'id']}
+        if search_hidden:
+            req_dict["_allow_extra_fields_"] = True
+            req_dict["search_hidden"] = True
+        request = request_cls.from_dict(req_dict)
         # from_dict will ignore unrecognised keyword arguments - not all GetAll's have only_fields
         response = getattr(self._session.send_api(request), service)
         matches = [db_object for db_object in response if name.lower() == db_object.name.lower()]

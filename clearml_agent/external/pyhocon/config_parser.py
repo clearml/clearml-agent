@@ -6,9 +6,9 @@ import contextlib
 import codecs
 from datetime import timedelta
 
-from pyparsing import Forward, Keyword, QuotedString, Word, Literal, Suppress, Regex, Optional, SkipTo, ZeroOrMore, \
+from ..._vendor.pyparsing import Forward, Keyword, QuotedString, Word, Literal, Suppress, Regex, Optional, SkipTo, ZeroOrMore, \
     Group, lineno, col, TokenConverter, replaceWith, alphanums, alphas8bit, ParseSyntaxException, StringEnd
-from pyparsing import ParserElement
+from ..._vendor.pyparsing import ParserElement
 from .config_tree import ConfigTree, ConfigSubstitution, ConfigList, ConfigValues, ConfigUnquotedString, \
     ConfigInclude, NoneValue, ConfigQuotedString
 from .exceptions import ConfigSubstitutionException, ConfigMissingException, ConfigException
@@ -56,7 +56,7 @@ class STR_SUBSTITUTION(object):
 
 def period(period_value, period_unit):
     try:
-        from dateutil.relativedelta import relativedelta as period_impl
+        from ..._vendor.dateutil.relativedelta import relativedelta as period_impl
     except Exception:
         from datetime import timedelta as period_impl
 
@@ -219,7 +219,7 @@ class ConfigParser(object):
             cls.supported_period_map.update(cls.period_type_map)
 
             try:
-                from dateutil import relativedelta
+                from ..._vendor.dateutil import relativedelta
 
                 if relativedelta is not None:
                     cls.supported_period_map.update(cls.optional_period_type_map)
