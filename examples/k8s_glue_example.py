@@ -86,7 +86,8 @@ def parse_args():
         "--use-owner-token",
         action="store_true",
         default=False,
-        help="Generate and use task owner token for the execution of each task",
+        help="Run the task under the identity of the task's owner: all calls made by the task code during execution will "
+        "use the owner's credentials instead of the agent's. This feature is available under the ClearML Enterprise plan.",
     )
     parser.add_argument(
         "--create-queue",
