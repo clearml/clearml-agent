@@ -87,7 +87,8 @@ def parse_args():
         action="store_true",
         default=False,
         help="Run tasks under the identity of each task's owner: all calls made by the task code during execution will "
-        "use the owner's credentials instead of the agent's. This feature is available under the ClearML Enterprise plan.",
+        "use the owner's credentials instead of the agent's. This features requires the agent to use a ClearML "
+        "Enterprise Server.",
     )
     parser.add_argument(
         "--create-queue",
