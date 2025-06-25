@@ -2,9 +2,9 @@ from __future__ import print_function
 
 from typing import Dict, Optional
 
-from pathlib2 import Path
-from six.moves import input
-from six.moves.urllib.parse import urlparse
+from .._vendor.pathlib2 import Path
+from .._vendor.six.moves import input
+from .._vendor.six.moves.urllib.parse import urlparse
 
 from clearml_agent.backend_api.session import Session
 from clearml_agent.backend_api.session.defs import ENV_HOST
@@ -191,7 +191,7 @@ def main():
                               'agent.git_pass=\"{}\"\n' \
                               '\n'.format(git_user or '', git_pass or '')
             f.write(git_credentials)
-            extra_index_str = '# extra_index_url: ["https://allegroai.jfrog.io/clearml/api/pypi/public/simple"]\n' \
+            extra_index_str = '# extra_index_url: ["https://clearml.jfrog.io/clearml/api/pypi/public/simple"]\n' \
                               'agent.package_manager.extra_index_url= ' \
                               '[\n{}\n]\n\n'.format("\n".join(map("\"{}\"".format, extra_index_urls)))
             f.write(extra_index_str)

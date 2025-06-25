@@ -1,7 +1,7 @@
 import base64
 from typing import Union, Optional, Any, TypeVar, Callable, Tuple
 
-import six
+from ..._vendor import six
 
 try:
     from typing import Text
@@ -69,7 +69,7 @@ def or_(*converters, **kwargs):
     return wrapper
 
 
-def strtobool (val):
+def strtobool(val):
     """Convert a string representation of truth to true (1) or false (0).
 
     True values are 'y', 'yes', 't', 'true', 'on', and '1'; false values
@@ -83,4 +83,3 @@ def strtobool (val):
         return 0
     else:
         raise ValueError("invalid truth value %r" % (val,))
-

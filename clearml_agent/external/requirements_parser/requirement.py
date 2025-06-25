@@ -39,7 +39,7 @@ LOCAL_REGEX = re.compile(
 
 class Requirement(object):
     """
-    Represents a single requirementfrom clearml_agent.external.requirements_parser.requirement import Requirement
+    Represents a single requirement from clearml_agent.external.requirements_parser.requirement import Requirement
 
     Typically instances of this class are created with ``Requirement.parse``.
     For local file requirements, there's no verification that the file
@@ -214,6 +214,7 @@ class Requirement(object):
     def parse(cls, line):
         """
         Parses a Requirement from a line of a requirement file.
+        This is the main entry point for parsing a single requirements line (not parse_line!)
 
         :param line: a line of a requirement file
         :returns: a Requirement instance for the given line
@@ -226,7 +227,7 @@ class Requirement(object):
             return cls.parse_editable(
                 re.sub(r'^(-e|--editable=?)\s*', '', line))
         elif '@' in line and ('#' not in line or line.index('#') > line.index('@')):
-            # Allegro bug fix: support 'name @ git+' entries
+            # ClearML bug fix: support 'name @ git+' entries
             name, uri = line.split('@', 1)
             name = name.strip()
             uri = uri.strip()

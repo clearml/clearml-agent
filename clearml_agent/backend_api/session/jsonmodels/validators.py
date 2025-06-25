@@ -1,7 +1,7 @@
 """Predefined validators."""
 import re
 
-from six.moves import reduce
+from ...._vendor.six.moves import reduce
 
 from .errors import ValidationError
 from . import utilities

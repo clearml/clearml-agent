@@ -7,7 +7,7 @@ from .requirements import SimpleSubstitution
 
 class PriorityPackageRequirement(SimpleSubstitution):
 
-    name = ("cython", "numpy", "setuptools", "pip", )
+    name = ("cython", "numpy", "setuptools", "pip", "uv", )
     optional_package_names = tuple()
 
     def __init__(self, *args, **kwargs):
@@ -53,12 +53,18 @@ class PriorityPackageRequirement(SimpleSubstitution):
         if not self._replaced_packages:
             return list_of_requirements
 
+        # we assume that both pip & setup tools are not in list_of_requirements, and we need to add them
+
         if "pip" in self._replaced_packages:
             full_freeze = PackageManager.out_of_scope_freeze(freeze_full_environment=True)
-            # now let's look for pip
-            pips = [line for line in full_freeze.get("pip", []) if line.split("==")[0] == "pip"]
-            if pips and "pip" in list_of_requirements:
-                list_of_requirements["pip"] = [pips[0]] + list_of_requirements["pip"]
+            if not full_freeze:
+                if "pip" in list_of_requirements:
+                    list_of_requirements["pip"] = [self._replaced_packages["pip"]] + list_of_requirements["pip"]
+            else:
+                # now let's look for pip
+                pips = [line for line in full_freeze.get("pip", []) if str(line.split("==")[0]).strip() == "pip"]
+                if pips and "pip" in list_of_requirements:
+                    list_of_requirements["pip"] = [pips[0]] + list_of_requirements["pip"]
 
         if "setuptools" in self._replaced_packages:
             try:
@@ -85,6 +91,20 @@ class PriorityPackageRequirement(SimpleSubstitution):
                 return list_of_requirements
 
         return list_of_requirements
+
+
+class CachedPackageRequirement(PriorityPackageRequirement):
+
+    name = ("setuptools", "pip", )
+    optional_package_names = tuple()
+
+    def replace(self, req):
+        """
+        Put the requirement in the list for later conversion
+        :raises: ValueError if version is pre-release
+        """
+        self._replaced_packages[req.name] = req.line
+        return Text(req)
 
 
 class PackageCollectorRequirement(SimpleSubstitution):

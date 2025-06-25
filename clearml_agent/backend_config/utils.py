@@ -53,7 +53,7 @@ def apply_files(config):
         target_fmt = data.get("target_format", "string")
         overwrite = bool(data.get("overwrite", True))
         contents = data.get("contents")
-        mode = data.get("mode")
+        mode = data.get("mode", None)
 
         target = Path(expanduser(expandvars(path)))
 

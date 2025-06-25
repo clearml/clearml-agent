@@ -9,11 +9,11 @@ from functools import partial
 from itertools import chain
 from typing import Text, Iterable, Union, Dict, Set, Sequence, Any
 
-import six
-import yaml
+from ..._vendor import six
+from ..._vendor import pyyaml as yaml
 from time import time
-from attr import attrs, attrib, Factory
-from pathlib2 import Path
+from ..._vendor.attr import attrs, attrib, Factory
+from ..._vendor.pathlib2 import Path
 from clearml_agent.external.requirements_parser import parse
 from clearml_agent.external.requirements_parser.requirement import Requirement
 
@@ -27,7 +27,7 @@ from clearml_agent.session import Session
 from .base import PackageManager
 from .pip_api.venv import VirtualenvPip
 from .requirements import RequirementsManager, MarkerRequirement
-from ...backend_api.session.defs import ENV_CONDA_ENV_PACKAGE
+from ...backend_api.session.defs import ENV_CONDA_ENV_PACKAGE, ENV_USE_CONDA_BASE_ENV
 
 package_normalize = partial(re.compile(r"""\[version=['"](.*)['"]\]""").sub, r"\1")
 
@@ -78,6 +78,11 @@ class CondaAPI(PackageManager):
         self.path = path
         self.env_read_only = False
         self.extra_channels = self.session.config.get('agent.package_manager.conda_channels', [])
+        # install into base conda environment (should only be used if running in docker mode)
+        self.use_conda_base_env = ENV_USE_CONDA_BASE_ENV.get(
+            default=self.session.config.get('agent.package_manager.use_conda_base_env', None)
+        )
+        # notice this will not install any additional packages into the selected environment
         self.conda_env_as_base_docker = \
             self.session.config.get('agent.package_manager.conda_env_as_base_docker', None) or \
             bool(ENV_CONDA_ENV_PACKAGE.get())
@@ -128,16 +133,38 @@ class CondaAPI(PackageManager):
     def bin(self):
         return self.pip.bin
 
+    def _parse_package_marker_match_python_ver(self, line=None, marker_req=None):
+        if line:
+            marker_req = MarkerRequirement(Requirement.parse(line))
+
+        try:
+            mock_req = MarkerRequirement(Requirement.parse(marker_req.marker.replace("'", "").replace("\"", "")))
+        except Exception as ex:
+            print("WARNING: failed parsing, assuming package is okay {}".format(ex))
+            return marker_req
+
+        if not mock_req.compare_version(requested_version=self.python):
+            print("SKIPPING package `{}` not required python version {}".format(marker_req.tostr(), self.python))
+            return None
+        return marker_req
+
     # noinspection SpellCheckingInspection
     def upgrade_pip(self):
         # do not change pip version if pre built environement is used
         if self.env_read_only:
             print('Conda environment in read-only mode, skipping pip upgrade.')
             return ''
+
+        pip_versions = []
+        for req_pip_line in self.pip.get_pip_versions():
+            req = self._parse_package_marker_match_python_ver(line=req_pip_line)
+            if req:
+                pip_versions.append(req.tostr(markers=False))
+
         return self._install(
             *select_for_platform(
-                windows=self.pip.get_pip_versions(),
-                linux=self.pip.get_pip_versions()
+                windows=pip_versions,
+                linux=pip_versions
             )
         )
 
@@ -172,6 +199,14 @@ class CondaAPI(PackageManager):
             else:
                 raise ValueError("Could not restore Conda environment, cannot find {}".format(
                     self.conda_pre_build_env_path))
+        elif self.use_conda_base_env:
+            try:
+                base_path = Path(self.conda).parent.parent.as_posix()
+                print("Using base conda environment at {}".format(base_path))
+                self._init_existing_environment(base_path, is_readonly=False)
+                return self
+            except Exception as ex:
+                print("WARNING: Failed using base conda environment, reverting to new environment: {}".format(ex))
 
         command = Argv(
             self.conda,
@@ -199,10 +234,25 @@ class CondaAPI(PackageManager):
 
         return self
 
-    def _init_existing_environment(self, conda_pre_build_env_path):
+    def _init_existing_environment(self, conda_pre_build_env_path, is_readonly=True):
         print("Using pre-existing Conda environment from {}".format(conda_pre_build_env_path))
         self.path = Path(conda_pre_build_env_path)
         self.source = ("conda", "activate", self.path.as_posix())
+        conda_env = self._get_conda_sh()
+        self.source = CommandSequence(('source', conda_env.as_posix()), self.source)
+
+        conda_packages_json = json.loads(
+            self._run_command((self.conda, "list", "--json", "-p", self.path), raw=True))
+
+        try:
+            for package in conda_packages_json:
+                if package.get("name") == "python" and package.get("version"):
+                    self.python = ".".join(package.get("version").split(".")[:2])
+                    print("Existing conda environment, found python version {}".format(self.python))
+                    break
+        except Exception as ex:
+            print("WARNING: failed detecting existing conda python version: {}".format(ex))
+
         self.pip = CondaPip(
             session=self.session,
             source=self.source,
@@ -210,9 +260,9 @@ class CondaAPI(PackageManager):
             requirements_manager=self.requirements_manager,
             path=self.path,
         )
-        conda_env = self._get_conda_sh()
-        self.source = self.pip.source = CommandSequence(('source', conda_env.as_posix()), self.source)
-        self.env_read_only = True
+        self.pip.source = self.source
+
+        self.env_read_only = is_readonly
 
     def remove(self):
         """
@@ -222,7 +272,7 @@ class CondaAPI(PackageManager):
         Conda seems to load "vcruntime140.dll" from all its environment on startup.
         This means environment have to be deleted using 'conda env remove'.
         If necessary, conda can be fooled into deleting a partially-deleted environment by creating an empty file
-        in '<ENV>\conda-meta\history' (value found in 'conda.gateways.disk.test.PREFIX_MAGIC_FILE').
+        in '<ENV>\\conda-meta\\history' (value found in 'conda.gateways.disk.test.PREFIX_MAGIC_FILE').
         Otherwise, it complains that said directory is not a conda environment.
 
         See: https://github.com/conda/conda/issues/7682
@@ -498,7 +548,7 @@ class CondaAPI(PackageManager):
                 if '.' not in m.specs[0][1]:
                     continue
 
-            if m.name.lower() == 'cudatoolkit':
+            if m.name.lower() in ('cudatoolkit', 'cuda-toolkit'):
                 # skip cuda if we are running on CPU
                 if not cuda_version:
                     continue
@@ -525,10 +575,22 @@ class CondaAPI(PackageManager):
                 has_torch = True
                 m.req.name = 'tensorflow-gpu' if cuda_version > 0 else 'tensorflow'
 
+            # push the clearml packages into the pip_requirements
+            if "clearml" in m.req.name and "clearml" not in self.extra_channels:
+                if self.session.debug_mode:
+                    print("info: moving `{}` packages to `pip` section".format(m.req))
+                pip_requirements.append(m)
+                continue
+
             reqs.append(m)
 
         if not has_cudatoolkit and cuda_version:
-            m = MarkerRequirement(Requirement.parse("cudatoolkit == {}".format(cuda_version_full)))
+            # nvidia channel is using `cuda-toolkit` and has newer versions of cuda,
+            # older cuda can be picked from conda-forge (<12)
+            if "nvidia" in self.extra_channels:
+                m = MarkerRequirement(Requirement.parse("cuda-toolkit == {}".format(cuda_version_full)))
+            else:
+                m = MarkerRequirement(Requirement.parse("cudatoolkit == {}".format(cuda_version_full)))
             has_cudatoolkit = True
             reqs.append(m)
 
@@ -588,21 +650,30 @@ class CondaAPI(PackageManager):
             if r.name and not r.name.startswith('_') and not requirements.get('conda', None):
                 r.name = r.name.replace('_', '-')
 
-            if has_cudatoolkit and r.specs and len(r.specs[0]) > 1 and r.name == 'cudatoolkit':
+            if has_cudatoolkit and r.specs and len(r.specs[0]) > 1 and r.name in ('cudatoolkit', 'cuda-toolkit'):
                 # select specific cuda version if it came from the requirements
                 r.specs = [(r.specs[0][0].replace('==', '='), r.specs[0][1].split('.post')[0])]
             elif r.specs and r.specs[0] and len(r.specs[0]) > 1:
                 # remove .post from version numbers it fails with ~= version, and change == to ~=
-                r.specs = [(r.specs[0][0].replace('==', '~='), r.specs[0][1].split('.post')[0])]
+                r.specs = [(s[0].replace('==', '~='), s[1].split('.post')[0]) for s in r.specs]
 
         while reqs:
             # notice, we give conda more freedom in version selection, to help it choose best combination
             def clean_ver(ar):
-                if not ar.specs:
-                    return ar.tostr()
-                ar.specs = [(ar.specs[0][0], ar.specs[0][1] + '.0' if '.' not in ar.specs[0][1] else ar.specs[0][1])]
-                return ar.tostr()
-            conda_env['dependencies'] = [clean_ver(r) for r in reqs]
+                markers = None
+                if ar.marker:
+                    # check if we really need it based on python version
+                    ar = self._parse_package_marker_match_python_ver(marker_req=ar)
+                    if not ar:
+                        # empty lines should be skipped
+                        return ""
+                    # if we do make sure we note that we ignored markers
+                    print("WARNING: ignoring marker in `{}`".format(ar.tostr()))
+                    markers = False
+                if ar.specs:
+                    ar.specs = [(s[0], s[1] + '.0' if '.' not in s[1] else s[1]) for s in ar.specs]
+                return ar.tostr(markers=markers)
+            conda_env['dependencies'] = [clean_ver(r) for r in reqs if clean_ver(r)]
             with self.temp_file("conda_env", yaml.dump(conda_env), suffix=".yml") as name:
                 print('Conda: Trying to install requirements:\n{}'.format(conda_env['dependencies']))
                 if self.session.debug_mode:
@@ -728,6 +799,25 @@ class CondaAPI(PackageManager):
             if conda_env.is_file():
                 return conda_env
         return base_conda_env
+
+    def add_cached_venv(self, *args, **kwargs):
+        """
+        Copy the local venv folder into the venv cache (keys are based on the requirements+python+docker).
+        """
+        # do not cache if this is a base conda environment
+        if self.conda_env_as_base_docker or self.use_conda_base_env:
+            return
+        return super().add_cached_venv(*args, **kwargs)
+
+    def get_cached_venv(self, *args, **kwargs):
+        """
+        Copy a cached copy of the venv (based on the requirements) into destination_folder.
+        Return None if failed or cached entry does not exist
+        """
+        # do not cache if this is a base conda environment
+        if self.conda_env_as_base_docker or self.use_conda_base_env:
+            return
+        return super().get_cached_venv(*args, **kwargs)
 
 
 # enable hashing with cmp=False because pdb fails on un-hashable exceptions

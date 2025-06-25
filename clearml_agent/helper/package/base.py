@@ -6,8 +6,8 @@ from contextlib import contextmanager
 from hashlib import md5
 from typing import Text, Iterable, Union, Optional, Dict, List
 
-import six
-from pathlib2 import Path
+from ..._vendor import six
+from ..._vendor.pathlib2 import Path
 
 from clearml_agent.definitions import ENV_VENV_CACHE_PATH
 from clearml_agent.helper.base import mkstemp, safe_remove_file, join_lines, select_for_platform
@@ -22,6 +22,9 @@ class PackageManager(object):
     ABC for classes providing python package management interface
     """
 
+    # # mark that we have support for the `--break-system-packages` flag that allows system install
+    # pip_support_break_system_packages_flag = False
+
     _selected_manager = None
     _cwd = None
     _pip_version = None
@@ -29,9 +32,12 @@ class PackageManager(object):
     _config_cache_max_entries = 'agent.venvs_cache.max_entries'
     _config_cache_free_space_threshold = 'agent.venvs_cache.free_space_threshold_gb'
     _config_cache_lock_timeout = 'agent.venvs_cache.lock_timeout'
+    _config_pip_legacy_resolver = 'agent.package_manager.pip_legacy_resolver'
 
     def __init__(self):
         self._cache_manager = None
+        self._existing_packages = []
+        self._base_install_flags = []
 
     @abc.abstractproperty
     def bin(self):
@@ -79,6 +85,23 @@ class PackageManager(object):
         # type: (Iterable[Text]) -> None
         pass
 
+    def add_extra_install_flags(self, extra_flags):  # type: (List[str]) -> None
+        if extra_flags:
+            extra_flags = [
+                e for e in extra_flags if e not in list(self._base_install_flags)
+            ]
+            self._base_install_flags = list(self._base_install_flags) + list(extra_flags)
+
+    def remove_extra_install_flags(self, extra_flags):  # type: (List[str]) -> bool
+        if extra_flags:
+            _base_install_flags = [
+                e for e in self._base_install_flags if e not in list(extra_flags)
+            ]
+            if self._base_install_flags != _base_install_flags:
+                self._base_install_flags = _base_install_flags
+                return True
+        return False
+
     def upgrade_pip(self):
         result = self._install(
             *select_for_platform(
@@ -87,18 +110,68 @@ class PackageManager(object):
             ),
             "--upgrade"
         )
-        packages = self.run_with_env(('list',), output=True).splitlines()
-        # p.split is ('pip', 'x.y.z')
-        pip = [p.split() for p in packages if len(p.split()) == 2 and p.split()[0] == 'pip']
-        if pip:
-            # noinspection PyBroadException
+
+        packages = (self.freeze(freeze_full_environment=True) or dict()).get("pip")
+        if packages:
+            from clearml_agent.helper.package.requirements import RequirementsManager
+            from .requirements import MarkerRequirement, SimpleVersion
+
+            # store existing packages so that we can check if we can skip preinstalled packages
+            # we will only check "@ file" "@ vcs" for exact match
+            self._existing_packages = RequirementsManager.parse_requirements_section_to_marker_requirements(
+                packages, skip_local_file_validation=True)
+
             try:
-                from .requirements import MarkerRequirement
-                pip = pip[0][1].split('.')
-                MarkerRequirement.pip_new_version = bool(int(pip[0]) >= 20)
-            except Exception:
-                pass
+                pip_pkg = next(p for p in self._existing_packages if p.name == "pip")
+            except StopIteration:
+                pip_pkg = None
+
+            # check if we need to list the pip version as well
+            if pip_pkg:
+                MarkerRequirement.pip_new_version = SimpleVersion.compare_versions(pip_pkg.version, ">=", "20")
+
+                # # actually this is not really needed,
+                # # because if we got here, someone already installed us system-wide
+                # # but we will store it anyhow, for future use
+                # self.pip_support_break_system_packages_flag = (
+                #     SimpleVersion.compare_versions(pip_pkg.version, ">=", "23.0.1"))
+
+                # # this is too late for this flag because from now on we are in venv
+                # if self.pip_support_break_system_packages_flag:
+                #     print("INFO: Using `--break-system-packages to` allow system wide agent install")
+                #     self.add_extra_install_flags(["--break-system-packages"])
+
+            # add --use-deprecated=legacy-resolver to pip install to avoid mismatched packages issues
+            self._add_legacy_resolver_flag(pip_pkg.version)
+
         return result
+
+    def _add_legacy_resolver_flag(self, pip_pkg_version):
+        if not self.session.config.get(self._config_pip_legacy_resolver, None):
+            return
+
+        from .requirements import SimpleVersion
+
+        match_versions = self.session.config.get(self._config_pip_legacy_resolver)
+        matched = False
+        for rule in match_versions:
+            matched = False
+            # make sure we match all the parts of the rule
+            for a_version in rule.split(","):
+                o, v = SimpleVersion.split_op_version(a_version.strip())
+                matched = SimpleVersion.compare_versions(pip_pkg_version, o, v)
+                if not matched:
+                    break
+            # if the rule is fully matched we have a match
+            if matched:
+                break
+
+        legacy_resolver_flags = ["--use-deprecated=legacy-resolver"]
+        if matched:
+            print("INFO: Using legacy resolver for PIP to avoid inconsistency with package versions!")
+            self.add_extra_install_flags(legacy_resolver_flags)
+        elif self.remove_extra_install_flags(legacy_resolver_flags):
+            print("INFO: removing pip legacy resolver!")
 
     def get_python_command(self, extra=()):
         # type: (...) -> Executable
@@ -149,6 +222,18 @@ class PackageManager(object):
                     return False
             except Exception:
                 return False
+
+            try:
+                from .requirements import Requirement, MarkerRequirement
+                req = MarkerRequirement(Requirement.parse(package_name))
+
+                # if pip was part of the requirements, make sure we update the flags
+                # add --use-deprecated=legacy-resolver to pip install to avoid mismatched packages issues
+                if req.name == "pip" and req.version:
+                    PackageManager._selected_manager._add_legacy_resolver_flag(req.version)
+            except Exception as e:
+                print("WARNING: Error while parsing pip version legacy [{}]".format(e))
+
         return True
 
     @classmethod
@@ -218,6 +303,8 @@ class PackageManager(object):
         """
         if not self._get_cache_manager():
             return
+
+        print('Adding venv into cache: {}'.format(source_folder))
 
         try:
             keys = self._generate_reqs_hash_keys(requirements, docker_cmd, python_version, cuda_version)
@@ -312,3 +399,26 @@ class PackageManager(object):
                 return None
 
         return self._cache_manager
+
+
+def get_specific_package_version(cached_requirements, package_name):
+    pkg_version = None
+    try:
+        from clearml_agent.external.requirements_parser.requirement import Requirement
+        from clearml_agent.external.requirements_parser import parse
+        requirements = []
+        if cached_requirements.get("pip", ""):
+            requirements += cached_requirements.get("pip", "").split("\n") \
+                if isinstance(cached_requirements.get("pip", ""), str) else cached_requirements.get("pip", [])
+
+        if cached_requirements.get("org_pip", ""):
+            requirements += cached_requirements.get("org_pip", "").split("\n") \
+                if isinstance(cached_requirements.get("org_pip", ""), str) else (
+                cached_requirements.get("org_pip", []))
+
+        pkg_version = [p for p in parse(requirements) if p.name == package_name]
+        if pkg_version:
+            pkg_version = pkg_version[0].specs[0][1]
+    except Exception as ex:
+        print("Failed parsing {} package version ({})".format(package_name, ex))
+    return pkg_version

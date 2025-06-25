@@ -5,10 +5,10 @@ import json
 import warnings
 from datetime import datetime
 
-import jsonschema
+from ..._vendor import jsonschema
 from enum import Enum
 
-import six
+from ..._vendor import six
 
 
 def format_date(obj):

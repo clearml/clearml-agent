@@ -1,14 +1,13 @@
 from time import sleep
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List
 
 from clearml_agent.backend_api.session import Request
 from clearml_agent.glue.utilities import get_bash_output
 
-from clearml_agent.helper.process import stringify_bash_output
-
 from .daemon import K8sDaemon
 from .utilities import get_path
 from .errors import GetPodsError
+from .definitions import ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION
 
 
 class PendingPodsDaemon(K8sDaemon):
@@ -17,16 +16,16 @@ class PendingPodsDaemon(K8sDaemon):
         self._polling_interval = polling_interval
         self._last_tasks_msgs = {}  # last msg updated for every task
 
-    def get_pods(self, pod_name=None):
+    def get_pods(self, pod_name=None, debug_msg="Detecting pending pods: {cmd}"):
         filters = ["status.phase=Pending"]
         if pod_name:
             filters.append(f"metadata.name={pod_name}")
 
         if self._agent.using_jobs:
             return self._agent.get_pods_for_jobs(
-                job_condition="status.active=1", pod_filters=filters, debug_msg="Detecting pending pods: {cmd}"
+                job_condition="status.active=1", pod_filters=filters, debug_msg=debug_msg
             )
-        return self._agent.get_pods(filters=filters, debug_msg="Detecting pending pods: {cmd}")
+        return self._agent.get_pods(filters=filters, debug_msg=debug_msg)
 
     def _get_pod_name(self, pod: dict):
         return get_path(pod, "metadata", "name")
@@ -37,7 +36,11 @@ class PendingPodsDaemon(K8sDaemon):
         return get_path(pod, "metadata", "name")
 
     def _get_task_id(self, pod: dict):
-        return self._get_k8s_resource_name(pod).rpartition('-')[-1]
+        prefix, _, value = self._get_k8s_resource_name(pod).rpartition('-')
+        if len(value) > 4:
+            return value
+        # we assume this is a multi-node rank x (>0) pod
+        return prefix.rpartition('-')[-1] or value
 
     @staticmethod
     def _get_k8s_resource_namespace(pod: dict):
@@ -71,6 +74,11 @@ class PendingPodsDaemon(K8sDaemon):
                     namespace = self._get_k8s_resource_namespace(pod)
                     if not namespace:
                         continue
+
+                    updated_pod = self.get_pods(pod_name=pod_name, debug_msg="Refreshing pod information: {cmd}")
+                    if not updated_pod:
+                        continue
+                    pod = updated_pod[0]
 
                     task_id_to_pod[task_id] = pod
 
@@ -190,32 +198,39 @@ class PendingPodsDaemon(K8sDaemon):
         if not msg or self._last_tasks_msgs.get(task_id, None) == (msg, tags):
             return
         try:
-            # Make sure the task is queued
-            result = self._session.send_request(
-                service='tasks',
-                action='get_all',
-                json={"id": task_id, "only_fields": ["status"]},
-                method=Request.def_method,
-                async_enable=False,
-            )
-            if result.ok:
-                status = get_path(result.json(), 'data', 'tasks', 0, 'status')
-                # if task is in progress, change its status to enqueued
-                if status == "in_progress":
-                    result = self._session.send_request(
-                        service='tasks', action='enqueue',
-                        json={
-                            "task": task_id, "force": True, "queue": self._agent.k8s_pending_queue_id
-                        },
-                        method=Request.def_method,
-                        async_enable=False,
-                    )
-                    if not result.ok:
-                        result_msg = get_path(result.json(), 'meta', 'result_msg')
-                        self.log.debug(
-                            "K8S Glue pods monitor: failed forcing task status change"
-                            " for pending task {}: {}".format(task_id, result_msg)
+            if ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION.get():
+                # This disables the option to enqueue the task which is supposed to sync the ClearML task status
+                # in case the pod was preempted. In some cases this does not happen due to preemption but due to
+                # cluster communication lag issues that cause us not to discover the pod is no longer pending and
+                # enqueue the task when it's actually already running, thus essentially killing the task
+                pass
+            else:
+                # Make sure the task is queued
+                result = self._session.send_request(
+                    service='tasks',
+                    action='get_all',
+                    json={"id": task_id, "only_fields": ["status"]},
+                    method=Request.def_method,
+                    async_enable=False,
+                )
+                if result.ok:
+                    status = get_path(result.json(), 'data', 'tasks', 0, 'status')
+                    # if task is in progress, change its status to enqueued
+                    if status == "in_progress":
+                        result = self._session.send_request(
+                            service='tasks', action='enqueue',
+                            json={
+                                "task": task_id, "force": True, "queue": self._agent.k8s_pending_queue_id
+                            },
+                            method=Request.def_method,
+                            async_enable=False,
                         )
+                        if not result.ok:
+                            result_msg = get_path(result.json(), 'meta', 'result_msg')
+                            self.log.debug(
+                                "K8S Glue pods monitor: failed forcing task status change"
+                                " for pending task {}: {}".format(task_id, result_msg)
+                            )
 
             # Update task status message
             payload = {"task": task_id, "status_message": "K8S glue status: {}".format(msg)}
@@ -225,6 +240,11 @@ class PendingPodsDaemon(K8sDaemon):
             if not result.ok:
                 result_msg = get_path(result.json(), 'meta', 'result_msg')
                 raise Exception(result_msg or result.text)
+
+            self._agent.send_logs(
+                task_id, ["Kubernetes Pod status: {}".format(msg)],
+                session=self._session
+            )
 
             # update last msg for this task
             self._last_tasks_msgs[task_id] = msg

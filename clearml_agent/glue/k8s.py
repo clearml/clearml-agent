@@ -16,8 +16,6 @@ from pprint import pformat
 from time import sleep, time
 from typing import Text, List, Callable, Any, Collection, Optional, Union, Iterable, Dict, Tuple, Set
 
-import yaml
-
 from clearml_agent.commands.events import Events
 from clearml_agent.commands.worker import Worker, get_task_container, set_task_container, get_next_task
 from clearml_agent.definitions import (
@@ -25,6 +23,7 @@ from clearml_agent.definitions import (
     ENV_AGENT_GIT_USER,
     ENV_AGENT_GIT_PASS,
     ENV_FORCE_SYSTEM_SITE_PACKAGES,
+    ENV_AGENT_DEBUG_GET_NEXT_TASK,
 )
 from clearml_agent.errors import APIError, UsageError
 from clearml_agent.glue.errors import GetPodCountError
@@ -40,7 +39,11 @@ from clearml_agent.glue.definitions import (
     ENV_START_AGENT_SCRIPT_PATH,
     ENV_DEFAULT_EXECUTION_AGENT_ARGS,
     ENV_POD_AGENT_INSTALL_ARGS,
+    ENV_POD_USE_IMAGE_ENTRYPOINT,
+    ENV_KUBECTL_IGNORE_ERROR,
+    ENV_DEFAULT_SCHEDULER_QUEUE_TAGS,
 )
+from .._vendor import pyyaml as yaml
 
 
 class K8sIntegration(Worker):
@@ -53,8 +56,8 @@ class K8sIntegration(Worker):
     KUBECTL_APPLY_CMD = "kubectl apply --namespace={namespace} -f"
 
     BASH_INSTALL_SSH_CMD = [
-        "apt-get update",
-        "apt-get install -y openssh-server",
+        "(apt-get update -y ; apt-get install -y openssh-server) || "
+        "(dnf install -y openssh-server)",
         "mkdir -p /var/run/sshd",
         "echo 'root:training' | chpasswd",
         "echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config",
@@ -67,17 +70,28 @@ class K8sIntegration(Worker):
         'echo "ldconfig" >> /etc/profile',
         "/usr/sbin/sshd -p {port}"]
 
-    CONTAINER_BASH_SCRIPT = [
+    _CONTAINER_APT_SCRIPT_SECTION = [
         "export DEBIAN_FRONTEND='noninteractive'",
         "echo 'Binary::apt::APT::Keep-Downloaded-Packages \"true\";' > /etc/apt/apt.conf.d/docker-clean",
-        "chown -R root /root/.cache/pip",
-        "apt-get update",
-        "apt-get install -y git libsm6 libxext6 libxrender-dev libglib2.0-0",
+        "chown -R $(whoami) $HOME/.cache/pip",
+        "(apt-get update -y ; apt-get install -y git) || "
+        "(dnf install -y git)"
+        # should only be added if docker_install_opencv_libs:  # libsm6 libxext6 libxrender-dev libglib2.0-0",
+    ]
+
+    CONTAINER_BASH_SCRIPT = [
+        *(
+            '[ ! -z "$CLEARML_AGENT_SKIP_CONTAINER_APT" ] || {}'.format(line)
+            for line in _CONTAINER_APT_SCRIPT_SECTION
+        ),
         "declare LOCAL_PYTHON",
-        "[ ! -z $LOCAL_PYTHON ] || for i in {{15..5}}; do which python3.$i && python3.$i -m pip --version && "
-        "export LOCAL_PYTHON=$(which python3.$i) && break ; done",
-        "[ ! -z $LOCAL_PYTHON ] || apt-get install -y python3-pip",
+        "[ ! -z $LOCAL_PYTHON ] || for i in {{20..5}}; do (which python3.$i 2> /dev/null || command -v python3.$i) && python3.$i -m pip --version && "
+        "export LOCAL_PYTHON=$(which python3.$i 2> /dev/null || command -v python3.$i) && break ; done",
+        '[ ! -z "$CLEARML_AGENT_SKIP_CONTAINER_APT" ] || [ ! -z "$LOCAL_PYTHON" ] || '
+        'apt-get install -y python3-pip || dnf install -y python3-pip',
         "[ ! -z $LOCAL_PYTHON ] || export LOCAL_PYTHON=python3",
+        "[ ! -z $CLEARML_AGENT_NO_UPDATE ] || $LOCAL_PYTHON -m pip --version > /dev/null || export LOCAL_PYTHON=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v python3)",
+        "rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED",  # remove PEP 668
         "{extra_bash_init_cmd}",
         "[ ! -z $CLEARML_AGENT_NO_UPDATE ] || $LOCAL_PYTHON -m pip install clearml-agent{agent_install_args}",
         "{extra_docker_bash_script}",
@@ -85,7 +99,7 @@ class K8sIntegration(Worker):
     ]
 
     DEFAULT_POD_NAME_PREFIX = "clearml-id-"
-    DEFAULT_LIMIT_POD_LABEL = "ai.allegro.agent.serial=pod-{pod_number}"
+    DEFAULT_LIMIT_POD_LABEL = "ai.clearml.agent.serial=pod-{pod_number}"
 
     _edit_hyperparams_version = "2.9"
 
@@ -98,6 +112,7 @@ class K8sIntegration(Worker):
             num_of_services=20,
             base_pod_num=1,
             user_props_cb=None,
+            runtime_cb=None,
             overrides_yaml=None,
             template_yaml=None,
             clearml_conf_file=None,
@@ -125,6 +140,7 @@ class K8sIntegration(Worker):
         :param callable user_props_cb: An Optional callable allowing additional user properties to be specified
             when scheduling a task to run in a pod. Callable can receive an optional pod number and should return
             a dictionary of user properties (name and value). Signature is [[Optional[int]], Dict[str,str]]
+        :param callable runtime_cb: An Optional callable allowing additional task runtime to be specified (see user_props_cb)
         :param str overrides_yaml: YAML file containing the overrides for the pod (optional)
         :param str template_yaml: YAML file containing the template for the pod (optional).
             If provided the pod is scheduled with kubectl apply and overrides are ignored, otherwise with kubectl run.
@@ -163,6 +179,7 @@ class K8sIntegration(Worker):
         self.base_pod_num = base_pod_num
         self._edit_hyperparams_support = None
         self._user_props_cb = user_props_cb
+        self._runtime_cb = runtime_cb
         self.conf_file_content = None
         self.overrides_json_string = None
         self.template_dict = None
@@ -195,6 +212,18 @@ class K8sIntegration(Worker):
 
         self._min_cleanup_interval_per_ns_sec = 1.0
         self._last_pod_cleanup_per_ns = defaultdict(lambda: 0.)
+
+        self._server_supports_same_state_transition = (
+                self._session.feature_set != "basic" and self._session.check_min_server_version("3.22.3")
+        )
+
+        self.ignore_kubectl_errors_re = (
+            re.compile(ENV_KUBECTL_IGNORE_ERROR.get()) if ENV_KUBECTL_IGNORE_ERROR.get() else None
+        )
+
+    @property
+    def agent_label(self):
+        return self._get_agent_label()
 
     def _create_daemon_instance(self, cls_, **kwargs):
         return cls_(agent=self, **kwargs)
@@ -428,6 +457,12 @@ class K8sIntegration(Worker):
         """ Called when a resource (pod/job) was applied """
         pass
 
+    def ports_mode_supported_for_task(self, task_id: str, task_data):
+        return self.ports_mode
+
+    def get_default_docker_image(self, session, queue: str) -> str:
+        return str(ENV_DOCKER_IMAGE.get() or session.config.get("agent.default_docker.image", "nvidia/cuda"))
+
     def run_one_task(self, queue: Text, task_id: Text, worker_args=None, task_session=None, **_):
         print('Pulling task {} launching on kubernetes cluster'.format(task_id))
         session = task_session or self._session
@@ -437,7 +472,9 @@ class K8sIntegration(Worker):
         if self._is_same_tenant(task_session):
             try:
                 print('Pushing task {} into temporary pending queue'.format(task_id))
-                _ = session.api_client.tasks.stop(task_id, force=True, status_reason="moving to k8s pending queue")
+
+                if not self._server_supports_same_state_transition:
+                    _ = session.api_client.tasks.stop(task_id, force=True, status_reason="moving to k8s pending queue")
 
                 # Just make sure to clean up in case the task is stuck in the queue (known issue)
                 self._session.api_client.queues.remove_task(
@@ -445,13 +482,34 @@ class K8sIntegration(Worker):
                     queue=self.k8s_pending_queue_id,
                 )
 
-                res = self._session.api_client.tasks.enqueue(
-                    task_id,
-                    queue=self.k8s_pending_queue_id,
-                    status_reason='k8s pending scheduler',
-                )
-                if res.meta.result_code != 200:
-                    raise Exception(res.meta.result_msg)
+                for attempt in range(2):
+                    res = self._session.send_request(
+                        "tasks",
+                        "enqueue",
+                        json={
+                            "task": task_id,
+                            "queue": self.k8s_pending_queue_id,
+                            "status_reason": "k8s pending scheduler",
+                            "update_execution_queue": False,
+                        }
+                    )
+                    if res.ok:
+                        break
+
+                    # noinspection PyBroadException
+                    try:
+                        result_subcode = res.json()["meta"]["result_subcode"]
+                        result_msg = res.json()["meta"]["result_msg"]
+                    except Exception:
+                        result_subcode = None
+                        result_msg = res.text
+
+                    if attempt == 0 and res.status_code == 400 and result_subcode == 701:
+                        # Invalid queue ID, only retry once
+                        self._ensure_pending_queue_exists()
+                        continue
+                    raise Exception(result_msg)
+
             except Exception as e:
                 self.log.error("ERROR: Could not push back task [{}] to k8s pending queue {} [{}], error: {}".format(
                     task_id, self.k8s_pending_queue_name, self.k8s_pending_queue_id, e))
@@ -459,9 +517,7 @@ class K8sIntegration(Worker):
 
         container = get_task_container(session, task_id)
         if not container.get('image'):
-            container['image'] = str(
-                ENV_DOCKER_IMAGE.get() or session.config.get("agent.default_docker.image", "nvidia/cuda")
-            )
+            container['image'] = self.get_default_docker_image(session, queue)
             container['arguments'] = session.config.get("agent.default_docker.arguments", None)
             set_task_container(
                 session, task_id, docker_image=container['image'], docker_arguments=container['arguments']
@@ -497,8 +553,10 @@ class K8sIntegration(Worker):
                 )
             )
 
-        if self.ports_mode:
+        ports_mode = False
+        if self.ports_mode_supported_for_task(task_id, task_data):
             print("Kubernetes looking for available pod to use")
+            ports_mode = True
 
         # noinspection PyBroadException
         try:
@@ -509,12 +567,12 @@ class K8sIntegration(Worker):
         # Search for a free pod number
         pod_count = 0
         pod_number = self.base_pod_num
-        while self.ports_mode or self.max_pods_limit:
+        while ports_mode or self.max_pods_limit:
             pod_number = self.base_pod_num + pod_count
 
             try:
                 items_count = self._get_pod_count(
-                    extra_labels=[self.limit_pod_label.format(pod_number=pod_number)] if self.ports_mode else None,
+                    extra_labels=[self.limit_pod_label.format(pod_number=pod_number)] if ports_mode else None,
                     msg="Looking for a free pod/port"
                 )
             except GetPodCountError:
@@ -564,17 +622,17 @@ class K8sIntegration(Worker):
                 break
             pod_count += 1
 
-        labels = self._get_pod_labels(queue, queue_name)
-        if self.ports_mode:
+        labels = self._get_pod_labels(queue, queue_name, task_data)
+        if ports_mode:
             labels.append(self.limit_pod_label.format(pod_number=pod_number))
 
-        if self.ports_mode:
+        if ports_mode:
             print("Kubernetes scheduling task id={} on pod={} (pod_count={})".format(task_id, pod_number, pod_count))
         else:
             print("Kubernetes scheduling task id={}".format(task_id))
 
         try:
-            template = self._resolve_template(task_session, task_data, queue)
+            template = self._resolve_template(task_session, task_data, queue, task_id)
         except Exception as ex:
             print("ERROR: Failed resolving template (skipping): {}".format(ex))
             return
@@ -588,47 +646,127 @@ class K8sIntegration(Worker):
             print("ERROR: no template for task {}, skipping".format(task_id))
             return
 
+        pod_name = self.pod_name_prefix + str(task_id)
+
+        self.apply_template_and_handle_result(
+            pod_name=pod_name,
+            clearml_conf_create_script=clearml_conf_create_script,
+            labels=labels,
+            queue=queue,
+            task_id=task_id,
+            namespace=namespace,
+            template=template,
+            docker_image=container['image'],
+            docker_args=container.get('arguments'),
+            docker_bash=container.get('setup_shell_script'),
+            session=session,
+            task_session=task_session,
+            pod_number=pod_number,
+            queue_name=queue_name,
+            task_data=task_data,
+            ports_mode=ports_mode,
+            pod_count=pod_count,
+        )
+
+    def apply_template_and_handle_result(
+            self,
+            pod_name,
+            clearml_conf_create_script: List[str],
+            labels,
+            queue,
+            task_id,
+            namespace,
+            template,
+            docker_image,
+            docker_args,
+            docker_bash,
+            session,
+            task_session,
+            queue_name,
+            task_data,
+            ports_mode,
+            pod_count,
+            pod_number=None,
+            base_spec: dict = None,
+    ):
+        """Apply the provided template with all custom settings and handle bookkeeping for the reaults"""
+
         output, error, pod_name = self._kubectl_apply(
+            pod_name=pod_name,
             template=template,
             pod_number=pod_number,
             clearml_conf_create_script=clearml_conf_create_script,
             labels=labels,
-            docker_image=container['image'],
-            docker_args=container.get('arguments'),
-            docker_bash=container.get('setup_shell_script'),
+            docker_image=docker_image,
+            docker_args=docker_args,
+            docker_bash=docker_bash,
             task_id=task_id,
             queue=queue,
             namespace=namespace,
+            task_token=task_session.token.encode("ascii") if task_session else None,
+            base_spec=base_spec,
         )
 
         print('kubectl output:\n{}\n{}'.format(error, output))
         if error:
-            send_log = "Running kubectl encountered an error: {}".format(error)
-            self.log.error(send_log)
-            self.send_logs(task_id, send_log.splitlines())
-            return
+            if self.ignore_kubectl_errors_re and self.ignore_kubectl_errors_re.match(error):
+                print(f"Ignoring error due to {ENV_KUBECTL_IGNORE_ERROR.key}")
+            else:
+                self._set_task_failed_while_applying(
+                    session, task_id, f"Running kubectl encountered an error: {error}"
+                )
+                return
 
         if pod_name:
             self.resource_applied(
                 resource_name=pod_name, namespace=namespace, task_id=task_id, session=session
             )
 
+        self.set_task_info(
+            task_id=task_id, task_session=task_session, queue_name=queue_name, ports_mode=ports_mode,
+            pod_number=pod_number, pod_count=pod_count, task_data=task_data
+        )
+
+    def _set_task_failed_while_applying(self, session, task_id: str, error: str):
+        send_log = "Running kubectl encountered an error: {}".format(error)
+        self.log.error(send_log)
+        self.send_logs(task_id, send_log.splitlines())
+
+        # Make sure to remove the task from our k8s pending queue
+        self._session.api_client.queues.remove_task(
+            task=task_id,
+            queue=self.k8s_pending_queue_id,
+        )
+        # Set task as failed
+        session.api_client.tasks.failed(task_id, force=True)
+
+    def set_task_info(
+            self, task_id: str, task_session, task_data, queue_name: str, ports_mode: bool, pod_number, pod_count
+    ):
         user_props = {"k8s-queue": str(queue_name)}
-        if self.ports_mode:
-            user_props.update(
-                {
-                    "k8s-pod-number": pod_number,
-                    "k8s-pod-label": labels[0],
-                    "k8s-internal-pod-count": pod_count,
-                    "k8s-agent": self._get_agent_label(),
-                }
-            )
+        runtime = {}
+        if ports_mode:
+            agent_label = self._get_agent_label()
+            user_props.update({
+                "k8s-pod-number": pod_number,
+                "k8s-pod-label": agent_label,  # backwards-compatibility / legacy
+                "k8s-internal-pod-count": pod_count,
+                "k8s-agent": agent_label,
+            })
 
         if self._user_props_cb:
             # noinspection PyBroadException
             try:
-                custom_props = self._user_props_cb(pod_number) if self.ports_mode else self._user_props_cb()
+                custom_props = self._user_props_cb(pod_number) if ports_mode else self._user_props_cb()
                 user_props.update(custom_props)
+            except Exception:
+                pass
+
+        if self._runtime_cb:
+            # noinspection PyBroadException
+            try:
+                custom_runtime = self._runtime_cb(pod_number) if ports_mode else self._runtime_cb()
+                runtime.update(custom_runtime)
             except Exception:
                 pass
 
@@ -639,7 +777,38 @@ class K8sIntegration(Worker):
                 **user_props
             )
 
-    def _get_pod_labels(self, queue, queue_name):
+        if runtime:
+            task_runtime = self._get_task_runtime(task_id) or {}
+            task_runtime.update(runtime)
+
+            try:
+                res = task_session.send_request(
+                    service='tasks', action='edit', method=Request.def_method,
+                    json={
+                        "task": task_id, "force": True, "runtime": task_runtime
+                    },
+                )
+                if not res.ok:
+                    raise Exception("failed setting runtime property")
+            except Exception as ex:
+                print("WARNING: failed setting custom runtime properties for task '{}': {}".format(task_id, ex))
+
+    def _get_task_runtime(self, task_id) -> Optional[dict]:
+        try:
+            res = self._session.send_request(
+                service='tasks', action='get_by_id', method=Request.def_method,
+                json={"task": task_id, "only_fields": ["runtime"]},
+            )
+            if not res.ok:
+                raise ValueError(f"request returned {res.status_code}")
+            data = res.json().get("data")
+            if not data or "task" not in data:
+                raise ValueError("empty data in result")
+            return data["task"].get("runtime", {})
+        except Exception as ex:
+            print(f"ERROR: Failed getting runtime properties for task {task_id}: {ex}")
+
+    def _get_pod_labels(self, queue, queue_name, task_data):
         return [
             self._get_agent_label(),
             "{}={}".format(self.QUEUE_LABEL, self._safe_k8s_label_value(queue)),
@@ -675,9 +844,12 @@ class K8sIntegration(Worker):
     def get_task_worker_id(self, template, task_id, pod_name, namespace, queue):
         return f"{self.worker_id}:{task_id}"
 
+    def use_image_entrypoint(self, queue: str, task_id: str, docker_image: str) -> bool:
+        return ENV_POD_USE_IMAGE_ENTRYPOINT.get()
+
     def _create_template_container(
-        self, pod_name: str, task_id: str, docker_image: str, docker_args: List[str],
-        docker_bash: str, clearml_conf_create_script: List[str], task_worker_id: str
+        self, pod_name: str, task_id: str, docker_image: str, docker_args: List[str], queue: str,
+        docker_bash: str, clearml_conf_create_script: List[str], task_worker_id: str, task_token: str = None
     ) -> dict:
         container = self._get_docker_args(
             docker_args,
@@ -686,16 +858,32 @@ class K8sIntegration(Worker):
             convert=lambda env: {'name': env.partition("=")[0], 'value': env.partition("=")[2]},
         )
 
-        # Set worker ID
-        env_vars = container.get('env', [])
-        found_worker_id = False
-        for entry in env_vars:
-            if entry.get('name') == 'CLEARML_WORKER_ID':
-                entry['name'] = task_worker_id
-                found_worker_id = True
-        if not found_worker_id:
-            container['env'] = env_vars + [{'name': 'CLEARML_WORKER_ID', 'value': task_worker_id}]
+        def add_or_update_env_var(name, value):
+            env_vars = container.get('env', [])
+            for entry in env_vars:
+                if entry.get('name') == name:
+                    entry['value'] = value
+                    break
+            else:
+                container['env'] = env_vars + [{'name': name, 'value': value}]
 
+        # Set worker ID
+        add_or_update_env_var('CLEARML_WORKER_ID', task_worker_id)
+
+        if self.use_image_entrypoint(queue=queue, task_id=task_id, docker_image=docker_image):
+            # Don't add a cmd and args, just the image
+
+            # Add the task ID and token since we need it (it's usually in the init script passed to us
+            add_or_update_env_var('CLEARML_TASK_ID', task_id)
+            if task_token:
+                # TODO: find a way to base64 encode the token
+                add_or_update_env_var('CLEARML_AUTH_TOKEN', task_token)
+
+            return self._merge_containers(
+                container, dict(name=pod_name, image=docker_image)
+            )
+
+        # Create bash script for container and
         container_bash_script = [self.container_bash_script] if isinstance(self.container_bash_script, str) \
             else self.container_bash_script
 
@@ -735,6 +923,7 @@ class K8sIntegration(Worker):
 
     def _kubectl_apply(
         self,
+        pod_name,
         clearml_conf_create_script: List[str],
         docker_image,
         docker_args,
@@ -744,7 +933,9 @@ class K8sIntegration(Worker):
         task_id,
         namespace,
         template,
-        pod_number=None
+        pod_number=None,
+        task_token=None,
+        base_spec: dict = None,  # base values for the spec (might be overridden)
     ):
         if "apiVersion" not in template:
             template["apiVersion"] = "batch/v1" if self.using_jobs else "v1"
@@ -759,8 +950,7 @@ class K8sIntegration(Worker):
             template["kind"] = self.kind.capitalize()
 
         metadata = template.setdefault('metadata', {})
-        name = self.pod_name_prefix + str(task_id)
-        metadata['name'] = name
+        metadata['name'] = pod_name
 
         def place_labels(metadata_dict):
             labels_dict = dict(pair.split('=', 1) for pair in labels)
@@ -775,24 +965,29 @@ class K8sIntegration(Worker):
             spec.setdefault('backoffLimit', 0)
             spec_template = spec.setdefault('template', {})
             if labels:
-                # Place same labels fro any pod spawned by the job
+                # Place same labels for any pod spawned by the job
                 place_labels(spec_template.setdefault('metadata', {}))
 
             spec = spec_template.setdefault('spec', {})
 
+        if base_spec:
+            merge_dicts(spec, base_spec)
+
         containers = spec.setdefault('containers', [])
         spec.setdefault('restartPolicy', 'Never')
 
-        task_worker_id = self.get_task_worker_id(template, task_id, name, namespace, queue)
+        task_worker_id = self.get_task_worker_id(template, task_id, pod_name, namespace, queue)
 
         container = self._create_template_container(
-            pod_name=name,
+            pod_name=pod_name,
             task_id=task_id,
             docker_image=docker_image,
             docker_args=docker_args,
             docker_bash=docker_bash,
             clearml_conf_create_script=clearml_conf_create_script,
-            task_worker_id=task_worker_id
+            task_worker_id=task_worker_id,
+            task_token=task_token,
+            queue=queue,
         )
 
         if containers:
@@ -831,7 +1026,7 @@ class K8sIntegration(Worker):
         finally:
             safe_remove_file(yaml_file)
 
-        return stringify_bash_output(output), stringify_bash_output(error), name
+        return stringify_bash_output(output), stringify_bash_output(error), pod_name
 
     def _process_bash_lines_response(self, bash_cmd: str, raise_error=True):
         res = get_bash_output(bash_cmd, raise_error=raise_error)
@@ -916,7 +1111,7 @@ class K8sIntegration(Worker):
         deleted_pods = defaultdict(list)
         for namespace in namespaces:
             if time() - self._last_pod_cleanup_per_ns[namespace] < self._min_cleanup_interval_per_ns_sec:
-                # Do not try to cleanup the same namespace too quickly
+                # Do not try to clean up the same namespace too quickly
                 continue
 
             try:
@@ -939,7 +1134,7 @@ class K8sIntegration(Worker):
                 result = self._session.get(
                     service='tasks',
                     action='get_all',
-                    json={"id": task_ids, "status": ["in_progress", "queued"], "only_fields": ["id", "status"]},
+                    json={"id": task_ids, "status": ["in_progress", "queued"], "only_fields": ["id", "status", "status_reason"]},
                     method=Request.def_method,
                 )
                 tasks_to_abort = result["tasks"]
@@ -949,8 +1144,12 @@ class K8sIntegration(Worker):
         for task in tasks_to_abort:
             task_id = task.get("id")
             status = task.get("status")
+            status_reason = (task.get("status_reason") or "").lower()
             if not task_id or not status:
                 self.log.warning('Failed getting task information: id={}, status={}'.format(task_id, status))
+                continue
+            if status == "queued" and "pushed back by policy manager" in status_reason:
+                # Task was pushed back to policy queue by policy manager, don't touch it
                 continue
             try:
                 if status == "queued":
@@ -985,6 +1184,24 @@ class K8sIntegration(Worker):
 
         return deleted_pods
 
+    def check_if_suspended(self) -> bool:
+        pass
+
+    def check_if_schedulable(self, queue: str) -> bool:
+        return True
+
+    def _ensure_pending_queue_exists(self):
+        resolved_ids = self._resolve_queue_names(
+            [self.k8s_pending_queue_name],
+            create_if_missing=True,
+            create_system_tags=ENV_DEFAULT_SCHEDULER_QUEUE_TAGS.get()
+        )
+        if not resolved_ids:
+            raise ValueError(
+                "Failed resolving or creating k8s pending queue {}".format(self.k8s_pending_queue_name)
+            )
+        self.k8s_pending_queue_id = resolved_ids[0]
+
     def run_tasks_loop(self, queues: List[Text], worker_params, **kwargs):
         """
         :summary: Pull and run tasks from queues.
@@ -996,16 +1213,12 @@ class K8sIntegration(Worker):
         :param worker_params: Worker command line arguments
         :type worker_params: ``clearml_agent.helper.process.WorkerParams``
         """
+        # print("debug> running tasks loop")
+
         events_service = self.get_service(Events)
 
-        # make sure we have a k8s pending queue
         if not self.k8s_pending_queue_id:
-            resolved_ids = self._resolve_queue_names([self.k8s_pending_queue_name], create_if_missing=True)
-            if not resolved_ids:
-                raise ValueError(
-                    "Failed resolving or creating k8s pending queue {}".format(self.k8s_pending_queue_name)
-                )
-            self.k8s_pending_queue_id = resolved_ids[0]
+            self._ensure_pending_queue_exists()
 
         _last_machine_update_ts = 0
         while True:
@@ -1027,12 +1240,22 @@ class K8sIntegration(Worker):
                     continue
 
             # iterate over queues (priority style, queues[0] is highest)
+            # print("debug> iterating over queues")
             for queue in queues:
                 # delete old completed / failed pods
                 self._cleanup_old_pods(namespaces, extra_msg="Cleanup cycle {cmd}")
 
+                if self.check_if_suspended():
+                    print("Agent is suspended, sleeping for {:.1f} seconds".format(self._polling_interval))
+                    sleep(self._polling_interval)
+                    break
+
+                if not self.check_if_schedulable(queue):
+                    continue
+
                 # get next task in queue
                 try:
+                    # print(f"debug> getting tasks for queue {queue}")
                     response = self._get_next_task(queue=queue, get_task_info=self._impersonate_as_task_owner)
                 except Exception as e:
                     print("Warning: Could not access task queue [{}], error: {}".format(queue, e))
@@ -1078,7 +1301,7 @@ class K8sIntegration(Worker):
 
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues, queue=queue, task=task_id))
                     self.run_one_task(queue, task_id, worker_params, task_session)
-                    self.report_monitor(ResourceMonitor.StatusReport(queues=self.queues))
+                    self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
                     break
             else:
                 # sleep and retry polling
@@ -1110,7 +1333,7 @@ class K8sIntegration(Worker):
             self._session, queue=queue, get_task_info=get_task_info
         )
 
-    def _resolve_template(self, task_session, task_data, queue):
+    def _resolve_template(self, task_session, task_data, queue, task_id):
         if self.template_dict:
             return deepcopy(self.template_dict)
 

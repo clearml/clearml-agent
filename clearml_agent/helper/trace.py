@@ -9,9 +9,9 @@ from itertools import chain
 from types import ModuleType
 from typing import Text, Sequence, Union
 
-from pathlib2 import Path
+from .._vendor.pathlib2 import Path
 
-import six
+from .._vendor import six
 
 try:
     from functools import lru_cache

@@ -1,7 +1,7 @@
 import abc
 
-import jsonschema
-import six
+from ..._vendor import jsonschema
+from ..._vendor import six
 
 from .apimodel import ApiModel
 from .datamodel import DataModel
@@ -19,8 +19,19 @@ class Request(ApiModel):
     _method = ENV_API_DEFAULT_REQ_METHOD.get(default="get")
 
     def __init__(self, **kwargs):
-        if kwargs:
+        allow_extra_fields = kwargs.pop("_allow_extra_fields_", False)
+        if not allow_extra_fields and kwargs:
             raise ValueError('Unsupported keyword arguments: %s' % ', '.join(kwargs.keys()))
+        elif allow_extra_fields and kwargs:
+            self._extra_fields = kwargs
+        else:
+            self._extra_fields = {}
+
+    def to_dict(self, *args, **kwargs):
+        res = super(Request, self).to_dict(*args, **kwargs)
+        if self._extra_fields:
+            res.update(self._extra_fields)
+        return res
 
 
 @six.add_metaclass(abc.ABCMeta)

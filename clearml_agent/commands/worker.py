@@ -22,13 +22,14 @@ from datetime import datetime
 from functools import partial
 from os.path import basename
 from tempfile import mkdtemp, NamedTemporaryFile
+from threading import Thread
 from time import sleep, time
 from typing import Text, Optional, Any, Tuple, List, Dict, Mapping, Union
 
-import attr
-import six
-from pathlib2 import Path
-from six.moves.urllib.parse import quote
+from .._vendor import attr
+from .._vendor import six
+from .._vendor.pathlib2 import Path
+from .._vendor.six.moves.urllib.parse import quote  # noqa
 
 from clearml_agent.external.pyhocon import ConfigTree, ConfigFactory
 from clearml_agent.backend_api.services import auth as auth_api
@@ -38,7 +39,7 @@ from clearml_agent.backend_api.services import workers as workers_api
 from clearml_agent.backend_api.session import CallResult, Request
 from clearml_agent.backend_api.session.defs import (
     ENV_ENABLE_ENV_CONFIG_SECTION, ENV_ENABLE_FILES_CONFIG_SECTION,
-    ENV_VENV_CONFIGURED, ENV_PROPAGATE_EXITCODE, )
+    ENV_VENV_CONFIGURED, ENV_PROPAGATE_EXITCODE, ENV_MULTI_NODE_SINGLE_TASK, )
 from clearml_agent.backend_config import Config
 from clearml_agent.backend_config.defs import UptimeConf
 from clearml_agent.backend_config.utils import apply_environment, apply_files
@@ -76,7 +77,13 @@ from clearml_agent.definitions import (
     ENV_EXTRA_DOCKER_LABELS,
     ENV_AGENT_FORCE_CODE_DIR,
     ENV_AGENT_FORCE_EXEC_SCRIPT,
-    ENV_TEMP_STDOUT_FILE_DIR, ENV_AGENT_FORCE_TASK_INIT,
+    ENV_TEMP_STDOUT_FILE_DIR,
+    ENV_AGENT_FORCE_TASK_INIT,
+    ENV_AGENT_DEBUG_GET_NEXT_TASK,
+    ENV_ABORT_CALLBACK_CMD,
+    ENV_ABORT_CALLBACK_CMD_TIMEOUT,
+    ENV_QUEUE_POLL_FREQ_SEC,
+    ENV_STATUS_REPORT_FREQ_SEC,
 )
 from clearml_agent.definitions import WORKING_REPOSITORY_DIR, PIP_EXTRA_INDICES
 from clearml_agent.errors import (
@@ -89,7 +96,6 @@ from clearml_agent.errors import (
 from clearml_agent.helper.base import (
     return_list,
     print_parameters,
-    dump_yaml,
     warning,
     normalize_path,
     check_directory_path,
@@ -108,20 +114,22 @@ from clearml_agent.helper.base import (
     is_linux_platform,
     rm_file,
     add_python_path,
-    safe_remove_tree,
+    safe_remove_tree, get_python_version, dump_flat_dict, check_is_binary_python_or_bash,
 )
 from clearml_agent.helper.check_update import start_check_update_daemon
 from clearml_agent.helper.console import ensure_text, print_text, decode_binary_lines
 from clearml_agent.helper.environment.converters import strtobool
 from clearml_agent.helper.os.daemonize import daemonize_process
-from clearml_agent.helper.package.base import PackageManager
+from clearml_agent.helper.package.base import PackageManager, get_specific_package_version
 from clearml_agent.helper.package.conda_api import CondaAPI
 from clearml_agent.helper.package.external_req import ExternalRequirements, OnlyExternalRequirements
 from clearml_agent.helper.package.pip_api.system import SystemPip
 from clearml_agent.helper.package.pip_api.venv import VirtualenvPip
 from clearml_agent.helper.package.poetry_api import PoetryConfig, PoetryAPI
+from clearml_agent.helper.package.uv_api import UvConfig, UvAPI
 from clearml_agent.helper.package.post_req import PostRequirement
-from clearml_agent.helper.package.priority_req import PriorityPackageRequirement, PackageCollectorRequirement
+from clearml_agent.helper.package.priority_req import PriorityPackageRequirement, PackageCollectorRequirement, \
+    CachedPackageRequirement
 from clearml_agent.helper.package.pytorch import PytorchRequirement
 from clearml_agent.helper.package.requirements import (
     RequirementsManager, )
@@ -146,7 +154,7 @@ from clearml_agent.helper.repo import clone_repository_cached, RepoInfo, VCS, fi
 from clearml_agent.helper.resource_monitor import ResourceMonitor
 from clearml_agent.helper.runtime_verification import check_runtime, print_uptime_properties
 from clearml_agent.helper.singleton import Singleton
-from clearml_agent.helper.docker_args import DockerArgsSanitizer
+from clearml_agent.helper.docker_args import DockerArgsSanitizer, DockerArgsTemplateResolver
 from clearml_agent.session import Session
 from .events import Events
 
@@ -222,6 +230,23 @@ class LiteralScriptManager(object):
         :return: directory and script path
         """
         log = logging.getLogger(__name__)
+        target_file_name_module_call = None
+        is_python_binary, is_bash_binary = check_is_binary_python_or_bash(task.script.binary)
+
+        if execution.entry_point and (
+                execution.entry_point.strip().startswith("-m ") or
+                execution.entry_point.strip().startswith("-c ")
+        ):
+            # this is a module we cannot use it as file name
+            target_file_name_module_call = 'untitled.sh' \
+                if is_bash_binary and execution.entry_point.strip().startswith("-c ") else 'untitled.py'
+            # let's parse the working_dir and override the default literal file
+            if execution.working_dir and ":" in execution.working_dir:
+                execution.working_dir, target_file_name_module_call = execution.working_dir.split(":", 1)
+            log.warning(
+                "found task with `script.entry_point` "
+                "using a module defaulting to: {}".format(target_file_name_module_call))
+
         if repo_info and repo_info.root:
             location = Path(repo_info.root, execution.working_dir)
         else:
@@ -231,8 +256,8 @@ class LiteralScriptManager(object):
                     execution.working_dir,
                 )
             if not execution.entry_point:
-                execution.entry_point = 'untitled.py'
-            else:
+                execution.entry_point = 'untitled.sh' if is_bash_binary else 'untitled.py'
+            elif not target_file_name_module_call:
                 # ignore any folders in the entry point we only need the file name
                 execution.entry_point = execution.entry_point.split(os.path.sep)[-1]
             location = None
@@ -241,7 +266,8 @@ class LiteralScriptManager(object):
             location = Path(self.venv_folder, WORKING_STANDALONE_DIR)
             location.mkdir(exist_ok=True, parents=True)
         log.debug("selected execution directory: %s", location)
-        return Text(location), self.write(task, location, execution.entry_point)
+        target_file = self.write(task, location, target_file_name_module_call or execution.entry_point)
+        return Text(location), execution.entry_point if target_file_name_module_call else target_file
 
 
 def get_repo_auth_string(user, password):
@@ -271,6 +297,13 @@ class TaskStopReason(object):
     status_changed = 3  # type: TaskStopReason
     exception = 4       # type: TaskStopReason
     not_found = 5       # type: TaskStopReason
+
+    @classmethod
+    def to_str(cls, reason):
+        for k, v in vars(cls).items():
+            if isinstance(v, int) and v == reason:
+                return k
+        return "unknown"
 
 
 def get_task(session, task_id, **kwargs):
@@ -305,9 +338,12 @@ def get_next_task(session, queue, get_task_info=False):
     """
     Returns dict that contains next task and its additional info (company, user)
     """
+    debug = ENV_AGENT_DEBUG_GET_NEXT_TASK.get()
     request = {'queue': queue}
     if get_task_info:
         request["get_task_info"] = True
+    if debug:
+        print(f"debug> get_next_task: {Request.def_method} payload {request}")
     result = session.send_request(
         service='queues',
         action='get_next_task',
@@ -316,6 +352,8 @@ def get_next_task(session, queue, get_task_info=False):
         method=Request.def_method,
         async_enable=False,
     )
+    if debug:
+        print(f"debug> get_next_task: response {result.status_code} text {result.text}")
     if not result.ok:
         raise APIError(result)
     data = result.json().get('data')
@@ -355,10 +393,11 @@ def get_task_fields(session, task_id, fields: list, log=None) -> dict:
     return {}
 
 
-def get_task_container(session, task_id):
+def get_task_container(session, task_id, ignore_match_rules=False, allow_force_container_rules=True):
     """
     Returns dict with Task docker container setup {container: '', arguments: '', setup_shell_script: ''}
     """
+    raw_container = {}
     if session.check_min_api_version("2.13"):
         result = session.send_request(
             service='tasks',
@@ -370,6 +409,7 @@ def get_task_container(session, task_id):
         )
         try:
             container = result.json()['data']['tasks'][0]['container'] if result.ok else {}
+            raw_container = copy(container or {})
             if container.get('arguments'):
                 container['arguments'] = shlex.split(str(container.get('arguments')).strip())
             if container.get('image'):
@@ -389,9 +429,70 @@ def get_task_container(session, task_id):
                     )
                 except (ValueError, TypeError):
                     pass
+            raw_container = copy(container or {})
+            if raw_container.get("arguments"):
+                raw_container["arguments"] = ' '.join(shlex.quote(x) for x in raw_container["arguments"])
 
-    if (not container or not container.get('image')) and session.check_min_api_version("2.13"):
-        container = resolve_default_container(session=session, task_id=task_id, container_config=container)
+    no_default_container = not container or not container.get('image')
+    if no_default_container or allow_force_container_rules and session.check_min_api_version("2.13"):
+        original_container = copy(container or {})
+        updated_container, entry = resolve_default_container(
+            session=session, task_id=task_id,
+            container_config=original_container,
+            ignore_match_rules=ignore_match_rules and not no_default_container,
+        )
+        if entry and no_default_container and not ignore_match_rules:
+            # if we do not have a default container image / args, use the defaults from the resolver
+            container = updated_container
+            updated = True
+        elif entry and allow_force_container_rules and updated_container.get('force_container_rules'):
+            # if we allow to force rules (and we have requested container)
+            # and the 'force_container_rules' is turned on in the rule, then overwrite container
+            container = updated_container
+            updated = True
+        else:
+            updated = False
+
+        if updated:
+            print('INFO: Updating Task Container with matched rule:\n{}'.format(json.dumps(entry or {})))
+
+            # make sure we pop the new added fields
+            container.pop("force_container_rules", None)
+
+            # check if we need to update the Task based on the new matched container defaults or overrides
+            update_back_task = container.pop("update_back_task", None) or updated_container.pop("update_back_task", None)
+            if update_back_task and container != original_container and session.check_min_api_version("2.13"):
+                # update back the task
+                print('INFO: Updating the Task with the selected container with rule')
+                try:
+                    res = session.send_request(
+                        service='tasks', action='edit', method=Request.def_method,
+                        version='2.13',
+                        json={
+                            "task": task_id,
+                            "force": True,
+                            "container": {
+                                "image": str(container.get('image') or ""),
+                                # fix if we are left with the list of arguments, take the original arguments text,
+                                # because combining back the list is a bit off
+                                "arguments":
+                                    str(raw_container.get('arguments') or "")
+                                    if isinstance(container.get('arguments'), (list, tuple))
+                                    else str(container.get('arguments') or ""),
+                                "setup_shell_script": str(container.get('setup_shell_script') or ""),
+                            }
+                        },
+                    )
+                    if not res.ok:
+                        raise Exception("failed setting container property")
+                except Exception as ex:
+                    print("WARNING: failed setting container properties for task '{}': {}".format(task_id, ex))
+
+            # make sure we preserve backwards compatibility with the expected entries types
+            if isinstance(container.get('arguments'), str):
+                container['arguments'] = shlex.split(str(container.get('arguments') or '').strip())
+            if container.get('image'):
+                container['image'] = container.get('image').strip()
 
     return container
 
@@ -438,14 +539,18 @@ class TaskStopSignal(object):
     ]
     default = TaskStopReason.no_stop
     stopping_message = "stopping"
+    property_abort_callback_completed = "_abort_callback_completed"
+    property_abort_callback_timeout = "_abort_callback_timeout"
+    property_abort_poll_freq = "_abort_poll_freq"
 
-    def __init__(self, command, session, events_service, task_id):
-        # type: (Worker, Session, Events, Text) -> ()
+    def __init__(self, command, session, events_service, task_id, bash_cwd=None):
+        # type: (Worker, Session, Events, Text, Text) -> None
         """
         :param command: workers command
         :param session: command session
         :param events_service: events service object
         :param task_id: followed task ID
+        :param bash_cwd: cwd for bash on_abort callback
         """
         self.command = command
         self.session = session
@@ -457,6 +562,111 @@ class TaskStopSignal(object):
         self._active_callback_timestamp = None
         self._active_callback_timeout = None
         self._abort_callback_max_timeout = float(self.session.config.get('agent.abort_callback_max_timeout', 1800))
+        self._bash_callback_cwd = bash_cwd
+        self._bash_callback = None
+        self._bash_callback_timeout = None
+        self._bash_callback_thread = None
+        self._self_monitor_thread = None
+
+    @classmethod
+    def check_registered_bash_callback(cls):
+        return bool((ENV_ABORT_CALLBACK_CMD.get() or
+                     os.environ.get(ENV_ABORT_CALLBACK_CMD.vars[0] + "_REGISTERED") or
+                     "").strip())
+
+    def register_bash_callback(self):
+        if self._bash_callback:
+            return
+        # check if the env variable defined a callback
+        if not (ENV_ABORT_CALLBACK_CMD.get() or "").strip():
+            return
+        self._bash_callback = shlex.split(ENV_ABORT_CALLBACK_CMD.get())
+        # make sure we are re-testing in subprocesses
+        os.environ[ENV_ABORT_CALLBACK_CMD.vars[0]+"_REGISTERED"] = ENV_ABORT_CALLBACK_CMD.get()
+        ENV_ABORT_CALLBACK_CMD.pop()
+
+        # noinspection PyBroadException
+        try:
+            self._bash_callback_timeout = int((ENV_ABORT_CALLBACK_CMD_TIMEOUT.get() or "").strip() or 180)
+        except Exception:
+            self._bash_callback_timeout = 180
+
+        # update the task runtime properties
+        try:
+            task_info = self.session.get(
+                service="tasks", action="get_all", version="2.13",
+                id=[self.task_id], only_fields=["runtime"])['tasks'][0]
+            runtime_properties = task_info.get("runtime") or {}
+            runtime_properties[self.property_abort_callback_timeout] = str(self._bash_callback_timeout)
+            runtime_properties[self.property_abort_poll_freq] = str(10)
+            self.session.post(service="tasks", action="edit", version="2.13",
+                              task=self.task_id, runtime=runtime_properties, force=True)
+        except Exception as ex:
+            print("WARNING: failed registering bash callback: {}".format(ex))
+            return
+
+        print("INFO: registering bash callback, timout {}s: {}".format(
+            self._bash_callback_timeout, self._bash_callback))
+
+    def start_monitor_thread(self, polling_interval_sec=10):
+        self.register_bash_callback()
+
+        if self._self_monitor_thread:
+           return
+        self._self_monitor_thread = Thread(target=self._monitor_thread_loop, args=(polling_interval_sec, ))
+        self._self_monitor_thread.daemon = True
+        self._self_monitor_thread.start()
+        print("INFO: bash on_abort monitor thread started")
+
+    def stop_monitor_thread(self, wait_on_abort_timeout=-1):
+        # if no on_abort callback was launched, or it's done, nothing to do
+        if not self._bash_callback_thread or not self._self_monitor_thread:
+            self._self_monitor_thread = None
+            return
+
+        # we need to wait for the on_abort callback to be done
+        if wait_on_abort_timeout and wait_on_abort_timeout < 0:
+            wait_on_abort_timeout = self._abort_callback_max_timeout
+
+        if wait_on_abort_timeout:
+            tic = time()
+            while self._bash_callback_thread and (time() - tic < wait_on_abort_timeout):
+                sleep(1)
+
+        self._self_monitor_thread = None
+
+    def _monitor_thread_loop(self, polling_interval_sec=10):
+        while self._self_monitor_thread is not None:
+            sleep(polling_interval_sec)
+            stop_reason = self.test()
+            if stop_reason != TaskStopSignal.default:
+                # mark quit loop
+                self._self_monitor_thread = None
+                break
+
+    def _bash_callback_launch_thread(self):
+        command = Argv(*self._bash_callback)
+        print("INFO: running bash on_abort callback: {}".format(command.pretty()))
+        try:
+            command.check_call(cwd=self._bash_callback_cwd or None)
+        except Exception as ex:
+            print("WARNING: failed running bash callback: {}".format(ex))
+
+        # update the task runtime properties
+        try:
+            task_info = self.session.get(
+                service="tasks", action="get_all", version="2.13",
+                id=[self.task_id], only_fields=["runtime"])['tasks'][0]
+            runtime_properties = task_info.get("runtime") or {}
+            runtime_properties[self.property_abort_callback_completed] = str(1)
+            self.session.post(service="tasks", action="edit", version="2.13",
+                              task=self.task_id, runtime=runtime_properties, force=True)
+        except Exception as ex:
+            print("WARNING: failed updating bash callback completed: {}".format(ex))
+
+        # mark we are done
+        self._bash_callback_thread = None
+        return
 
     def test(self):
         # type: () -> TaskStopReason
@@ -487,8 +697,12 @@ class TaskStopSignal(object):
                 try:
                     task_info = self.session.get(
                         service="tasks", action="get_all", version="2.13", id=[self.task_id],
-                        only_fields=["status", "status_message", "runtime._abort_callback_completed"])
-                    cb_completed = task_info['tasks'][0]['runtime'].get('_abort_callback_completed', None)
+                        only_fields=[
+                            "status", "status_message",
+                            "runtime.{}".format(self.property_abort_callback_completed)
+                        ]
+                    )
+                    cb_completed = task_info['tasks'][0]['runtime'].get(self.property_abort_callback_completed, None)
                 except:  # noqa
                     pass
 
@@ -524,6 +738,13 @@ class TaskStopSignal(object):
             session=self.session
         )
 
+        # launch bash callback if exists
+        if self._bash_callback and not self._bash_callback_thread:
+            print("INFO: bash on_abort callback thread started")
+            self._bash_callback_thread = Thread(target=self._bash_callback_launch_thread)
+            self._bash_callback_thread.daemon = True
+            self._bash_callback_thread.start()
+
         self._active_callback_timestamp = time()
         self._active_callback_timeout = timeout
         return bool(cb_completed)
@@ -533,11 +754,16 @@ class TaskStopSignal(object):
         try:
             task_info = self.session.get(
                 service="tasks", action="get_all", version="2.13", id=[self.task_id],
-                only_fields=["status", "status_message", "runtime._abort_callback_timeout",
-                             "runtime._abort_poll_freq", "runtime._abort_callback_completed"])
-            abort_timeout = task_info['tasks'][0]['runtime'].get('_abort_callback_timeout', 0)
-            poll_timeout = task_info['tasks'][0]['runtime'].get('_abort_poll_freq', 0)
-            cb_completed = task_info['tasks'][0]['runtime'].get('_abort_callback_completed', None)
+                only_fields=[
+                    "status", "status_message",
+                    "runtime.{}".format(self.property_abort_callback_timeout),
+                    "runtime.{}".format(self.property_abort_poll_freq),
+                    "runtime.{}".format(self.property_abort_callback_completed)
+                ]
+            )
+            abort_timeout = task_info['tasks'][0]['runtime'].get(self.property_abort_callback_timeout, 0)
+            poll_timeout = task_info['tasks'][0]['runtime'].get(self.property_abort_poll_freq, 0)
+            cb_completed = task_info['tasks'][0]['runtime'].get(self.property_abort_callback_completed, None)
         except:  # noqa
             abort_timeout = None
             poll_timeout = None
@@ -592,7 +818,7 @@ class TaskStopSignal(object):
             # actively waiting for task to complete
             if self._wait_for_abort_callback() is False:
                 return TaskStopReason.no_stop
-            return TaskStopReason.status_changed
+            return TaskStopReason.exception if status == self.statuses.failed else TaskStopReason.status_changed
 
         if status == self.statuses.created:
             if (
@@ -638,12 +864,15 @@ class Worker(ServiceCommandSection):
         ExternalRequirements,
         partial(PackageCollectorRequirement, collect_package=['trains']),
         partial(PackageCollectorRequirement, collect_package=['clearml']),
+        partial(PackageCollectorRequirement, collect_package=['nbconvert']),
+        partial(PackageCollectorRequirement, collect_package=['ipython']),
     )
 
-    # poll queues every _polling_interval seconds
-    _polling_interval = 5.0
+    # default poll queues every _polling_interval seconds
+    _polling_interval = ENV_QUEUE_POLL_FREQ_SEC.get() or 5.0
+
     # machine status update intervals, seconds
-    _machine_update_interval = 30.0
+    _machine_update_interval = ENV_STATUS_REPORT_FREQ_SEC.get() or 30.0
 
     # message printed before starting task logging,
     # it will be parsed by services_mode, to identify internal docker logging start
@@ -718,9 +947,13 @@ class Worker(ServiceCommandSection):
 
         self.is_venv_update = self._session.config.agent.venv_update.enabled
         self.poetry = PoetryConfig(self._session)
+        self.uv = UvConfig(self._session)
         self.docker_image_func = None
+        self._patch_docker_cmd_func = None
         self._docker_image = None
         self._docker_arguments = None
+        # if True, docker default passed on command line, which means we ignore the default docker match rules
+        self._docker_default_cmd_override = False
         PackageManager.set_pip_version(self._session.config.get("agent.package_manager.pip_version", None))
         self._extra_docker_arguments = (
                 ENV_EXTRA_DOCKER_ARGS.get() or self._session.config.get("agent.extra_docker_arguments", None)
@@ -732,7 +965,7 @@ class Worker(ServiceCommandSection):
         self._services_mode = None
         self._impersonate_as_task_owner = None
         self._worker_tags = None
-        self._dynamic_gpus = None
+        self._dynamic_gpus = None  # valid options, True/False, "fractional"
         self._force_current_version = None
         self._redirected_stdout_file_no = None
         self._uptime_config = self._session.config.get("agent.uptime", None)
@@ -907,12 +1140,14 @@ class Worker(ServiceCommandSection):
             print("Warning: failed obtaining/setting hostname for task '{}': {}".format(task_id, ex))
 
         # set task status to in_progress so we know it was popped from the queue
-        # noinspection PyBroadException
-        try:
-            task_session.send_api(tasks_api.StartedRequest(task=task_id, status_message="pulled by agent", force=True))
-        except Exception:
-            print("Warning: Could not start task id '{}', skipping".format(task_id))
-            return
+        if not self._get_node_rank():
+            # noinspection PyBroadException
+            try:
+                task_session.send_api(tasks_api.StartedRequest(task=task_id, status_message="launch by agent", force=True))
+            except Exception:
+                print("Warning: Could not set status=in_progress task id '{}', skipping".format(task_id))
+                return
+
         # setup console log
         temp_stdout_name = safe_mkstemp(
             suffix=".txt", prefix=".clearml_agent_out.", name_only=True, dir=(ENV_TEMP_STDOUT_FILE_DIR.get() or None)
@@ -932,7 +1167,8 @@ class Worker(ServiceCommandSection):
         if self.docker_image_func:
             # noinspection PyBroadException
             try:
-                task_container = get_task_container(task_session, task_id)
+                task_container = get_task_container(
+                    task_session, task_id, ignore_match_rules=self._docker_default_cmd_override)
             except Exception:
                 task_container = {}
 
@@ -952,11 +1188,14 @@ class Worker(ServiceCommandSection):
 
             self.send_logs(
                 task_id=task_id,
-                lines=
-                ['Running Task {} inside {}docker: {} arguments: {}\n'.format(
-                    task_id, "default " if default_docker else '',
-                    docker_image, DockerArgsSanitizer.sanitize_docker_command(self._session, docker_arguments or []))]
-                + (['custom_setup_bash_script:\n{}'.format(docker_setup_script)] if docker_setup_script else []),
+                lines=[
+                    'Running Task {} inside {}docker: {} arguments: {}\n'.format(
+                        task_id,
+                        "default " if default_docker else '',
+                        docker_image,
+                        DockerArgsSanitizer.sanitize_docker_command(self._session, docker_arguments or [])
+                    )
+                ] + (['custom_setup_bash_script:\n{}\n'.format(docker_setup_script)] if docker_setup_script else []),
                 level="INFO",
                 session=task_session,
             )
@@ -1005,6 +1244,15 @@ class Worker(ServiceCommandSection):
                     else:
                         print("Warning: generated docker container name is invalid: {}".format(name))
 
+            # convert template arguments now (i.e. ${CLEARML_} ), this is important for the docker arg
+            # resolve the Task's docker arguments before everything else, because
+            # unlike the vault/config these are not running as the agent's user, they are the user's,
+            # we need to filter them post template parsing limitation to happen before the `docker_image_func` call
+            docker_args_template_resolver = DockerArgsTemplateResolver(task_session=self._session, task_id=task_id)
+            if docker_params.get("docker_arguments"):
+                docker_params["docker_arguments"] = docker_args_template_resolver.resolve_docker_args_from_template(
+                    full_docker_cmd=docker_params["docker_arguments"])
+
             full_docker_cmd = self.docker_image_func(env_task_id=task_id, **docker_params)
 
             # if we are using the default docker, update back the Task:
@@ -1020,6 +1268,12 @@ class Worker(ServiceCommandSection):
                     )
                 except Exception:
                     pass
+
+            # convert template arguments now (i.e. ${CLEARML_} )
+            # Notice we do not parse the last part of the docker cmd because that's
+            # the actual command to be executed inside the docker
+            full_docker_cmd = docker_args_template_resolver.resolve_docker_args_from_template(
+                full_docker_cmd=full_docker_cmd[:-1]) + [full_docker_cmd[-1]]
 
             # if this is services_mode, change the worker_id to a unique name
             # abd use full-monitoring, ot it registers itself as a worker for this specific service.
@@ -1038,6 +1292,10 @@ class Worker(ServiceCommandSection):
                 level="INFO",
                 session=task_session,
             )
+
+            # patch the full docker cmd if needed, notice this is done post reporting
+            if self._patch_docker_cmd_func:
+                full_docker_cmd = self._patch_docker_cmd_func(full_docker_cmd)
 
             cmd = Argv(*full_docker_cmd, display_argv=display_docker_command)
 
@@ -1132,8 +1390,15 @@ class Worker(ServiceCommandSection):
         Requires that agent session credentials will allow impersonation as task user
         """
         def get_new_session(session, headers):
-            result = session.send(auth_api.LoginRequest(), headers=headers)
+            result = session.send(
+                auth_api.LoginRequest(expiration_sec=session.req_token_expiration_sec),
+                headers=headers
+            )
             if not (result.ok() and result.response):
+                try:
+                    self.log.debug("Failed creating task session: %s", result.response)
+                except:
+                    pass
                 return
             new_session = copy(session)
             new_session.config = deepcopy(session.config)
@@ -1184,14 +1449,15 @@ class Worker(ServiceCommandSection):
 
         # get current running instances
         available_gpus = None
+        allocated_gpus = {}
         dynamic_gpus_worker_id = None
         if gpu_indexes and gpu_queues:
-            available_gpus, gpu_queues = self._setup_dynamic_gpus(gpu_queues)
+            available_gpus, gpu_queues = self._setup_dynamic_gpus(gpu_queues, gpu_indexes)
             # multi instance support
             self._services_mode = True
 
         # last 64 tasks
-        list_task_gpus_ids = {}
+        dict_task_gpus_ids = {}  # {str(gpu_indexes): task_id}
         try:
             while True:
                 queue_tags = None
@@ -1215,7 +1481,7 @@ class Worker(ServiceCommandSection):
 
                 # update available gpus
                 if gpu_queues:
-                    available_gpus = self._dynamic_gpu_get_available(gpu_indexes)
+                    available_gpus, allocated_gpus = self._dynamic_gpu_get_available(gpu_indexes)
                     # if something went wrong, or we have no free gpus
                     # start over from the highest priority queue
                     if not available_gpus:
@@ -1244,11 +1510,21 @@ class Worker(ServiceCommandSection):
                         if not len(response.queue.entries):
                             continue
                         # check if we do not have enough available gpus
-                        if gpu_queues[queue][0] > len(available_gpus):
+                        # Notice that gpu_queues[queue] is (min_gpu, max_gpu) that we should allocate
+                        # for a Task pulled from that queue, this means
+                        # gpu_queues[queue][0] is the minimum number of GPUs we need
+                        # and min_available_fract_gpu is the maximum number of fraction of GPU
+                        # and max_available_gpus is the maximum number of full GPUs we have
+                        min_available_fract_gpu = max([v for v in available_gpus.values()])
+                        max_available_gpus = sum([v for v in available_gpus.values() if v >= 1])
+                        if gpu_queues[queue][0] > max(float(max_available_gpus), min_available_fract_gpu):
                             # not enough available_gpus, we should sleep and start over
                             if self._daemon_foreground or worker_params.debug:
                                 print("Not enough free GPUs {}/{}, sleeping for {:.1f} seconds".format(
-                                    len(available_gpus), gpu_queues[queue][0], self._polling_interval))
+                                    max(float(max_available_gpus), min_available_fract_gpu),
+                                    gpu_queues[queue][0],
+                                    self._polling_interval)
+                                )
                             sleep(self._polling_interval)
                             break
 
@@ -1282,6 +1558,17 @@ class Worker(ServiceCommandSection):
                             except:
                                 pass
 
+                        # set task status to in_progress so we know it was popped from the queue
+                        # next api version we will set the status when pulling from the queue
+                        if not self._get_node_rank():
+                            # noinspection PyBroadException
+                            try:
+                                self._session.send_api(
+                                    tasks_api.StartedRequest(task=task_id, status_message="pulled by agent", force=True))
+                            except Exception:
+                                print("Warning: Could not set status=in_progress task id '{}', retrying in a bit".format(task_id))
+
+                        # check if we need to impersonate
                         task_session = None
                         if self._impersonate_as_task_owner:
                             try:
@@ -1306,17 +1593,85 @@ class Worker(ServiceCommandSection):
                         dynamic_gpus_worker_id = self.worker_id
                         # the following is only executed in dynamic gpus mode
                         if gpu_queues and gpu_queues.get(queue):
+                            gpus = []
+                            fractions = []
                             # pick the first available GPUs
                             # gpu_queues[queue] = (min_gpus, max_gpus)
-                            # get as many gpus as possible with max_gpus as limit, the min is covered before
-                            gpus = available_gpus[:gpu_queues.get(queue)[1]]
-                            available_gpus = available_gpus[gpu_queues.get(queue)[1]:]
+                            # first check if the max_gpus is larger equal to 1 (if so, allocate full GPUs)
+                            if float(gpu_queues.get(queue)[1]) >= 1:
+                                gpus = [g for g, v in available_gpus.items() if v >= 1]
+                                if gpus:
+                                    # get as many gpus as possible with max_gpus as limit, the min is covered before
+                                    gpus = gpus[:int(gpu_queues.get(queue)[1])]
+                                    fractions = [1] * len(gpus)
+                                    # update available gpus
+                                    available_gpus = {g: v for g, v in available_gpus.items() if g not in gpus}
+                                else:
+                                    # we assume the minimum was < 1 GPU, otherwise why are we here
+                                    pass
+
+                            # if this is under 1 GPU
+                            if not gpus:
+                                # find the GPU with availability that covers the minimum
+                                _max_req_gpu = min(float(gpu_queues.get(queue)[1]), 1.)
+                                _min_req_gpu = float(gpu_queues.get(queue)[0])
+                                _potential_gpus = {
+                                    g: (v - float(_max_req_gpu)) for g, v in available_gpus.items()
+                                    if v >= float(_min_req_gpu)}
+                                # sort based on the least available that can fit the maximum
+                                # find the first instance that is positive or 0
+                                _potential_gpus = sorted(_potential_gpus.items(), key=lambda a: a[1])
+                                gpus = [(g, v) for g, v in _potential_gpus if v >= 0]
+                                if gpus:
+                                    available_gpus[gpus[0][0]] -= _max_req_gpu
+                                    gpus = [gpus[0][0]]
+                                    fractions = [_max_req_gpu]
+                                else:
+                                    gpus = [_potential_gpus[-1][0]]
+                                    # this is where we need to decide on the actual granularity
+                                    # now it is hardcoded to 1/8th
+                                    _base_fract = 8
+                                    avail_fract = int(float(available_gpus[_potential_gpus[-1][0]]) * _base_fract)
+                                    fractions = [avail_fract/float(avail_fract)]
+                                    available_gpus[_potential_gpus[-1][0]] -= fractions[0]
+
+                                try:
+                                    from clearml_agent_fractional_gpu import patch_docker_cmd_gpu_fraction  # noqa
+                                    # new docker image func
+                                    self._patch_docker_cmd_func = lambda docker_cmd: (
+                                        patch_docker_cmd_gpu_fraction(docker_cmd, gpu_fraction=fractions[0]))
+                                except Exception:
+                                    print("Error! could not load clearml_agent_fractional_gpu module! "
+                                          "failed configuring fractional GPU support")
+                                    raise
+
                             self.set_runtime_properties(
-                                key='available_gpus', value=','.join(str(g) for g in available_gpus))
+                                key='available_gpus',
+                                value=','.join("{}_{}".format(g, str(f)[2:]) for g, f in available_gpus.items()))
+
+                            # this is where we set the fractions as well as gpus
                             Session.set_nvidia_visible_env(gpus)
-                            list_task_gpus_ids.update({str(g): task_id for g in gpus})
-                            self.worker_id = ':'.join(
-                                self.worker_id.split(':')[:-1] + ['gpu'+','.join(str(g) for g in gpus)])
+
+                            if fractions and min(fractions) < 1:
+                                # we assume a single gpu in the list
+                                gpu_idx_fract = ["{}.{}".format(g, str(f)[2:]) for g, f in zip(gpus, fractions)]
+                                # check a new available unique name (id) for us
+                                from string import ascii_lowercase
+                                for x in ascii_lowercase:
+                                    if gpu_idx_fract[0]+x not in allocated_gpus:
+                                        gpu_idx_fract[0] = gpu_idx_fract[0]+x
+                                        break
+
+                                # add the new task
+                                allocated_gpus[gpu_idx_fract[0]] = fractions[0]
+                                dict_task_gpus_ids.update({str(g): task_id for g in gpu_idx_fract})
+                                self.worker_id = ':'.join(
+                                    self.worker_id.split(':')[:-1] + ['gpu'+','.join(str(g) for g in gpu_idx_fract)])
+                            else:
+                                # update the task list
+                                dict_task_gpus_ids.update({str(g): task_id for g in gpus})
+                                self.worker_id = ':'.join(
+                                    self.worker_id.split(':')[:-1] + ['gpu'+','.join(str(g) for g in gpus)])
 
                         self.send_logs(
                             task_id=task_id,
@@ -1327,9 +1682,13 @@ class Worker(ServiceCommandSection):
 
                         self.run_one_task(queue, task_id, worker_params, task_session=task_session)
 
+                        # restore back worker_id / GPUs
                         if gpu_queues:
                             self.worker_id = dynamic_gpus_worker_id
                             Session.set_nvidia_visible_env(org_gpus)
+
+                        # clear docker patching function (if exists
+                        self._patch_docker_cmd_func = None
 
                         self.report_monitor(ResourceMonitor.StatusReport(queues=self.queues))
 
@@ -1351,7 +1710,7 @@ class Worker(ServiceCommandSection):
         finally:
             # if we are in dynamic gpus mode, shutdown all active runs
             if self.docker_image_func:
-                for t_id in set(list_task_gpus_ids.values()):
+                for t_id in set(dict_task_gpus_ids.values()):
                     if shutdown_docker_process(docker_cmd_contains='--id {}\'\"'.format(t_id)):
                         self.handle_task_termination(task_id=t_id, exit_code=0, stop_reason=TaskStopReason.stopped)
             else:
@@ -1369,41 +1728,70 @@ class Worker(ServiceCommandSection):
                 self._unregister()
 
     def _dynamic_gpu_get_available(self, gpu_indexes):
-        # cast to string
-        gpu_indexes = [str(g) for g in gpu_indexes]
+        # key: cast to string, value: 1 (i.e. gull GPU)
+        gpu_indexes = {str(g): 1 for g in gpu_indexes}
+        worker_name = self._session.config.get("agent.worker_name", "") + ':gpu'
+
+        # only return "Our" workers (requires server API +2, otherwise the selecort pattern is ignored)
         # noinspection PyBroadException
         try:
-            response = self._session.send_api(workers_api.GetAllRequest(last_seen=600))
+            response = self._session.send_api(workers_api.GetAllRequest(
+                last_seen=600,
+                worker_pattern="{}*".format(worker_name),
+                _allow_extra_fields_=True
+            ))
         except Exception:
             return None
 
-        worker_name = self._session.config.get("agent.worker_name", "") + ':gpu'
+        # filter only our workers, in case the selector pattern above was ignored due to lower version API server
         our_workers = [
             w.id for w in response.workers
-            if w.id.startswith(worker_name) and w.id != self.worker_id]
-        gpus = []
+            if w.id.startswith(worker_name) and w.id != self.worker_id
+        ]
+        gpus = {}
+        allocated_gpus = {}
+        gpu_pattern = re.compile(r"\d+[.]?\d*[a-z]?")
+        fract_gpu_pattern = re.compile(r"\d+[.]?\d*[a-z]+")
         for w in our_workers:
             for g in w.split(':')[-1].lower().replace('gpu', '').split(','):
                 try:
-                    # verify "int.int"
-                    gpus += [str(g).strip()] if float(g.strip()) >= 0 else []
+                    # verify pattern "int.int" or "int.int[a-z]"
+                    gpu_idx_name = g.strip()
+                    if gpu_pattern.fullmatch(gpu_idx_name):
+                        # check if this is a fraction
+                        if fract_gpu_pattern.fullmatch(gpu_idx_name):
+                            gpu_idx = gpu_idx_name.split(".")[0]
+                            gpu_fract = float("0.{}".format(gpu_idx_name.split(".")[-1][:-1]))
+                            # the entire gpu
+                            gpus[gpu_idx] = gpus.get(gpu_idx, 0) + gpu_fract
+                            # the gpu fraction uid eg 0.25a
+                            allocated_gpus[gpu_idx_name] = gpu_fract
+                        else:
+                            # or a static MIG slice
+                            gpus[gpu_idx_name] = 1
+                            allocated_gpus[gpu_idx_name] = 1
+                    else:
+                        print("INFO: failed parsing fractional GPU '{}' - skipping".format(g))
                 except (ValueError, TypeError):
                     print("INFO: failed parsing GPU int('{}') - skipping".format(g))
-        available_gpus = list(set(gpu_indexes) - set(gpus))
 
-        return available_gpus
+        # remove the GPUs we have workers running on
+        available_gpus = {g: (v - gpus.get(g, 0)) for g, v in gpu_indexes.items() if (v - gpus.get(g, 0)) > 0}
+        return available_gpus, allocated_gpus
 
-    def _setup_dynamic_gpus(self, gpu_queues):
+    def _setup_dynamic_gpus(self, gpu_queues, gpu_indexes):
         available_gpus = self.get_runtime_properties()
         if available_gpus is None:
             raise ValueError("Dynamic GPU allocation is not supported by your ClearML-server")
         available_gpus = [prop["value"] for prop in available_gpus if prop["key"] == 'available_gpus']
         if available_gpus:
-            gpus = []
-            for g in available_gpus[-1].split(','):
+            gpus = {}
+            for g_v in available_gpus[-1].split(','):
+                g, v = g_v.split("_")
                 try:
-                    # verify "int.int"
-                    gpus += [str(g).strip()] if float(g.strip()) >= 0 else []
+                    # verify "int.int_float"
+                    if float(g.strip()) >= 0:
+                        gpus[g.strip()] = float("0."+v)
                 except (ValueError, TypeError):
                     print("INFO: failed parsing GPU int('{}') - skipping".format(g))
             available_gpus = gpus
@@ -1412,10 +1800,11 @@ class Worker(ServiceCommandSection):
             gpu_queues = dict(gpu_queues)
 
         if not self.set_runtime_properties(
-                key='available_gpus', value=','.join(str(g) for g in available_gpus)):
+                key='available_gpus', value=','.join("{}_{}".format(g, str(v)[2:]) for g, v in available_gpus.items())):
             raise ValueError("Dynamic GPU allocation is not supported by your ClearML-server")
 
-        self.cluster_report_monitor(available_gpus=available_gpus, gpu_queues=gpu_queues)
+        # because it sets the MAX not the actual available (i.e. free) GPUS
+        self.cluster_report_monitor(available_gpus=gpu_indexes, gpu_queues=gpu_queues)
 
         return available_gpus, gpu_queues
 
@@ -1522,7 +1911,7 @@ class Worker(ServiceCommandSection):
 
     def reload_config(self):
         try:
-            reloaded = self._session.reload()
+            reloaded = self._session.config.reload()
         except Exception as ex:
             self.log("Failed reloading config file")
             self.log_traceback(ex)
@@ -1575,6 +1964,7 @@ class Worker(ServiceCommandSection):
         self._use_owner_token(kwargs.get('use_owner_token', False))
 
         self._standalone_mode = kwargs.get('standalone_mode', False)
+        self._polling_interval = max(kwargs.get('polling_interval', 5), 5)
         self._services_mode = kwargs.get('services_mode', False)
         # must have docker in services_mode
         if self._services_mode:
@@ -1593,6 +1983,10 @@ class Worker(ServiceCommandSection):
 
         if self._services_mode and dynamic_gpus:
             raise ValueError("Combining --dynamic-gpus and --services-mode is not supported")
+
+        if self._dynamic_gpus == "fractional" and docker in (None, False):
+            raise ValueError("Fractional GPUs are only supported in docker-mode, "
+                             "add --docker to allow docker-mode operation")
 
         # We are not running a daemon we are killing one.
         # find the pid send termination signal and leave
@@ -1639,7 +2033,7 @@ class Worker(ServiceCommandSection):
         columns = ("id", "name", "tags")
         print("Listening to queues:")
         if dynamic_gpus:
-            columns = ("id", "name", "tags", "gpus")
+            columns = ("id", "name", "tags", "gpus (min, max)")
             for q in queues_info:
                 q['gpus'] = str(dict(dynamic_gpus).get(q['id']) or '')
         print_table(queues_info, columns=columns, titles=columns)
@@ -1762,6 +2156,7 @@ class Worker(ServiceCommandSection):
         if not dynamic_gpus:
             return None, None, queues
 
+        has_fractional = False
         queue_names = [q.name for q in queues]
         if not all('=' in q for q in queue_names):
             raise ValueError("using --dynamic-gpus, --queue [{}], "
@@ -1790,9 +2185,12 @@ class Worker(ServiceCommandSection):
         for s in queue_names:
             s_p = s.split('=')
             name = s[:-1 - len(s_p[-1])]
-            min_max_g = int(s_p[-1].split('-')[0] or 1), int(s_p[-1].split('-')[-1])
+            min_max_g = float(s_p[-1].split('-')[0] or 1), float(s_p[-1].split('-')[-1])
             if min(min_max_g) <= 0:
                 raise ValueError("Parsing min/max number of gpus <= 0 is not allowed: \"{}\"".format(s))
+            if any(g for g in min_max_g if 1 < g != int(g)):
+                raise ValueError("Parsing min/max number of gpus, fractional gpu cannot be > 1: \"{}\"".format(s))
+            has_fractional = min(min_max_g) < 1
             dynamic_gpus.append((name, min_max_g,))
         queue_names = [q for q, _ in dynamic_gpus]
         # resolve queue ids
@@ -1802,15 +2200,16 @@ class Worker(ServiceCommandSection):
         # maintain original priority order
         queues = [q for q, _ in dynamic_gpus]
 
-        self._dynamic_gpus = True
+        self._dynamic_gpus = "fractional" if has_fractional else True
 
         return dynamic_gpus, gpu_indexes, queues
 
     def _register_dynamic_gpus(self, gpu_indexes):
         # test server support
-        available_gpus = self._dynamic_gpu_get_available(gpu_indexes)
+        available_gpus, allocated_gpus = self._dynamic_gpu_get_available(gpu_indexes)
         if not self.set_runtime_properties(
-                key='available_gpus', value=','.join(str(g) for g in available_gpus)):
+                key='available_gpus',
+                value=','.join("{}_{}".format(g, str(v)[2:]) for g, v in available_gpus.items())):
             raise ValueError("Dynamic GPU allocation is not supported by your ClearML-server")
 
     def report_monitor(self, report):
@@ -1929,7 +2328,15 @@ class Worker(ServiceCommandSection):
         stderr_line_count, stderr_pos_count, stderr_last_lines = 0, 0, []
         lines_buffer = defaultdict(list)
 
-        def report_lines(lines, source):
+        def report_lines(lines, source, a_multi_node_single_task=None):
+            # support colored multi-node reporting on the same Task for easier debugging
+            if lines and a_multi_node_single_task and a_multi_node_single_task > 0:
+                rank = self._get_node_rank()
+                if rank:
+                    # see ANSI color: https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
+                    # Only the "RANK x: line is colored to preserve the original color reporting
+                    lines = ["\033[38;5;{}mRANK {}:\033[0m\n".format(20+(rank % 210), rank)] + lines
+
             if not self._truncate_task_output_files:
                 # non-buffered
                 return self.send_logs(task_id, lines, session=session)
@@ -1947,6 +2354,7 @@ class Worker(ServiceCommandSection):
         status = None
         process = None
         last_task_ping = 0
+        multi_node_single_task = ENV_MULTI_NODE_SINGLE_TASK.get()
         try:
             _last_machine_update_ts = time()
             stop_reason = None
@@ -1968,7 +2376,11 @@ class Worker(ServiceCommandSection):
                     if daemon:
                         self.send_logs(
                             task_id=task_id,
-                            lines=["User aborted: stopping task ({})\n".format(str(stop_reason))],
+                            lines=["{}: stopping task ({}) {}\n".format(
+                                "User aborted" if stop_reason != TaskStopReason.exception else "Task failed",
+                                stop_reason,
+                                TaskStopReason.to_str(stop_reason))
+                            ],
                             level="ERROR",
                             session=session,
                         )
@@ -2005,11 +2417,11 @@ class Worker(ServiceCommandSection):
                     if status is not None:
                         stop_reason = 'Service started'
 
-                stdout_line_count += report_lines(printed_lines, "stdout")
+                stdout_line_count += report_lines(printed_lines, "stdout", multi_node_single_task)
 
                 if stderr_path:
                     printed_lines, stderr_pos_count = _print_file(stderr_path, stderr_pos_count)
-                    stderr_line_count += report_lines(printed_lines, "stderr")
+                    stderr_line_count += report_lines(printed_lines, "stderr", multi_node_single_task)
 
         except subprocess.CalledProcessError as ex:
             # non zero return code
@@ -2023,10 +2435,10 @@ class Worker(ServiceCommandSection):
         except Exception:
             # we should not get here, but better safe than sorry
             printed_lines, stdout_pos_count = _print_file(stdout_path, stdout_pos_count)
-            stdout_line_count += report_lines(printed_lines, "stdout")
+            stdout_line_count += report_lines(printed_lines, "stdout", multi_node_single_task)
             if stderr_path:
                 printed_lines, stderr_pos_count = _print_file(stderr_path, stderr_pos_count)
-                stderr_line_count += report_lines(printed_lines, "stderr")
+                stderr_line_count += report_lines(printed_lines, "stderr", multi_node_single_task)
             stop_reason = TaskStopReason.exception
             status = -1
 
@@ -2244,14 +2656,16 @@ class Worker(ServiceCommandSection):
             OnlyExternalRequirements.cwd = package_api.cwd = cwd
             package_api.requirements_manager = self._get_requirements_manager(
                 base_interpreter=package_api.requirements_manager.get_interpreter(),
-                requirement_substitutions=[OnlyExternalRequirements],
+                requirement_substitutions=[CachedPackageRequirement, OnlyExternalRequirements],
             )
             # manually update the current state,
             # for the external git reference chance (in the replace callback)
             package_api.requirements_manager.update_installed_packages_state(package_api.freeze())
             # make sure we run the handlers
             cached_requirements = \
-                {k: package_api.requirements_manager.replace(requirements[k] or '')
+                {k: package_api.requirements_manager.replace(
+                    requirements=requirements[k] or '',
+                    existing_packages=package_api.requirements_manager.get_installed_packages_state())
                  for k in requirements}
             package_api.load_requirements(cached_requirements)
             # make sure we call the correct freeze
@@ -2274,7 +2688,7 @@ class Worker(ServiceCommandSection):
         print("Restoring running environment of task id [%s]:" % task_id)
         if freeze:
             print("Summary - installed python packages:")
-            print(dump_yaml(freeze))
+            print(dump_flat_dict(freeze))
         else:
             print("No freeze information available")
 
@@ -2309,7 +2723,8 @@ class Worker(ServiceCommandSection):
         else:
             # noinspection PyBroadException
             try:
-                task_container = get_task_container(self._session, task_id)
+                task_container = get_task_container(
+                    self._session, task_id, ignore_match_rules=self._docker_default_cmd_override)
                 if (
                     task_container.get('image')
                     and not self._session.config.get('agent.disable_task_docker_override', False)
@@ -2326,6 +2741,11 @@ class Worker(ServiceCommandSection):
         full_docker_cmd = self.docker_image_func(
             docker_image=docker_image, docker_arguments=docker_arguments, docker_bash_setup_script=docker_setup_script
         )
+
+        # convert docker template arguments (i.e. ${CLEARML_} ) based on the current Task
+        docker_args_template_resolver = DockerArgsTemplateResolver(task_session=self._session, task_id=task_id)
+        full_docker_cmd = docker_args_template_resolver.resolve_docker_args_from_template(
+            full_docker_cmd=full_docker_cmd)
 
         end_of_build_marker = "build.done=true"
         docker_cmd_suffix = ' build --id {task_id} --install-globally; ' \
@@ -2392,18 +2812,24 @@ class Worker(ServiceCommandSection):
 
         return
 
-    def _get_task_python_version(self, task):
+    @staticmethod
+    def _get_task_python_version(task):
         # noinspection PyBroadException
         try:
             python_ver = task.script.binary
-            python_ver = python_ver.split('/')[-1].replace('python', '')
+            python_ver = python_ver.split('/')[-1]
+            if not python_ver.startswith("python"):
+                return None
+
+            python_ver = python_ver.replace('python', '')
             # if we can cast it, we are good
-            return '{}.{}'.format(
-                int(python_ver.partition(".")[0]),
-                int(python_ver.partition(".")[-1].partition(".")[0] or 0)
-            )
+            parts = python_ver.split('.')
+            if len(parts) < 2:
+                return '{}'.format(int(parts[0]))
+            else:
+                return '{}.{}'.format(int(parts[0]), int(parts[1]))
         except Exception:
-            pass
+            return None
 
     @resolve_names
     def execute(
@@ -2468,13 +2894,15 @@ class Worker(ServiceCommandSection):
                     raise ValueError(
                         "Execution required enqueued task, but task id={} is not queued.".format(current_task.id)
                     )
-                # Set task status to started to prevent any external monitoring from killing it
-                self._session.api_client.tasks.started(
-                    task=current_task.id,
-                    status_reason="starting execution soon",
-                    status_message="",
-                    force=True,
-                )
+                # only force set started if we actually dequeued it (which would have changed the state)
+                if res.ok and res.json().get("data", {}).get("updated", 0):
+                    # Set task status to started to prevent any external monitoring from killing it
+                    self._session.api_client.tasks.started(
+                        task=current_task.id,
+                        status_reason="starting execution soon",
+                        status_message="",
+                        force=True,
+                    )
             except Exception:
                 if require_queue:
                     raise
@@ -2656,14 +3084,16 @@ class Worker(ServiceCommandSection):
                     OnlyExternalRequirements.cwd = package_api.cwd = cwd
                     package_api.requirements_manager = self._get_requirements_manager(
                         base_interpreter=package_api.requirements_manager.get_interpreter(),
-                        requirement_substitutions=[OnlyExternalRequirements]
+                        requirement_substitutions=[CachedPackageRequirement, OnlyExternalRequirements]
                     )
                     # manually update the current state,
-                    # for the external git reference chance (in the replace callback)
+                    # for the external git reference chance (in the replaced callback)
                     package_api.requirements_manager.update_installed_packages_state(package_api.freeze())
                     # make sure we run the handlers
                     cached_requirements = \
-                        {k: package_api.requirements_manager.replace(requirements[k] or '')
+                        {k: package_api.requirements_manager.replace(
+                            requirements=requirements[k] or '',
+                            existing_packages=package_api.requirements_manager.get_installed_packages_state())
                          for k in requirements}
                     if str(cached_requirements.get('pip', '')).strip() \
                             or str(cached_requirements.get('conda', '')).strip():
@@ -2687,6 +3117,10 @@ class Worker(ServiceCommandSection):
             skip_freeze_update = self.is_conda and not self._session.config.get(
                 "agent.package_manager.conda_full_env_update", False)
 
+            # skip update requirements on nodes that are not Rank 0 (only update requirements on RANK 0)
+            if self._get_node_rank():
+                skip_freeze_update = True
+
             freeze = self.freeze_task_environment(
                 task_id=current_task.id,
                 requirements_manager=requirements_manager,
@@ -2700,68 +3134,100 @@ class Worker(ServiceCommandSection):
         # run code
         # print("Running task id [%s]:" % current_task.id)
         print(self._task_logging_pass_control_message.format(current_task.id))
-        extra = ['-u', ]
-        if optimization:
-            extra.append(
-                WorkerParams(optimization=optimization).get_optimization_flag()
-            )
 
         # check if we need to patch entry point script
         if ENV_AGENT_FORCE_TASK_INIT.get():
             patch_add_task_init_call((Path(script_dir) / execution.entry_point).as_posix())
 
+        is_python_binary, is_bash_binary = check_is_binary_python_or_bash(current_task.script.binary)
+
+        extra = []
+        if is_python_binary:
+            extra = ['-u', ]
+            if optimization:
+                extra.append(
+                    WorkerParams(optimization=optimization).get_optimization_flag()
+                )
+        elif is_bash_binary:
+            # if we needed some arguments for bash, that's where we will add them
+            extra = []
+
         # check if this is a module load, then load it.
         # noinspection PyBroadException
         try:
-            if current_task.script.binary and current_task.script.binary.startswith('python') and \
-                    execution.entry_point and execution.entry_point.split()[0].strip() == '-m':
-                # we need to split it
-                extra.extend(shlex.split(execution.entry_point))
+            if is_python_binary and execution.entry_point and execution.entry_point.strip().split()[0].strip() == '-m':
+                # do not parse $env when running as user
+                if "$" in execution.entry_point and not ENV_TASK_EXECUTE_AS_USER.get() and is_linux_platform():
+                    print("INFO: parsing environment variables: {}".format(execution.entry_point))
+                    _org_env = copy(os.environ)
+                    os.environ.update(self._get_job_os_envs(current_task, log_level))
+                    os.environ.update(self._get_task_os_env(self._session.config, current_task) or dict())
+                    extra.extend(shlex.split(os.path.expandvars(execution.entry_point)))
+                    # restore (just in case, so we do not interfere with our local execution)
+                    os.environ = _org_env
+                else:
+                    extra.extend(shlex.split(execution.entry_point))
+            elif (is_python_binary and execution.entry_point and
+                  execution.entry_point.strip().lower().endswith('.ipynb')):
+
+                # now we have to convert the notebook to python
+                convert_extra = copy(extra)
+                convert_extra.extend(["-m", "nbconvert", "--to", "python", execution.entry_point])
+                convert_command = self.package_api.get_python_command(convert_extra)
+
+                exit_code = convert_command.check_call(cwd=script_dir)
+                if exit_code:
+                    raise ValueError("Failed [{}] converting jupyter notebook: {}".format(
+                        exit_code, execution.entry_point))
+
+                converted_script_filename = Path(execution.entry_point).with_suffix(".py").as_posix()
+
+                if ENV_AGENT_FORCE_TASK_INIT.get():
+                    patch_add_task_init_call(converted_script_filename)
+
+                extra.append(converted_script_filename)
+            elif is_bash_binary and execution.entry_point and execution.entry_point.strip().split()[0].strip() == '-c':
+                extra.append("-c")
+                extra.append(" ".join(execution.entry_point.strip().split()[1:]))
             else:
                 extra.append(execution.entry_point)
         except Exception:
             extra.append(execution.entry_point)
 
-        command = self.package_api.get_python_command(extra)
+        if is_python_binary:
+            command = self.package_api.get_python_command(extra)
+        elif is_bash_binary:
+            command = Argv(Path(os.environ.get("SHELL", "/bin/bash")), *extra)
+        else:
+            # actually we should not be here because we default to python is we do not recognize the binary
+            raise ValueError("Task execution binary requested {} is not supported!".format(current_task.script.binary))
+
         print("[{}]$ {}".format(execution.working_dir, command.pretty()))
 
         if freeze:
             print("Summary - installed python packages:")
-            print(dump_yaml(freeze))
+            print(dump_flat_dict(freeze))
         else:
             print("No freeze information available")
 
         print("Environment setup completed successfully\n")
 
-        sdk_env = {
-            # config_file updated in session.py
-            "task_id": current_task.id,
-            "log_level": log_level,
-            "log_to_backend": "0",
-            "config_file": self._session.config_file,  # The config file is the tmp file that clearml_agent created
-        }
-        os.environ.update(
-            {
-                sdk_key: str(value)
-                for key, value in sdk_env.items()
-                for sdk_key in ENVIRONMENT_SDK_PARAMS[key]
-            }
-        )
+        # update the jobs global environment variable
+        os.environ.update(self._get_job_os_envs(current_task, log_level))
 
         if repo_info:
             self._update_commit_id(current_task.id, execution, repo_info)
 
-        # get Task Environments and update the process
-        if self._session.config.get('agent.enable_task_env', None):
-            hyper_params = self._get_task_os_env(current_task)
-            if hyper_params:
-                os.environ.update(hyper_params)
+        # get Task Environments variables and update the process (if enabled)
+        os.environ.update(self._get_task_os_env(self._session.config, current_task) or dict())
 
         # Add the script CWD to the python path
         if repo_info and repo_info.root and self._session.config.get('agent.force_git_root_python_path', None):
-            python_path = get_python_path(repo_info.root, None, self.package_api, is_conda_env=self.is_conda)
+            python_path = get_python_path(repo_info.root, None, self.package_api,
+                                          is_conda_env=self.is_conda or self.uv.enabled)
         else:
-            python_path = get_python_path(script_dir, execution.entry_point, self.package_api, is_conda_env=self.is_conda)
+            python_path = get_python_path(script_dir, execution.entry_point, self.package_api,
+                                          is_conda_env=self.is_conda or self.uv.enabled)
         if ENV_TASK_EXTRA_PYTHON_PATH.get():
             python_path = add_python_path(python_path, ENV_TASK_EXTRA_PYTHON_PATH.get())
         if python_path:
@@ -2776,7 +3242,7 @@ class Worker(ServiceCommandSection):
                 ENV_TASK_EXECUTE_AS_USER.get())
             use_execv = False
         else:
-            use_execv = is_linux_platform() and not isinstance(self.package_api, (PoetryAPI, CondaAPI))
+            use_execv = is_linux_platform() and not isinstance(self.package_api, (PoetryAPI, UvAPI ,CondaAPI))
 
         self._session.api_client.tasks.started(
             task=current_task.id,
@@ -2785,6 +3251,18 @@ class Worker(ServiceCommandSection):
             force=True,
         )
 
+        stop_signal = None
+        if TaskStopSignal.check_registered_bash_callback():
+            use_execv = False
+            stop_signal = TaskStopSignal(
+                command=self,
+                session=self._session,
+                events_service=self.get_service(Events),
+                task_id=task_id,
+                bash_cwd=script_dir
+            )
+            stop_signal.start_monitor_thread(polling_interval_sec=self._polling_interval)
+
         # check if we need to add encoding to the subprocess
         if sys.getfilesystemencoding() == 'ascii' and not os.environ.get("PYTHONIOENCODING"):
             os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -2792,6 +3270,9 @@ class Worker(ServiceCommandSection):
         # check if we need to update backwards compatible OS environment
         if not os.environ.get("TRAINS_CONFIG_FILE") and os.environ.get("CLEARML_CONFIG_FILE"):
             os.environ["TRAINS_CONFIG_FILE"] = os.environ.get("CLEARML_CONFIG_FILE")
+        # remove our internal env
+        os.environ.pop("CLEARML_APT_INSTALL", None)
+        os.environ.pop("TRAINS_APT_INSTALL", None)
 
         print("Starting Task Execution:\n".format(current_task.id))
         exit_code = -1
@@ -2805,6 +3286,9 @@ class Worker(ServiceCommandSection):
                         os.execv(command.argv[0].as_posix(), tuple([command.argv[0].as_posix()])+command.argv[1:])
                     else:
                         exit_code = command.check_call(cwd=script_dir)
+                        # if we have an on_abort callback still running, wait for it
+                        if stop_signal:
+                            stop_signal.stop_monitor_thread()
                         exit(exit_code)
                 except subprocess.CalledProcessError as ex:
                     # non zero return code
@@ -2838,6 +3322,10 @@ class Worker(ServiceCommandSection):
             self.log_traceback(e)
             exit_code = -1
 
+        # if we have an on_abort callback still running, wait for it
+        if stop_signal:
+            stop_signal.stop_monitor_thread()
+
         # kill leftover processes
         kill_all_child_processes()
 
@@ -2855,7 +3343,23 @@ class Worker(ServiceCommandSection):
 
         return 1 if exit_code is None else exit_code
 
-    def _get_task_os_env(self, current_task):
+    def _get_job_os_envs(self, current_task, log_level):
+        sdk_env = {
+            # config_file updated in session.py
+            "task_id": current_task.id,
+            "log_level": log_level,
+            "log_to_backend": "0",
+            "config_file": self._session.config_file,  # The config file is the tmp file that clearml_agent created
+        }
+        return {
+                sdk_key: str(value)
+                for key, value in sdk_env.items()
+                for sdk_key in ENVIRONMENT_SDK_PARAMS[key]
+            }
+
+    def _get_task_os_env(self, config, current_task):
+        if not config.get('agent.enable_task_env', None):
+            return None
         if not self._session.check_min_api_version('2.9'):
             return None
         # noinspection PyBroadException
@@ -2884,6 +3388,7 @@ class Worker(ServiceCommandSection):
                 status_reason=e.args[0], status_message=self._task_status_change_message
             )
             self.exit(e.args[0])
+
         if "\\" in execution.working_dir:
             warning(
                 'Working dir "{}" contains backslashes. '
@@ -2910,9 +3415,11 @@ class Worker(ServiceCommandSection):
         has_repository = bool(execution.repository)
         is_literal_script = literal_script.is_literal_script(task)
         if not has_repository and not is_literal_script:
-            raise CommandFailedError(
-                "Can not run task without repository or literal script in `script.diff`"
-            )
+            print("WARNING: running a task without repository or literal script in `script.diff`")
+            location = Path(venv_folder) / WORKING_STANDALONE_DIR
+            location.mkdir(exist_ok=True, parents=True)
+            return location.as_posix(), None, None
+
         repo_info = None
         directory = None
         vcs = None
@@ -2941,7 +3448,11 @@ class Worker(ServiceCommandSection):
             execution.working_dir = execution.working_dir or "."
 
         # fix our import patch (in case we have __future__)
-        if script_file and script_file.is_file():
+        try:
+            is_file = script_file and script_file.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
             fix_package_import_diff_patch(script_file.as_posix())
 
         if is_literal_script and not has_repository:
@@ -2982,15 +3493,24 @@ class Worker(ServiceCommandSection):
         session = session or self._session
         try:
             if stop_reason == TaskStopReason.stopped:
-                self.log("Stopping - tasks.stop was called for task")
-                self.send_logs(task_id, ["Process aborted by user"], session=session)
-                session.send_api(
-                    tasks_api.StoppedRequest(
-                        task=task_id,
-                        status_reason="task was stopped by tasks.stop",
-                        status_message=self._task_status_change_message,
+                # do not change the status to stopped if the Task status is already failed
+                task_status = get_task(
+                    session, task_id, only_fields=["status"]
+                ).status
+                if str(task_status) == "failed":
+                    self.send_logs(task_id, ["Process aborted by user - Task status was Failed"], session=session)
+                    self.log("Stopping - task was already marked as failed")
+                else:
+                    self.send_logs(task_id, ["Process aborted by user"], session=session)
+                    self.log("Stopping - tasks.stop was called for task")
+                    session.send_api(
+                        tasks_api.StoppedRequest(
+                            task=task_id,
+                            status_reason="task was stopped by tasks.stop",
+                            status_message=self._task_status_change_message,
+                            force=False
+                        )
                     )
-                )
 
             elif stop_reason == TaskStopReason.status_changed:
                 try:
@@ -3033,41 +3553,58 @@ class Worker(ServiceCommandSection):
             )
             self.log_traceback(e)
 
+    @staticmethod
+    def _get_node_rank():
+        # type: () -> int
+        # noinspection PyBroadException
+        try:
+            rank = int(os.environ.get("RANK", os.environ.get('SLURM_PROCID')) or 0)
+        except Exception:
+            rank = 0
+        return rank
+
     def handle_task_process_termination(self, task_id, exit_code, session=None):
         # type: (Text, int) -> None
         session = session or self._session
-        self.log("Task process terminated")
+        rank = self._get_node_rank()
+        rank_text = " - rank {}".format(rank) if rank else ""
+
+        self.log("Task process terminated" + rank_text)
+        # only RANK 0 can change the Task status.
 
         if exit_code == COMMAND_SUCCESS:
-            self.log("Task success: completing")
-            self.send_logs(task_id, ["Process completed successfully"], session=session)
-            session.send_api(
-                tasks_api.CompletedRequest(
-                    task=task_id,
-                    status_reason="worker execution done",
-                    status_message=self._task_status_change_message,
+            self.log("Task success: completing" + rank_text)
+            self.send_logs(task_id, ["Process completed successfully" + rank_text], session=session)
+            if not rank:
+                session.send_api(
+                    tasks_api.CompletedRequest(
+                        task=task_id,
+                        status_reason="worker execution done",
+                        status_message=self._task_status_change_message,
+                    )
                 )
-            )
         elif exit_code in (ExitStatus.interrupted, 256+ExitStatus.interrupted):
-            self.log("Task interrupted: stopping")
-            self.send_logs(task_id, ["Process terminated by user"], session=session)
-            session.send_api(
-                tasks_api.StoppedRequest(
-                    task=task_id,
-                    status_reason="user abort",
-                    status_message=self._task_status_change_message,
+            self.log("Task interrupted: stopping" + rank_text)
+            self.send_logs(task_id, ["Process terminated by user" + rank_text], session=session)
+            if not rank:
+                session.send_api(
+                    tasks_api.StoppedRequest(
+                        task=task_id,
+                        status_reason="user abort",
+                        status_message=self._task_status_change_message,
+                    )
                 )
-            )
         else:
-            self.log("Task failure: setting status to 'failed'")
-            self.send_logs(task_id, ["Process failed, exit code {}".format(exit_code)], session=session)
-            session.send_api(
-                tasks_api.FailedRequest(
-                    task=task_id,
-                    status_reason="worker execution exit code {}".format(exit_code),
-                    status_message=self._task_status_change_message,
+            self.log("Task failure: setting status to 'failed'" + rank_text)
+            self.send_logs(task_id, ["Process failed, exit code {}".format(exit_code) + rank_text], session=session)
+            if not rank:
+                session.send_api(
+                    tasks_api.FailedRequest(
+                        task=task_id,
+                        status_reason="worker execution exit code {}".format(exit_code),
+                        status_message=self._task_status_change_message,
+                    )
                 )
-            )
 
     def freeze_task_environment(self, task_id=None, requirements_manager=None,
                                 add_venv_folder_cache=None, execution_info=None, update_requirements=False):
@@ -3102,10 +3639,13 @@ class Worker(ServiceCommandSection):
 
         # disable caching with poetry because we cannot make it install into a specific folder
         # Todo: add support for poetry caching
-        if not self.poetry.enabled:
-            # add to cache
-            if add_venv_folder_cache and not self._standalone_mode:
-                print('Adding venv into cache: {}'.format(add_venv_folder_cache))
+        if not self.poetry.enabled and not self.uv.enabled:
+            # disable caching if we skipped the venv creation or the entire python setup
+            if add_venv_folder_cache and not self._standalone_mode and (
+                not ENV_AGENT_SKIP_PIP_VENV_INSTALL.get() and
+                not ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get()
+            ):
+                # add to cache
                 self.package_api.add_cached_venv(
                     requirements=[freeze, previous_reqs],
                     docker_cmd=execution_info.docker_cmd if execution_info else None,
@@ -3150,6 +3690,39 @@ class Worker(ServiceCommandSection):
         except Exception as ex:
             self.log.error("failed installing poetry requirements: {}".format(ex))
         return None
+    
+    def _install_uv_requirements(self, repo_info, working_dir=None, cached_requirements=None):
+        # type: (Optional[RepoInfo], Optional[str], Optional[Dict[str, list]]) -> Optional[UvAPI]
+        if not repo_info:
+            return None
+
+        if not isinstance(self.package_api, UvAPI):
+            return None
+
+        files_from_working_dir = self._session.config.get(
+            "agent.package_manager.uv_files_from_repo_working_dir", False)
+        lockfile_path = Path(repo_info.root) / ((working_dir or "") if files_from_working_dir else "")
+
+        self.package_api.set_lockfile_path(lockfile_path)
+
+        if self.package_api.enabled:
+            print('UV Enabled: Ignoring requested python packages, using repository uv lock file!')
+            # noinspection PyBroadException
+            try:
+                self.package_api.install()
+                return self.package_api
+            except Exception as ex:
+                self.log.error("Failed installing uv requirements from lock file: {}".format(ex))
+                # if we have a lock file we actually fail, otherwise we revert to pip behaviour
+                if self.package_api.lock_file_exists:
+                    raise
+                self.log.error("Reverting to UV as pip replacement - installing "
+                               "from Task requirements or git requirements.txt")
+                self.package_api._enabled = False
+                return None
+
+        # we will create the "regular" venv style using UV
+        return None
 
     def install_requirements(
         self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None, package_api=None
@@ -3179,6 +3752,18 @@ class Worker(ServiceCommandSection):
             package_api.cwd = cwd
 
         api = self._install_poetry_requirements(repo_info, execution.working_dir)
+        if not api:
+            api = self._install_uv_requirements(repo_info, execution.working_dir, cached_requirements)
+            # if we could not find a lock file, but UV is installed and enabled, use it instead of pip
+            if not api and not self._session.config.get("agent.package_manager.uv_replace_pip", False):
+                if package_api == self.package_api and isinstance(self.package_api, UvAPI):
+                    # revert to venv that we used inside UV
+                    api = None
+                    self.package_api = package_api = package_api.get_venv_manager()
+            elif self._session.config.get("agent.package_manager.type", None) == "uv" and not api:
+                # this means `agent.package_manager.uv_replace_pip` is set to true
+                print("INFO: using UV as pip drop-in replacement")
+
         if api:
             # update back the package manager, this hack should be fixed
             if package_api == self.package_api:
@@ -3200,20 +3785,38 @@ class Worker(ServiceCommandSection):
             requirements_manager.set_cwd(cwd)
 
         cached_requirements_failed = False
-        if cached_requirements and (cached_requirements.get('pip') is not None or
-                                    cached_requirements.get('conda') is not None):
+        if not repo_info or (
+                cached_requirements and
+                (cached_requirements.get('pip') is not None or
+                 cached_requirements.get('conda') is not None)
+        ):
             self.log("Found task requirements section, trying to install")
+            cached_requirements = cached_requirements or {}
+
             if ENV_AGENT_FORCE_TASK_INIT.get():
                 # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
                 print("Force clearml Task.init patch adding clearml package to requirements")
-                if cached_requirements.get('pip'):
-                    cached_requirements["pip"] = ("clearml\n" + cached_requirements["pip"]) \
-                        if isinstance(cached_requirements["pip"], str) else \
-                        (["clearml"] + cached_requirements["pip"])
+                if not cached_requirements or cached_requirements.get('pip'):
+                    cached_requirements["pip"] = ("clearml\n" + cached_requirements.get("pip", "")) \
+                        if isinstance(cached_requirements.get("pip", ""), str) else \
+                        (["clearml"] + cached_requirements.get("pip", []))
                 if cached_requirements.get('conda'):
                     cached_requirements["conda"] = ("clearml\n" + cached_requirements["conda"]) \
                         if isinstance(cached_requirements["conda"], str) else \
                         (["clearml"] + cached_requirements["conda"])
+
+            # check if we need to push jupyter nbconvert if we need to run ipynb
+            if execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb'):
+                print("Force nbconvert patch to convert .ipynb to python")
+                # now we have to make sure we run it with jupyter notebook
+                if not cached_requirements or cached_requirements.get('pip'):
+                    cached_requirements["pip"] = ("nbconvert\nipython\n" + cached_requirements.get("pip", "")) \
+                        if isinstance(cached_requirements.get("pip", ""), str) else \
+                        (["nbconvert", "ipython"] + cached_requirements.get("pip", []))
+                if cached_requirements.get('conda'):
+                    cached_requirements["conda"] = ("nbconvert\nipython\n" + cached_requirements["conda"]) \
+                        if isinstance(cached_requirements["conda"], str) else \
+                        (["nbconvert", "ipython"] + cached_requirements["conda"])
 
             try:
                 package_api.load_requirements(cached_requirements)
@@ -3246,6 +3849,11 @@ class Worker(ServiceCommandSection):
                 # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
                 print("Force clearml Task.init patch adding clearml package to requirements")
                 requirements_text = "clearml\n" + requirements_text
+
+            if execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb'):
+                # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
+                print("Force nbconvert patch to convert .ipynb to python")
+                requirements_text = "nbconvert\nipython\n" + requirements_text
 
             new_requirements = requirements_manager.replace(requirements_text)
 
@@ -3558,14 +4166,14 @@ class Worker(ServiceCommandSection):
                     override_interpreter_path = skip_pip_venv_install
                 else:
                     print(
-                        "Warning: interpreter {} could not be found. Reverting to the default interpreter resolution".format(
-                            skip_pip_venv_install
-                        )
+                        "Warning: interpreter {} could not be found. "
+                        "Reverting to the default interpreter resolution".format(skip_pip_venv_install)
                     )
             if override_interpreter_path:
                 print("Python interpreter {} is set from environment var".format(override_interpreter_path))
                 executable_name = override_interpreter_path
-                executable_version_suffix = self._get_python_version_suffix(executable_name)
+                executable_version_suffix = (get_python_version(executable_name, self.log) or
+                                             self._get_python_version_suffix(executable_name))
             else:
                 try:
                     executable_version, executable_version_suffix, executable_name = \
@@ -3585,6 +4193,15 @@ class Worker(ServiceCommandSection):
         venv_dir = Path(venv_dir) if venv_dir else \
             Path(self._session.config["agent.venvs_dir"], executable_version_suffix)
         venv_dir = Path(os.path.expanduser(os.path.expandvars(venv_dir.as_posix())))
+
+        pip_version = get_specific_package_version(cached_requirements, package_name="pip")
+        if pip_version:
+            PackageManager.set_pip_version(pip_version)
+        if self.uv.enabled:
+            self.uv.set_python_version(requested_python_version)
+            uv_version = get_specific_package_version(cached_requirements, package_name="uv")
+            if uv_version:
+                self.uv.set_uv_version(uv_version)
 
         first_time = not standalone_mode and (
             is_windows_platform()
@@ -3613,12 +4230,14 @@ class Worker(ServiceCommandSection):
                   'To accelerate spin-up time set `agent.venvs_cache.path=~/.clearml/venvs-cache` :::\n')
 
         # check if we have a cached folder
-        if cached_requirements and not skip_pip_venv_install and self.package_api.get_cached_venv(
-            requirements=cached_requirements,
-            docker_cmd=execution_info.docker_cmd if execution_info else None,
-            python_version=self.package_api.python,
-            cuda_version=self._session.config.get("agent.cuda_version"),
-            destination_folder=Path(venv_dir)
+        if (cached_requirements and not skip_pip_venv_install and
+            not self.poetry.enabled and not self.uv.enabled and
+            self.package_api.get_cached_venv(
+                requirements=cached_requirements,
+                docker_cmd=execution_info.docker_cmd if execution_info else None,
+                python_version=self.package_api.python,
+                cuda_version=self._session.config.get("agent.cuda_version"),
+                destination_folder=Path(venv_dir))
         ):
             print('::: Using Cached environment {} :::'.format(self.package_api.get_last_used_entry_cache()))
             return venv_dir, requirements_manager, True
@@ -3677,11 +4296,16 @@ class Worker(ServiceCommandSection):
                         url=self._session.config["agent.venv_update.url"] or DEFAULT_VENV_UPDATE_URL,
                         **package_manager_params
                     )
+                elif self.uv.enabled:
+                    self.uv.initialize()
+                    self.package_api = self.uv.get_api(**package_manager_params)
                 else:
                     self.package_api = VirtualenvPip(**package_manager_params)
+
                 if first_time:
                     self.package_api.remove()
                     call_package_manager_create = True
+
                 self.global_package_api = SystemPip(**global_package_manager_params)
         else:
             if standalone_mode:
@@ -3739,6 +4363,8 @@ class Worker(ServiceCommandSection):
         if len(docker_arguments) > 1:
             docker_image = docker_arguments[0]
             docker_arguments = docker_arguments[1:]
+        elif docker_args and isinstance(docker_args, list) and len(docker_args) > 1:
+            docker_arguments = docker_args[1:]
         else:
             docker_arguments = self._session.config.get("agent.default_docker.arguments", None) or []
             if isinstance(docker_arguments, six.string_types):
@@ -3748,9 +4374,16 @@ class Worker(ServiceCommandSection):
         self._docker_image = docker_image
         self._docker_arguments = docker_arguments
 
-        print("Running in Docker{} mode (v19.03 and above) - using default docker image: {} {}\n".format(
-            ' *standalone*' if self._standalone_mode else '', self._docker_image,
-            DockerArgsSanitizer.sanitize_docker_command(self._session, self._docker_arguments) or ''))
+        if docker_args:
+            self._docker_default_cmd_override = True
+
+        print("Running in Docker{} mode (v19.03 and above) - using default docker image: {} {} {}\n".format(
+            ' *standalone*' if self._standalone_mode else '',
+            self._docker_image,
+            DockerArgsSanitizer.sanitize_docker_command(self._session, self._docker_arguments) or '',
+            "\n(default docker commandline override, config matching rules are ignored)"
+            if self._docker_default_cmd_override else "",
+        ))
 
         temp_config = deepcopy(self._session.config)
         self.remove_non_backwards_compatible_entries(temp_config)
@@ -3781,8 +4414,15 @@ class Worker(ServiceCommandSection):
         if force_system_site_packages:
             temp_config.put("agent.package_manager.system_site_packages", True)
 
+        # if venvs_cache is NOT disabled,
+        # we have to update the mount path and the path inside the container
         if temp_config.get("agent.venvs_cache.path", None):
-            temp_config.put("agent.venvs_cache.path", '/root/.clearml/venvs-cache')
+            venvs_cache_path = temp_config.get("agent.docker_internal_mounts.venvs_cache", None)
+            if not venvs_cache_path:
+                venvs_cache_path = "/root/.clearml/venvs-cache"
+                temp_config.put("agent.docker_internal_mounts.venvs_cache", venvs_cache_path)
+            # update the venvs cache path to the container scope
+            temp_config.put("agent.venvs_cache.path", venvs_cache_path)
 
         if (ENV_SSH_AUTH_SOCK.get() or '').strip():
             self._host_ssh_cache = None
@@ -3815,7 +4455,7 @@ class Worker(ServiceCommandSection):
         host_pip_dl = load_path("agent.pip_download_cache.path")
         self.debug("host_pip_dl: {}".format(host_pip_dl))
 
-        host_vcs_cache = load_path("agent.vcs_cache.path")
+        host_vcs_cache = load_path("agent.vcs_cache.path") if temp_config.get("agent.vcs_cache.enabled", True) else ""
         self.debug("host_vcs_cache: {}".format(host_vcs_cache))
 
         host_venvs_cache = load_path("agent.venvs_cache.path")
@@ -3902,7 +4542,7 @@ class Worker(ServiceCommandSection):
         mounted_cache_dir = temp_config.get("sdk.storage.cache.default_base_dir")
         mounted_pip_dl_dir = temp_config.get("agent.pip_download_cache.path")
         mounted_vcs_cache = temp_config.get("agent.vcs_cache.path")
-        mounted_venvs_cache = temp_config.get("agent.venvs_cache.path", "")
+        mounted_venvs_cache = temp_config.get("agent.docker_internal_mounts.venvs_cache", "")
         mount_ssh = temp_config.get("agent.docker_internal_mounts.ssh_folder", None)
         mount_ssh_ro = temp_config.get("agent.docker_internal_mounts.ssh_ro_folder", None)
         mount_apt_cache = temp_config.get("agent.docker_internal_mounts.apt_cache", None)
@@ -4109,7 +4749,7 @@ class Worker(ServiceCommandSection):
                 docker_arguments = self._resolve_docker_env_args(docker_arguments)
 
         if extra_docker_arguments:
-            # we always resolve environments in the `extra_docker_arguments` becuase the admin set them (not users)
+            # we always resolve environments in the `extra_docker_arguments` because the admin set them (not users)
             extra_docker_arguments = self._resolve_docker_env_args(extra_docker_arguments)
             extra_docker_arguments = [extra_docker_arguments] \
                 if isinstance(extra_docker_arguments, six.string_types) else extra_docker_arguments
@@ -4121,6 +4761,21 @@ class Worker(ServiceCommandSection):
             task_docker_arguments=docker_arguments,
             extra_docker_arguments=extra_docker_arguments
         )
+
+        # check if we have mapped ports
+        try:
+            port_mappings_struct = DockerArgsSanitizer.resolve_port_mapping(
+                config=self._session.config, docker_arguments=base_cmd)
+            if port_mappings_struct:
+                new_docker_cmd, additional_task_runtime = port_mappings_struct
+                if new_docker_cmd:
+                    base_cmd = new_docker_cmd
+                if additional_task_runtime:
+                    from clearml_agent.helper.task_runtime import TaskRuntime
+                    task_runtime = TaskRuntime(self._session)
+                    task_runtime.update_task_runtime(env_task_id, additional_task_runtime)
+        except Exception as e:
+            self.log.warning("WARNING: Failed parsing port mapping requested for docker execution: {}".format(e))
 
         # set docker labels
         base_cmd += ['-l', self._worker_label.format(worker_id)]
@@ -4189,7 +4844,10 @@ class Worker(ServiceCommandSection):
                     host_ssh_cache = new_ssh_cache.replace(k8s_pod_mnt, k8s_node_mnt)
                 except Exception:
                     raise ValueError('Error: could not copy .ssh directory into: {}'.format(new_ssh_cache))
-                self.debug("Copied host SSH cache to: {}, host {}".format(new_ssh_cache, host_ssh_cache), context="docker")
+                self.debug(
+                    "Copied host SSH cache to: {}, host {}".format(new_ssh_cache, host_ssh_cache),
+                    context="docker"
+                )
 
         base_cmd += ['-e', 'CLEARML_WORKER_ID='+worker_id, ]
         # update the docker image, so the system knows where it runs
@@ -4242,6 +4900,7 @@ class Worker(ServiceCommandSection):
         mount_apt_cache = mount_apt_cache or '/var/cache/apt/archives'
         mount_pip_cache = mount_pip_cache or '/root/.cache/pip'
         mount_poetry_cache = mount_poetry_cache or '/root/.cache/pypoetry'
+        mount_git_ro = "{}.git".format(mount_ssh_ro.rstrip("/"))
 
         if not standalone_mode:
             if not bash_script:
@@ -4249,18 +4908,22 @@ class Worker(ServiceCommandSection):
                 # python+pip is the requirement to match
                 bash_script = [
                     "echo 'Binary::apt::APT::Keep-Downloaded-Packages \"true\";' > /etc/apt/apt.conf.d/docker-clean",
-                    "chown -R root /root/.cache/pip",
+                    "chown -R $(whoami) $HOME/.cache/pip",
                     "export DEBIAN_FRONTEND=noninteractive",
                     "export CLEARML_APT_INSTALL=\"$CLEARML_APT_INSTALL{}\"".format(
                         ' libsm6 libxext6 libxrender-dev libglib2.0-0' if install_opencv_libs else ""),
                     "cp -Rf {mount_ssh_ro} -T {mount_ssh}" if host_ssh_cache else "",
-                    "[ ! -z $(which git) ] || export CLEARML_APT_INSTALL=\"$CLEARML_APT_INSTALL git\"",
+                    "cp -Rf {mount_git_ro} -T ~/" if host_git_credentials else "",
+                    "[ ! -z $(which git 2> /dev/null || command -v git) ] || export CLEARML_APT_INSTALL=\"$CLEARML_APT_INSTALL git\"",
                     "declare LOCAL_PYTHON",
-                    "[ ! -z $LOCAL_PYTHON ] || for i in {{15..5}}; do which {python_single_digit}.$i && " +
+                    "[ ! -z $LOCAL_PYTHON ] || for i in {{20..5}}; do (which {python_single_digit}.$i 2> /dev/null || command -v {python_single_digit}.$i) && " +
                     "{python_single_digit}.$i -m pip --version && " +
-                    "export LOCAL_PYTHON=$(which {python_single_digit}.$i) && break ; done",
+                    "export LOCAL_PYTHON=$(which {python_single_digit}.$i 2> /dev/null || command -v {python_single_digit}.$i) && break ; done",
                     "[ ! -z $LOCAL_PYTHON ] || export CLEARML_APT_INSTALL=\"$CLEARML_APT_INSTALL {python_single_digit}-pip\"",  # noqa
-                    "[ -z \"$CLEARML_APT_INSTALL\" ] || (apt-get update -y ; apt-get install -y $CLEARML_APT_INSTALL)",
+                    "[ -z \"$CLEARML_APT_INSTALL\" ] || "
+                    "(apt-get update -y ; apt-get install -y $CLEARML_APT_INSTALL) || "
+                    "(dnf install -y $CLEARML_APT_INSTALL)",
+                    "rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED",  # remove PEP 668
                 ]
 
             if preprocess_bash_script:
@@ -4269,22 +4932,24 @@ class Worker(ServiceCommandSection):
             docker_bash_script = " ; ".join([line for line in bash_script if line]) \
                 if not isinstance(bash_script, str) else bash_script
 
-            # make sure that if we do not have $LOCAL_PYTHON defined
-            # we set it to python3
+            # make sure that if we do not have $LOCAL_PYTHON defined, we set it to python3
+            # notice that if $LOCAL_PYTHON -m pip fails, that means we might have a broken python in the path
+            # so we set to default path and try to set global python
             update_scheme += (
                     docker_bash_script + " ; " +
                     "[ ! -z $LOCAL_PYTHON ] || export LOCAL_PYTHON={python} ; " +
+                    "$LOCAL_PYTHON -m pip --version > /dev/null || export LOCAL_PYTHON=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v python3) ; " +
                     "$LOCAL_PYTHON -m pip install -U {pip_version} ; " +
                     "$LOCAL_PYTHON -m pip install -U {clearml_agent_wheel} ; ").format(
                 python_single_digit=python_version.split('.')[0],
                 python=python_version, pip_version=" ".join(PackageManager.get_pip_versions(wrap='\"')),
                 clearml_agent_wheel=clearml_agent_wheel,
-                mount_ssh_ro=mount_ssh_ro, mount_ssh=mount_ssh,
+                mount_ssh_ro=mount_ssh_ro, mount_ssh=mount_ssh, mount_git_ro=mount_git_ro,
             )
 
         if host_git_credentials:
             for git_credentials in host_git_credentials:
-                base_cmd += ['-v', '{}:/root/{}'.format(git_credentials, Path(git_credentials).name)]
+                base_cmd += ['-v', '{}:{}/{}'.format(git_credentials, mount_git_ro, Path(git_credentials).name)]
 
         if docker_bash_setup_script and docker_bash_setup_script.strip('\n '):
             extra_shell_script = (extra_shell_script or '') + \
@@ -4477,7 +5142,7 @@ class Worker(ServiceCommandSection):
                 worker_name = '{}:cpu'.format(worker_name)
         return worker_id, worker_name
 
-    def _resolve_queue_names(self, queues, create_if_missing=False):
+    def _resolve_queue_names(self, queues, create_if_missing=False, create_system_tags=None):
         if not queues:
             # try to look for queues with "default" tag
             try:
@@ -4489,15 +5154,25 @@ class Worker(ServiceCommandSection):
 
         queues = return_list(queues)
         if not create_if_missing:
-            return [self._resolve_name(q if isinstance(q, str) else q.name, "queues") for q in queues]
+            return [
+                self._resolve_name(q if isinstance(q, str) else q.name, service="queues", search_hidden=True)
+                for q in queues
+            ]
 
         queue_ids = []
         for q in queues:
+            # noinspection PyBroadException
             try:
-                q_id = self._resolve_name(q if isinstance(q, str) else q.name, "queues")
+                q_id = self._resolve_name(
+                    q if isinstance(q, str) else q.name, service="queues", search_hidden=True
+                )
             except:
-                self._session.send_api(queues_api.CreateRequest(name=q if isinstance(q, str) else q.name))
-                q_id = self._resolve_name(q if isinstance(q, str) else q.name, "queues")
+                self._session.send_api(
+                    queues_api.CreateRequest(name=q if isinstance(q, str) else q.name, system_tags=create_system_tags)
+                )
+                q_id = self._resolve_name(
+                    q if isinstance(q, str) else q.name, service="queues", search_hidden=True
+                )
             queue_ids.append(q_id)
         return queue_ids
 

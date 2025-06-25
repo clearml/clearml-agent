@@ -1,10 +1,10 @@
 import re
 from functools import partial
 
-import attr
-from attr.converters import optional as optional_converter
-from attr.validators import instance_of, optional, and_
-from six import string_types
+from ..._vendor import attr
+from ..._vendor.attr.converters import optional as optional_converter
+from ..._vendor.attr.validators import instance_of, optional, and_
+from ..._vendor.six import string_types
 
 # noinspection PyTypeChecker
 sequence = instance_of((list, tuple))

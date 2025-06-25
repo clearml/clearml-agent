@@ -6,7 +6,7 @@ spec:
   serviceAccountName: ""
   containers:
     - name: k8s-glue-container
-      image: allegroai/clearml-agent-k8s:aws-latest-1.21
+      image: clearml/clearml-agent-k8s:aws-latest-1.21
       imagePullPolicy: Always
       command: [
           "/bin/bash",

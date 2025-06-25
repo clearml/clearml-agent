@@ -14,3 +14,5 @@ dist/
 # VSCode
 .vscode
 
+# MirrorD
+.mirrord

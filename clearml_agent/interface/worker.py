@@ -44,6 +44,11 @@ WORKER_ARGS = {
 }
 
 DAEMON_ARGS = dict({
+    '--polling-interval': {
+        'help': 'Polling interval in seconds. Minimum is 5 (default 5)',
+        'type': int,
+        'default': 5,
+    },
     '--foreground': {
         'help': 'Pipe full log to stdout/stderr, should not be used if running in background',
         'action': 'store_true',
@@ -62,7 +67,10 @@ DAEMON_ARGS = dict({
         'group': 'Docker support',
     },
     '--queue': {
-        'help': 'Queue ID(s)/Name(s) to pull tasks from (\'default\' queue)',
+        'help': 'Queue ID(s)/Name(s) to pull tasks from (\'default\' queue).'
+                ' Note that the queue list order determines priority, with the first listed queue having the'
+                ' highest priority. To change this behavior, use --order-fairness to pull from each queue in a'
+                ' round-robin order',
         'nargs': '+',
         'default': tuple(),
         'dest': 'queues',
@@ -107,8 +115,11 @@ DAEMON_ARGS = dict({
     '--dynamic-gpus': {
         'help': 'Allow to dynamically allocate gpus based on queue properties, '
                 'configure with \'--queue <queue_name>=<num_gpus>\'.'
-                ' Example: \'--dynamic-gpus --gpus 0-3 --queue dual_gpus=2 single_gpu=1\''
-                ' Example Opportunistic: \'--dynamic-gpus --gpus 0-3 --queue dual_gpus=2 max_quad_gpus=1-4 \'',
+                ' Example: \'--dynamic-gpus --gpus 0-3 --queue dual_gpus=2 single_gpu=1\'.'
+                ' Example Opportunistic: \'--dynamic-gpus --gpus 0-3 --queue dual_gpus=2 max_quad_gpus=1-4\'.'
+                ' Note that the queue list order determines priority, with the first listed queue having the'
+                ' highest priority. To change this behavior, use --order-fairness to pull from each queue in a'
+                ' round-robin order',
         'action': 'store_true',
     },
     '--uptime': {
@@ -130,7 +141,9 @@ DAEMON_ARGS = dict({
         'action': 'store_true',
     },
     '--use-owner-token': {
-        'help': 'Generate and use task owner token for the execution of the task',
+        'help': 'Run tasks under the identity of each task\'s owner: all calls made by the task code during execution '
+                'will use the owner\'s credentials instead of the agent\'s. This feature requires the agent to use a '
+                'ClearML Enterprise Server.',
         'action': 'store_true',
     }
 }, **WORKER_ARGS)

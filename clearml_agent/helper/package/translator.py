@@ -1,8 +1,8 @@
 from tempfile import mkdtemp
 from typing import Text
 
-from furl import furl
-from pathlib2 import Path
+from ..._vendor.furl import furl
+from ..._vendor.pathlib2 import Path
 
 from clearml_agent.config import Config
 from .pip_api.system import SystemPip

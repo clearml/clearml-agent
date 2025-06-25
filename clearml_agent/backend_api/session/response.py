@@ -1,6 +1,6 @@
 import requests
 
-import six
+from ..._vendor import six
 
 from . import jsonmodels
 from .apimodel import ApiModel

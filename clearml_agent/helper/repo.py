@@ -12,11 +12,11 @@ from random import random
 from threading import Lock
 from typing import Text, Sequence, Mapping, Iterable, TypeVar, Callable, Tuple, Optional
 
-import attr
-from furl import furl
-from pathlib2 import Path
+from .._vendor import attr
+from .._vendor.furl import furl
+from .._vendor.pathlib2 import Path
 
-import six
+from .._vendor import six
 
 from clearml_agent.definitions import ENV_AGENT_GIT_USER, ENV_AGENT_GIT_PASS, ENV_AGENT_GIT_HOST, ENV_GIT_CLONE_VERBOSE
 from clearml_agent.helper.console import ensure_text, ensure_binary
@@ -322,6 +322,8 @@ class VCS(object):
                 return
 
             # rewrite ssh URLs only if either ssh port or ssh user are forced in config
+            # TODO: fix, when url is in the form of `git@domain.com:user/project.git` we will fail to get scheme
+            # need to add ssh:// and replace first ":" with / , unless port is specified
             if parsed_url.scheme == "ssh" and (
                 self.session.config.get('agent.force_git_ssh_port', None) or
                 self.session.config.get('agent.force_git_ssh_user', None)
@@ -595,7 +597,8 @@ class Git(VCS):
         )
 
     def pull(self):
-        self.call("fetch", "--all", "--recurse-submodules", cwd=self.location)
+        self._set_ssh_url()
+        self.call("fetch", "--all", "--tags", "--recurse-submodules", cwd=self.location)
 
     def _git_pass_auth_wrapper(self, func, *args, **kwargs):
         try:
@@ -777,7 +780,22 @@ def clone_repository_cached(session, execution, destination):
                 # We clone the entire repository, not a specific branch
                 vcs.clone()  # branch=execution.branch)
 
-            vcs.pull()
+            print("pulling git")
+            try:
+                vcs.pull()
+            except Exception as ex:
+                print("git pull failed: {}".format(ex))
+                if (
+                        session.config.get("agent.vcs_cache.enabled", False) and
+                        session.config.get("agent.vcs_cache.clone_on_pull_fail", False)
+                ):
+                    print("pulling git failed, re-cloning: {}".format(no_password_url))
+                    rm_tree(cached_repo_path)
+                    vcs.clone()
+                else:
+                    raise ex
+            print("pulling git completed")
+
             rm_tree(destination)
             shutil.copytree(Text(cached_repo_path), Text(clone_folder),
                             symlinks=select_for_platform(linux=True, windows=False),
@@ -918,7 +936,7 @@ def _locate_future_import(lines):
 
 
 def patch_add_task_init_call(local_filename):
-    if not local_filename or not Path(local_filename).is_file():
+    if not local_filename or not Path(local_filename).is_file() or not str(local_filename).lower().endswith(".py"):
         return
 
     idx_a = 0

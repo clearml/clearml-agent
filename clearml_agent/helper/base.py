@@ -17,13 +17,13 @@ from collections import OrderedDict
 from functools import total_ordering
 from typing import Text, Dict, Any, Optional, AnyStr, IO, Union
 
-import attr
-import furl
-import six
-import yaml
-from attr import fields_dict
-from pathlib2 import Path
-from six.moves import reduce
+from .._vendor import attr
+from .._vendor import furl
+from .._vendor import six
+from .._vendor.attr import fields_dict
+from .._vendor.pathlib2 import Path
+from .._vendor.six.moves import reduce  # noqa
+from .._vendor import pyyaml as yaml
 
 from clearml_agent.errors import CommandFailedError
 from clearml_agent.external import pyhocon
@@ -51,6 +51,25 @@ def select_for_platform(linux, windows):
     :param windows: value to return if OS is Windows
     """
     return windows if is_windows_platform() else linux
+
+
+def check_is_binary_python_or_bash(script_binary) -> (bool, bool):
+    """
+    return if we should treat it as bash script or python based on the binary section of the task
+    i.e. task.script.binary
+    :param script_binary: e.g. task.script.binary
+    :return: tuple boolean (is_python_binary, is_bash_binary)
+    """
+    is_python_binary = (script_binary or "").split("/")[-1].startswith('python')
+    is_bash_binary = (not is_python_binary and
+                      (script_binary or "").split("/")[-1] in ('bash', 'zsh', 'sh'))
+
+    if not is_bash_binary and not is_python_binary:
+        if (script_binary or "").strip():
+            print("WARNING binary '{}' not supported, defaulting to python".format(script_binary))
+        is_python_binary = True
+
+    return is_python_binary, is_bash_binary
 
 
 def bash_c():
@@ -310,6 +329,29 @@ def dump_yaml(obj, path=None, dump_all=False, **kwargs):
         dump_func(obj, output, **base_kwargs)
 
 
+def _dump_flat_dict(flat_dict):
+    if not isinstance(flat_dict, (dict, )):
+        flat_dict = {"": flat_dict}
+
+    out = ""
+    for k in sorted(flat_dict.keys()):
+        out += "{}:\n".format(k)
+        values = flat_dict[k]
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        out += "".join(sorted(["- {}\n".format(v) for v in values], key=lambda t: str(t).lower()))
+
+    return out
+
+
+def dump_flat_dict(flat_dict):
+    # noinspection PyBroadException
+    try:
+        return _dump_flat_dict(flat_dict)
+    except Exception:
+        return dump_yaml(flat_dict)
+
+
 def one_value(dct):
     return next(iter(six.itervalues(dct)))
 
@@ -372,15 +414,15 @@ def construct_mapping(loader, node):
     return OrderedDict(loader.construct_pairs(node))
 
 
-yaml.SafeDumper.add_representer(OrderedDict, represent_ordered_dict)
-yaml.SafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+# yaml.SafeDumper.add_representer(OrderedDict, represent_ordered_dict)
+# yaml.SafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
 
 
 class AllDumper(yaml.SafeDumper):
     pass
 
 
-AllDumper.add_multi_representer(object, lambda dumper, data: dumper.represent_str(str(data)))
+# AllDumper.add_multi_representer(object, lambda dumper, data: dumper.represent_str(str(data)))
 
 
 def error(message):
@@ -541,6 +583,36 @@ def convert_cuda_version_to_int_10_base_str(cuda_version):
     """
     cuda_version = convert_cuda_version_to_float_single_digit_str(cuda_version)
     return str(int(float(cuda_version)*10))
+
+
+def get_python_version(python_executable, log=None):
+    from clearml_agent.helper.process import Argv
+    try:
+        output = Argv(python_executable, "--version").get_output(
+            stderr=subprocess.STDOUT
+        )
+    except subprocess.CalledProcessError as ex:
+        # Windows returns 9009 code and suggests to install Python from Windows Store
+        if is_windows_platform() and ex.returncode == 9009:
+            if log:
+                log.debug("version not found: {}".format(ex))
+        else:
+            if log:
+                log.warning("error getting %s version: %s", python_executable, ex)
+        return None
+    except FileNotFoundError as ex:
+        if log:
+            log.debug("version not found: {}".format(ex))
+        return None
+
+    match = re.search(r"Python ({}(?:\.\d+)*)".format(r"\d+"), output)
+    if match:
+        if log:
+            log.debug("Found: {}".format(python_executable))
+        # only return major.minor version
+        return ".".join(str(match.group(1)).split(".")[:2])
+
+    return None
 
 
 class NonStrictAttrs(object):

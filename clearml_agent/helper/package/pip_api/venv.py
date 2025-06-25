@@ -1,6 +1,7 @@
+import sys
 from typing import Any
 
-from pathlib2 import Path
+from ...._vendor.pathlib2 import Path
 
 from clearml_agent.helper.base import select_for_platform, rm_tree, ExecutionInfo
 from clearml_agent.helper.package.base import PackageManager
@@ -37,7 +38,9 @@ class VirtualenvPip(SystemPip, PackageManager):
 
     def load_requirements(self, requirements):
         if isinstance(requirements, dict) and requirements.get("pip"):
-            requirements["pip"] = self.requirements_manager.replace(requirements["pip"])
+            requirements["pip"] = self.requirements_manager.replace(
+                requirements["pip"], existing_packages=self._existing_packages
+            )
         super(VirtualenvPip, self).load_requirements(requirements)
         self.requirements_manager.post_install(self.session, package_manager=self)
 
@@ -64,9 +67,27 @@ class VirtualenvPip(SystemPip, PackageManager):
         Only valid if instantiated with path.
         Use self.python as self.bin does not exist.
         """
-        self.session.command(
-            self.python, "-m", "virtualenv", self.path, *self.create_flags()
-        ).check_call()
+        # noinspection PyBroadException
+        try:
+            self.session.command(
+                self.python, "-m", "virtualenv", self.path, *self.create_flags()
+            ).check_call()
+        except Exception as ex:
+            try:
+                # let's try with std library instead
+                print("WARNING: virtualenv call failed: {}\n INFO: Creating virtual environment with venv".format(ex))
+                self.session.command(
+                    self.python, "-m", "venv", self.path, *self.create_flags()
+                ).check_call()
+            except Exception as ex:
+                # let's try with std library instead
+                print("WARNING: virtualenv and venv failed with [{}] trying virtualenv with python [{}]".format(
+                    self.python, sys.executable))
+                self.python = str(sys.executable)
+                self.session.command(
+                    self.python, "-m", "virtualenv", self.path, *self.create_flags()
+                ).check_call()
+
         return self
 
     def remove(self):

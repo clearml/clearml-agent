@@ -1,6 +1,4 @@
-ARG TAG=3.7.17-alpine3.18
-
-FROM python:${TAG} as build
+FROM python:3.14-rc-alpine3.21 as build
 
 RUN apk add --no-cache \
     gcc \
@@ -16,11 +14,11 @@ RUN python3 \
     clearml-agent \
     cryptography>=2.9
 
-FROM python:${TAG} as target
+FROM python:3.14-rc-alpine3.21 as target
 
 WORKDIR /app
 
-ARG KUBECTL_VERSION=1.24.0
+ARG KUBECTL_VERSION=1.29.3
 
 # Not sure about these ENV vars
 # ENV LC_ALL=en_US.UTF-8
