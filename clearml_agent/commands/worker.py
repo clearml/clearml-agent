@@ -3248,7 +3248,9 @@ class Worker(ServiceCommandSection):
             os.environ['PYTHONPATH'] = os.pathsep.join(filter(None, (os.environ.get('PYTHONPATH', None), python_path)))
 
         # check if we want to run as another user, only supported on linux
-        if ENV_TASK_EXECUTE_AS_USER.get() and is_linux_platform():
+        # Note: User execution requires a virtual environment, so it's disabled when 
+        # ENV_AGENT_SKIP_PYTHON_ENV_INSTALL is set
+        if ENV_TASK_EXECUTE_AS_USER.get() and is_linux_platform() and not ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get():
             command, script_dir = self._run_as_user_patch(
                 command, self._session.config_file,
                 script_dir, venv_folder,
