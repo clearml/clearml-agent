@@ -490,7 +490,6 @@ class K8sIntegration(Worker):
                             "task": task_id,
                             "queue": self.k8s_pending_queue_id,
                             "status_reason": "k8s pending scheduler",
-                            "update_execution_queue": False,
                         }
                     )
                     if res.ok:
