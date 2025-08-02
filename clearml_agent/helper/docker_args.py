@@ -294,7 +294,6 @@ class CustomTemplate(Template):
     ${TASK.hyperparams.properties.user_key.value}
     """
 
-    idpattern = r'(?a:[_a-z][_a-z0-9|.|:]*)'
     prefix = "CLEARML_"
     queue_id_to_name_map = {}
 
