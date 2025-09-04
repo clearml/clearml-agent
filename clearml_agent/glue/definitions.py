@@ -30,3 +30,8 @@ kubectl actually works and starts the pod)
 ENV_DEFAULT_SCHEDULER_QUEUE_TAGS = EnvEntry(
     "K8S_GLUE_DEFAULT_SCHEDULER_QUEUE_TAGS", default=["k8s-glue"], converter=shlex.split
 )
+
+ENV_LOG_POD_STATUS_BEFORE_DELETING = EnvEntry("K8S_GLUE_LOG_POD_STATUS_BEFORE_DELETING", default=False, converter=bool)
+"""
+If True, log pod status and exit code before deleting it.
+"""
