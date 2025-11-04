@@ -1,5 +1,6 @@
 from copy import deepcopy, copy
 from functools import wraps
+from typing import Any
 
 from ..._vendor import attr
 import sys
@@ -270,8 +271,12 @@ class UvAPI(VirtualenvPip):
 
     def get_python_command(self, extra=()):
         if self.lock_config and self.lockfile_path and self.is_installed:
+            self._build_env_file()  # Inherit relevant env variables
             return self.lock_config.get_run_argv(
-                "run", "--python", str(self.lockfile_path / ".venv" / "bin" / "python"), "python", *extra, cwd=self.lockfile_path)
+                "run",
+                "--env-file", str(self.lockfile_path / ".env"),
+                "--python", str(self.lockfile_path / ".venv" / "bin" / "python"),
+                "python", *extra, cwd=self.lockfile_path)
 
         # if not self.lock_config.get_venv_binary() and check_if_command_exists("uv"):
         #     return Argv("uv", "run", "--no-project", "--python", self.lock_config.get_venv_binary(), "python", *extra)
@@ -282,6 +287,27 @@ class UvAPI(VirtualenvPip):
         #         return Argv(self.bin, "-m", "uv", "run", "--no-project", "--python", self.lock_config.get_venv_binary(), "python", *extra)
         #
         return Argv(self.lock_config.get_venv_binary(), *extra)
+
+    def _build_env_file(self) -> None:
+        if self.lock_config and self.lockfile_path:
+            inherited_env_vars: list[tuple[str, Any]] = []
+            for key, value in os.environ.items():
+                # Inherit ClearML environment variables
+                if key.startswith("CLEARML") or key.startswith("TRAINS_"):
+                    inherited_env_vars.append((key, value))
+            # Inherit environment variables environment section of ClearML config
+            if self.session and self.session.config and (self.session.config.get(
+                    "agent.apply_environment", False) or self.session.config.get(
+                    "sdk.apply_environment", False)):
+                inherited_env_vars += [
+                    (key, value) for key, value in self.session.config.get("environment", {}).items()]
+            with open(str(self.lockfile_path / ".env"), "w") as f:
+                # Consider registering an atexit hook to delete the .env file
+                for key, value in inherited_env_vars:
+                    f.write(f"{key}={value}\n")
+            return
+        Path(".env").touch()
+        return
 
     def _make_command(self, command):
         return self.lock_config.get_run_argv("pip", *command)
