@@ -466,7 +466,7 @@ class K8sIntegration(Worker):
     def run_one_task(self, queue: Text, task_id: Text, worker_args=None, task_session=None, **_):
         print('Pulling task {} launching on kubernetes cluster'.format(task_id))
         session = task_session or self._session
-        task_data = session.api_client.tasks.get_all(id=[task_id])[0]
+        task_data = self._session.get(service="tasks", action="get_all", version="2.13", id=[task_id])['tasks'][0]
 
         # push task into the k8s queue, so we have visibility on pending tasks in the k8s scheduler
         if self._is_same_tenant(task_session):
@@ -1002,7 +1002,7 @@ class K8sIntegration(Worker):
         fp, yaml_file = tempfile.mkstemp(prefix='clearml_k8stmpl_', suffix='.yml')
         os.close(fp)
         with open(yaml_file, 'wt') as f:
-            yaml.dump(template, f)
+            yaml.dump(dict(template), f)
 
         self.log.debug("Applying template:\n{}".format(pformat(template, indent=2)))
 
@@ -1280,7 +1280,7 @@ class K8sIntegration(Worker):
                             print("Error: cannot retrieve owner user for the task '{}', skipping".format(task_id))
                             continue
 
-                        task_session = self.get_task_session(task_user, task_company)
+                        task_session = self.get_task_session(task_user, task_company, self._session)
                         if not task_session:
                             print(
                                 "Error: Could not login as the user '{}' for the task '{}', skipping".format(

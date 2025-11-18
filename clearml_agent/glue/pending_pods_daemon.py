@@ -1,5 +1,5 @@
 from time import sleep
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from clearml_agent.backend_api.session import Request
 from clearml_agent.glue.utilities import get_bash_output
@@ -43,7 +43,7 @@ class PendingPodsDaemon(K8sDaemon):
         return prefix.rpartition('-')[-1] or value
 
     @staticmethod
-    def _get_k8s_resource_namespace(pod: dict):
+    def _get_k8s_resource_namespace(pod: dict) -> Optional[str]:
         return pod.get('metadata', {}).get('namespace', None)
 
     def target(self):

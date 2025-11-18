@@ -203,6 +203,21 @@ class ResourceMonitor(object):
             return False
         return True
 
+    def send_cluster_unregister(self):
+        if not self._cluster_report:
+            return False
+
+        if self.session.feature_set == "basic":
+            return False
+
+        # noinspection PyBroadException
+        try:
+            self.session.post(service="workers", action="cluster_unregister", key=self._cluster_report.cluster_key)
+        except Exception as ex:
+            log.warning("Failed sending cluster unregister: %s", ex)
+            return False
+        return True
+
     def get_cluster_key_and_resource_group(self, worker_id: str):
         worker_id_parts = worker_id.split(":")
         if len(worker_id_parts) < 3:
@@ -344,6 +359,8 @@ class ResourceMonitor(object):
 
         except Exception as ex:
             log.exception("Error reporting monitoring info: %s", str(ex))
+        finally:
+            self.send_cluster_unregister()
 
     def _update_readouts(self):
         readouts = self._machine_stats()

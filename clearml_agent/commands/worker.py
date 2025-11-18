@@ -1250,9 +1250,17 @@ class Worker(ServiceCommandSection):
             # resolve the Task's docker arguments before everything else, because
             # unlike the vault/config these are not running as the agent's user, they are the user's,
             # we need to filter them post template parsing limitation to happen before the `docker_image_func` call
-            docker_args_template_resolver = DockerArgsTemplateResolver(task_session=self._session, task_id=task_id)
+            docker_args_template_resolver = DockerArgsTemplateResolver(
+                task_session=self._session,
+                task_id=task_id,
+                queue_id=queue,
+                # todo cache with timout invalidation?!
+                queue_name=self._resolve_id(id=queue, service="queues", search_hidden=True),
+                worker_id=worker_id,
+                task_info=None
+            )
             if docker_params.get("docker_arguments"):
-                docker_params["docker_arguments"] = docker_args_template_resolver.resolve_docker_args_from_template(
+                docker_params["docker_arguments"] = docker_args_template_resolver.resolve_from_docker_cmd(
                     full_docker_cmd=docker_params["docker_arguments"])
 
             full_docker_cmd = self.docker_image_func(env_task_id=task_id, **docker_params)
@@ -1274,7 +1282,7 @@ class Worker(ServiceCommandSection):
             # convert template arguments now (i.e. ${CLEARML_} )
             # Notice we do not parse the last part of the docker cmd because that's
             # the actual command to be executed inside the docker
-            full_docker_cmd = docker_args_template_resolver.resolve_docker_args_from_template(
+            full_docker_cmd = docker_args_template_resolver.resolve_from_docker_cmd(
                 full_docker_cmd=full_docker_cmd[:-1]) + [full_docker_cmd[-1]]
 
             # if this is services_mode, change the worker_id to a unique name
@@ -1383,7 +1391,8 @@ class Worker(ServiceCommandSection):
 
         return status
 
-    def get_task_session(self, user, company):
+    @staticmethod
+    def get_task_session(user, company, main_session):
         """
         Get task session for the user by cloning the agent session
         and replacing the session credentials with the task owner auth token
@@ -1398,7 +1407,7 @@ class Worker(ServiceCommandSection):
             )
             if not (result.ok() and result.response):
                 try:
-                    self.log.debug("Failed creating task session: %s", result.response)
+                    main_session.log.debug("Failed creating task session: %s", result.response)
                 except:
                     pass
                 return
@@ -1408,7 +1417,7 @@ class Worker(ServiceCommandSection):
             new_session.set_auth_token(result.response.token)
             return new_session
 
-        task_session = get_new_session(self._session, headers={"X-Clearml-Impersonate-As": user})
+        task_session = get_new_session(main_session, headers={"X-Clearml-Impersonate-As": user})
         if not task_session:
             return
 
@@ -1585,7 +1594,7 @@ class Worker(ServiceCommandSection):
                                 print("Error: cannot retrieve owner user for the task '{}', skipping".format(task_id))
                                 continue
 
-                            task_session = self.get_task_session(task_user, task_company)
+                            task_session = self.get_task_session(task_user, task_company, self._session)
                             if not task_session:
                                 print(
                                     "Error: Could not login as the user '{}' for the task '{}', skipping".format(
@@ -1977,7 +1986,7 @@ class Worker(ServiceCommandSection):
         self._use_owner_token(kwargs.get('use_owner_token', False))
 
         self._standalone_mode = kwargs.get('standalone_mode', False)
-        self._polling_interval = max(kwargs.get('polling_interval', 5), 5)
+        self._polling_interval = ENV_QUEUE_POLL_FREQ_SEC.get() or max(kwargs.get('polling_interval', 5), 5)
         self._services_mode = kwargs.get('services_mode', False)
         # must have docker in services_mode
         if self._services_mode:
@@ -2757,8 +2766,15 @@ class Worker(ServiceCommandSection):
         )
 
         # convert docker template arguments (i.e. ${CLEARML_} ) based on the current Task
-        docker_args_template_resolver = DockerArgsTemplateResolver(task_session=self._session, task_id=task_id)
-        full_docker_cmd = docker_args_template_resolver.resolve_docker_args_from_template(
+        docker_args_template_resolver = DockerArgsTemplateResolver(
+            task_session=self._session,
+            task_id=task_id,
+            queue_id=None,
+            queue_name=None,
+            worker_id=None,
+            task_info=None
+        )
+        full_docker_cmd = docker_args_template_resolver.resolve_from_docker_cmd(
             full_docker_cmd=full_docker_cmd)
 
         end_of_build_marker = "build.done=true"
@@ -3125,6 +3141,9 @@ class Worker(ServiceCommandSection):
                 elif not self.package_api:
                     # check if we have to manually configure package API, it will be readonly
                     self.package_api = SystemPip(session=self._session)
+            else:
+                # default for standalone to get commands, implies just python
+                self.package_api = SystemPip(session=self._session)
 
             # do not update the task packages if we are using conda,
             # it will most likely make the task environment unreproducible

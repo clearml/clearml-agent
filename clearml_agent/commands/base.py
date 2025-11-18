@@ -7,10 +7,10 @@ from abc import abstractmethod
 from functools import wraps
 from operator import attrgetter
 from traceback import print_exc
+from time import time
 from typing import Text
 
-from clearml_agent.helper.console import ListFormatter, print_text
-from clearml_agent.helper.dicts import filter_keys
+from clearml_agent.helper.console import ListFormatter
 
 from .._vendor import six
 from clearml_agent.backend_api import services
@@ -91,6 +91,9 @@ class ServiceCommandSection(BaseCommandSection):
 
     _worker_name = None
     MAX_SUGGESTIONS = 10
+    SERVICE_ID_NAME_LOOKUP_CACHE = {}  #  {id: str. dict(timestamp: float, name: str)}
+    # todo: add cache size limit, currently only used for queus
+    LOOKUP_CACHE_TIMEOUT_SEC = 180  # todo: make configurable from conf file,
 
     def __init__(self, *args, **kwargs):
         super(ServiceCommandSection, self).__init__()
@@ -388,6 +391,53 @@ class ServiceCommandSection(BaseCommandSection):
             lambda db_object: '({}) {}'.format(db_object.id, db_object.name)
         )
         raise NameResolutionError(message, suggestions)
+
+    def _resolve_id(self, id, service=None, search_hidden=False):
+        """
+        Resolve an object ID to an object name. (ID is UUID in the system, regardless of service)
+        Operation:
+        - If the argument "looks like" an NAME, return it.
+        - Else, get all object with names containing the argument
+            - if an object with the argument as its name exists, return the object's NAME
+            - Else, print a list of suggestions and exit
+        :param str id: NAME (returned unmodified) or ID to resolve
+        :param str service: Service to resolve from (type of object). Defaults to service represented by the class
+        :return: name of object
+        :rtype: str
+        """
+        service = service or self.service
+        # check if this is a name not an ID
+        if not re.match(r'^[-a-f0-9]{30,}$', id):
+            return id
+
+        cache_entry = self.SERVICE_ID_NAME_LOOKUP_CACHE.get(id)
+        if cache_entry:
+            if time() - cache_entry['timestamp'] < self.LOOKUP_CACHE_TIMEOUT_SEC:
+                return cache_entry['name']
+
+        try:
+            request_cls = getattr(services, service).GetAllRequest
+        except AttributeError:
+            raise NameResolutionError('Name resolution unavailable for {}'.format(service))
+
+        req_dict = {"id": [re.escape(id)], "only_fields": ['name', 'id']}
+        if search_hidden:
+            req_dict["_allow_extra_fields_"] = True
+            req_dict["search_hidden"] = True
+        request = request_cls.from_dict(req_dict)
+        # from_dict will ignore unrecognised keyword arguments - not all GetAll's have only_fields
+        response = getattr(self._session.send_api(request), service)
+        matches = [db_object for db_object in response if id.lower() == db_object.id.lower()]
+
+        if len(matches) == 1:
+            cache_entry = dict(timestamp=time(), name=matches.pop().name)
+            self.SERVICE_ID_NAME_LOOKUP_CACHE[id] = cache_entry
+            return cache_entry['name']
+        elif len(matches) > 1:
+            raise NameResolutionError('Found multiple {} with Id "{}" (#{})'.format(service, id, len(matches)))
+
+        message = 'Could not find {} with name/id "{}"'.format(service.rstrip('s'), id)
+        raise NameResolutionError(message)
 
 
 def recursive_diff(org, upd, out):

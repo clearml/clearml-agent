@@ -1,12 +1,8 @@
 import re
 import shlex
-from functools import partial
 from typing import Tuple, List, TYPE_CHECKING, Optional
 from urllib.parse import urlunparse, urlparse
-from string import Template
 
-from clearml_agent.backend_api.services import queues as queues_api
-from clearml_agent.backend_api.session import Request
 from clearml_agent.definitions import (
     ENV_AGENT_GIT_PASS,
     ENV_AGENT_SECRET_KEY,
@@ -19,6 +15,7 @@ from clearml_agent.definitions import (
 )
 from clearml_agent.helper.sdk_client.utilities.networking import get_private_ip
 from clearml_agent.helper.os.networking import TcpPorts
+from clearml_agent.helper.custom_template import CustomTemplate, TemplateResolver
 
 if TYPE_CHECKING:
     from clearml_agent.session import Session
@@ -276,175 +273,33 @@ class DockerArgsSanitizer:
         return docker_arguments+additional_cmd, additional_task_runtime
 
 
-class CustomTemplate(Template):
-    """
-    Parse ${CLEARML_<something>:default} values based on Task object and replace with real-time value
-    Example: "-e project_id=${CLEARML_TASK.project}" will be replaced with the
-             Task actual project ID from the Task object "-e project_id=<task.project>"
-             "-e queue_name=${CLEARML_QUEUE_NAME}"
-             "-e user_key=${TASK.hyperparams.properties.user_key.value:default_value}"
-
-    It supports:
-
-    ${QUEUE_NAME} - name of the queue
-    # Task object nested variables:
-    ${TASK.id}
-    ${TASK.name}
-    ${TASK.project}
-    ${TASK.hyperparams.properties.user_key.value}
-    """
-
-    # this is a direct copy from _TemplateMetaclass, but removing the remarks that break RE
-    pattern = r"""
-        %(delim)s(?:
-          (?P<escaped>%(delim)s) |
-          (?P<named>%(id)s)      |
-          {(?P<braced>%(id)s)}   |
-          (?P<invalid>)
-        )
-        """
-
-    idpattern = r'(?a:[_a-z][_a-z0-9|.|:]*)'
-    prefix = "CLEARML_"
-    queue_id_to_name_map = {}
-
-    @classmethod
-    def get_queue_name(cls, task_session, queue_id):
-        if queue_id in cls.queue_id_to_name_map:
-            return cls.queue_id_to_name_map[queue_id]
-
-        # noinspection PyBroadException
-        try:
-            response = task_session.send_api(queues_api.GetByIdRequest(queue=queue_id))
-            cls.queue_id_to_name_map[queue_id] = response.queue.name
-        except Exception:
-            # if something went wrong start over from the highest priority queue
-            return None
-        return cls.queue_id_to_name_map.get(queue_id)
-
-    def default_custom_substitute(self, task_info, queue_name):
-        return self.custom_substitute(partial(CustomTemplate.default_resolve_template, task_info, queue_name))
-
-    def custom_substitute(self, mapping_func):
-        # Helper function for .sub()
-        def convert(mo):
-            named = mo.group('named') or mo.group('braced')
-            if not named or not str(named).startswith(self.prefix):
-                return mo.group()
-            named = named[len(self.prefix):]
-            if named is not None:
-                default_value = None
-                try:
-                    if ":" in named:
-                        named, default_value = named.split(":", 1)
-
-                    return str(mapping_func(named, default_value))
-                except KeyError:
-                    return mo.group()
-            if mo.group('escaped') is not None:
-                return self.delimiter
-            if mo.group('invalid') is not None:
-                return mo.group()
-            raise ValueError('Unrecognized named group in pattern', self.pattern)
-
-        return self.pattern.sub(convert, self.template)
-
-    def substitute(self, *args, **kwds):
-        raise ValueError("Unsupported")
-
-    def safe_substitute(self, *args, **kwds):
-        raise ValueError("Unsupported")
-
-    @classmethod
-    def default_resolve_template(cls, task_info, queue, key, default):
-        """
-        Notice CLEARML_ prefix omitted! (i.e. ${QUEUE_ID} is ${CLEARML_QUEUE_ID})
-
-        we support:
-        ${QUEUE_NAME} - name of the queue
-        ${WORKER_ID} - FUTURE
-
-        # we also complex variables:
-        ${TASK.id}
-        ${TASK.name}
-        ${TASK.project.id}
-        ${TASK.project.name}
-        ${TASK.hyperparams.properties.user_key.value}
-
-        :param task_info: nested dict with task information
-        :param queue: queue_id (str)
-        :param key: key to be replaced
-        :param default: default value, None will raise exception
-        :return: string value
-        """
-        try:
-            parts = key.split(".")
-            main_part = parts[0]
-            if main_part == "QUEUE_NAME":
-                if len(parts) == 1:
-                    return queue or default
-                raise ValueError()
-            elif main_part == "QUEUE_NAME":
-                # future support
-                raise ValueError()
-            elif main_part == "WORKER_ID":
-                # future support
-                raise ValueError()
-            elif main_part == "TASK":
-                for part in parts[1:]:
-
-                    task_info = task_info.get(part)
-                    if task_info is None:
-                        break
-
-                if isinstance(task_info, str):
-                    return task_info
-
-                if default:
-                    return default
-                raise ValueError()
-
-        except Exception:
-            raise KeyError((key,))
-
-        # default, nothing
-        raise KeyError((key,))
-
-
-class DockerArgsTemplateResolver:
-    def __init__(self, task_session, task_id):
-        self._task_session = task_session
-        self.task_info = None
-        self.queue_name = None
-        self.task_id = task_id
-
-    def resolve_docker_args_from_template(self, full_docker_cmd):
-        if not full_docker_cmd or not self._task_session.check_min_api_version("2.20"):
+class DockerArgsTemplateResolver(TemplateResolver):
+    def resolve_from_docker_cmd(self, full_docker_cmd):
+        if not full_docker_cmd or not self.task_session.check_min_api_version("2.20"):
             return full_docker_cmd
 
         # convert docker template arguments (i.e. ${CLEARML_} ) based on the current Task
         for i, token in enumerate(full_docker_cmd[:-1]):
             # skip the ones which are obviously not our prefix
-            if not CustomTemplate.delimiter in token or not CustomTemplate.prefix in token:
+            if CustomTemplate.delimiter not in token or CustomTemplate.prefix not in token:
                 continue
 
-            if self.task_info is None:
-                result = self._task_session.send_request(
-                    service='tasks',
-                    action='get_all',
-                    version='2.20',
-                    method=Request.def_method,
-                    json={'id': [self.task_id], 'search_hidden': True}
-                )
-                # we should not fail here
-                self.task_info = result.json().get("data", {}).get("tasks", [])[0] or {}
-                queue_id = self.task_info.get("execution", {}).get("queue")
-                self.queue_name = CustomTemplate.get_queue_name(self._task_session, queue_id)
+            queue_id = self.queue_id or self.task_info.get("execution", {}).get("queue")
+            queue_name = CustomTemplate.get_queue_name(self.task_session, queue_id)
 
             tmpl = CustomTemplate(token)
             # replace it
             try:
-                full_docker_cmd[i] = tmpl.default_custom_substitute(self.task_info, self.queue_name)
+                full_docker_cmd[i] = tmpl.default_custom_substitute(
+                    queue_id=queue_id,
+                    queue_name=queue_name,
+                    worker_id=self.worker_id,
+                    task_info=self.task_info,
+                    provider_info=self.provider_info,
+                    config=self.task_session.config,
+                    user_vaults=self.user_vaults,
+                    user_info=self.user_info,
+                )
             except Exception as ex:
                 print("Failed parsing ClearML Template argument [{}] skipped: error ()".format(token, ex))
 
