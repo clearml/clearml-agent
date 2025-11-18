@@ -97,7 +97,7 @@ ENVIRONMENT_CONFIG = {
     "agent.cuda_version": EnvironmentConfig("CLEARML_CUDA_VERSION", "TRAINS_CUDA_VERSION", "CUDA_VERSION"),
     "agent.cudnn_version": EnvironmentConfig("CLEARML_CUDNN_VERSION", "TRAINS_CUDNN_VERSION", "CUDNN_VERSION"),
     "agent.cpu_only": EnvironmentConfig(names=("CLEARML_CPU_ONLY", "TRAINS_CPU_ONLY", "CPU_ONLY"), type=bool),
-    "agent.crash_on_exception": EnvironmentConfig("CLEAMRL_AGENT_CRASH_ON_EXCEPTION", type=bool),
+    "agent.crash_on_exception": EnvironmentConfig("CLEARML_AGENT_CRASH_ON_EXCEPTION", type=bool),
     "sdk.aws.s3.key": EnvironmentConfig("AWS_ACCESS_KEY_ID"),
     "sdk.aws.s3.secret": ENV_AWS_SECRET_KEY,
     "sdk.aws.s3.region": EnvironmentConfig("AWS_DEFAULT_REGION"),

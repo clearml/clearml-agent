@@ -113,10 +113,10 @@ class UvConfig:
 
         self.log.debug("running: %s", argv)
 
-        #synced = self._is_sync
-        #self._is_sync = False
+        # synced = self._is_sync
+        # self._is_sync = False
         ret = func(argv, **kwargs)
-        #self._is_sync = synced
+        # self._is_sync = synced
         return ret
 
     def get_run_argv(self, *args, **kwargs):
@@ -153,8 +153,19 @@ class UvConfig:
         if not self._is_sync and self._venv_python:
             # if we have not synced then use the preinstalled venv python,
             # otherwise do not specify it
-            args_i = next(i for i, a in enumerate(args+("-", )) if a.startswith("-") or a == "python")
-            args = tuple(args[:args_i]) + ("--python", str(self._venv_python),) + tuple(args[args_i:])
+            args_i = next(
+                i
+                for i, a in enumerate(args + ("-",))
+                if a.startswith("-") or a == "python"
+            )
+            args = (
+                tuple(args[:args_i])
+                + (
+                    "--python",
+                    str(self._venv_python),
+                )
+                + tuple(args[args_i:])
+            )
         # elif "cwd" in kwargs:
         #     cwd = Path(kwargs["cwd"])/".venv"
         #     if cwd.exists():
@@ -174,7 +185,10 @@ class UvConfig:
         return argv
 
     @_guard_enabled
-    def initialize(self, cwd=None,):
+    def initialize(
+        self,
+        cwd=None,
+    ):
         if not self._initialized:
             if cwd:
                 self._cwd = cwd
@@ -183,12 +197,16 @@ class UvConfig:
 
     def get_api(self, session, python, requirements_manager, path, *args, **kwargs):
         if not self._api:
-
             self._api = UvAPI(
-                lockfile_path=self._cwd, lock_config=self,
+                lockfile_path=self._cwd,
+                lock_config=self,
                 session=session,
                 python=python or self._python,
-                requirements_manager=requirements_manager, path=path, *args, **kwargs)
+                requirements_manager=requirements_manager,
+                path=path,
+                *args,
+                **kwargs,
+            )
         return self._api
 
 
@@ -198,8 +216,18 @@ class UvAPI(VirtualenvPip):
     INDICATOR_FILES = "pyproject.toml", "uv.lock"
     VENV_SUFFIX = "_uv"
 
-    def __init__(self, lockfile_path, lock_config, session, python, requirements_manager,
-                 path, interpreter=None, execution_info=None, **kwargs):
+    def __init__(
+        self,
+        lockfile_path,
+        lock_config,
+        session,
+        python,
+        requirements_manager,
+        path,
+        interpreter=None,
+        execution_info=None,
+        **kwargs,
+    ):
         self.lockfile_path = Path(lockfile_path) if lockfile_path else None
         self.lock_config = lock_config
         self._installed = False
@@ -207,8 +235,14 @@ class UvAPI(VirtualenvPip):
         self._created = False
         self._uv_install_path = None
         super(UvAPI, self).__init__(
-            session, python, requirements_manager,
-            path, interpreter=interpreter, execution_info=execution_info, **kwargs)
+            session,
+            python,
+            requirements_manager,
+            path,
+            interpreter=interpreter,
+            execution_info=execution_info,
+            **kwargs,
+        )
 
     def set_lockfile_path(self, lockfile_path):
         if lockfile_path:
@@ -219,7 +253,9 @@ class UvAPI(VirtualenvPip):
         self.set_lockfile_path(lockfile_path)
 
         if self.enabled:
-            self.lock_config.run("sync", "--locked", cwd=str(self.lockfile_path), func=Argv.check_call)
+            self.lock_config.run(
+                "sync", "--locked", cwd=str(self.lockfile_path), func=Argv.check_call
+            )
             self._installed = True
             # self.lock_config.set_binary(Path(self.lockfile_path) / ".venv" / "bin" / "python")
             return True
@@ -233,50 +269,85 @@ class UvAPI(VirtualenvPip):
     @property
     def enabled(self):
         if self._enabled is None:
-            self._enabled =  self.lockfile_path and self.lock_config.enabled and (
-                any((self.lockfile_path / indicator).exists() for indicator in self.INDICATOR_FILES)
+            self._enabled = (
+                self.lockfile_path
+                and self.lock_config.enabled
+                and (
+                    any(
+                        (self.lockfile_path / indicator).exists()
+                        for indicator in self.INDICATOR_FILES
+                    )
+                )
             )
         return self._enabled
 
     @property
     def lock_file_exists(self):
-        return (self.lockfile_path and self.lock_config.enabled and
-                (self.lockfile_path / self.INDICATOR_FILES[1]).exists())
+        return (
+            self.lockfile_path
+            and self.lock_config.enabled
+            and (self.lockfile_path / self.INDICATOR_FILES[1]).exists()
+        )
 
     def freeze(self, freeze_full_environment=False):
-        if not self.is_installed or not self.lockfile_path or not self.lock_config.enabled:
+        if (
+            not self.is_installed
+            or not self.lockfile_path
+            or not self.lock_config.enabled
+        ):
             # there is a bug so we have to call pip to get the freeze because UV will return the wrong list
             # packages = self.run_with_env(('freeze',), output=True).splitlines()
-            packages = self.lock_config.get_run_argv(
-                "pip", "freeze", cwd=self.lockfile_path).get_output().splitlines()
+            packages = (
+                self.lock_config.get_run_argv("pip", "freeze", cwd=self.lockfile_path)
+                .get_output()
+                .splitlines()
+            )
             # list clearml_agent as well
             # packages_without_program = [package for package in packages if PROGRAM_NAME not in package]
-            return {'pip': packages}
+            return {"pip": packages}
 
         lines = self.lock_config.run(
-            "pip", "freeze",
-            cwd=str(self.lockfile_path or self._cwd or self.path)
+            "pip", "freeze", cwd=str(self.lockfile_path or self._cwd or self.path)
         ).splitlines()
         # fix local filesystem reference in freeze
         from clearml_agent.external.requirements_parser.requirement import Requirement
+
         packages = [Requirement.parse(p) for p in lines]
         for p in packages:
             if p.local_file and p.editable:
                 p.path = str(Path(p.path).relative_to(self.lockfile_path))
                 p.line = "-e {}".format(p.path)
 
-        return {
-            "pip": [p.line for p in packages]
-        }
+        return {"pip": [p.line for p in packages]}
 
     def get_python_command(self, extra=()):
         if self.lock_config and self.lockfile_path and self.is_installed:
-            self._build_env_file()  # Inherit relevant env variables
+            if (
+                self.session
+                and self.session.config
+                and self.session.config.get(
+                    "agent.package_manager.uv_apply_environment", True
+                )
+            ):
+                self._build_env_file()  # Inherit relevant env variables
+                return self.lock_config.get_run_argv(
+                    "run",
+                    "--env-file",
+                    str(self.lockfile_path / ".env"),
+                    "--python",
+                    str(self.lockfile_path / ".venv" / "bin" / "python"),
+                    "python",
+                    *extra,
+                    cwd=self.lockfile_path,
+                )
             return self.lock_config.get_run_argv(
                 "run",
-                "--env-file", str(self.lockfile_path / ".env"),
-                "--python", str(self.lockfile_path / ".venv" / "bin" / "python"),
-                "python", *extra, cwd=self.lockfile_path)
+                "--python",
+                str(self.lockfile_path / ".venv" / "bin" / "python"),
+                "python",
+                *extra,
+                cwd=self.lockfile_path,
+            )
 
         # if not self.lock_config.get_venv_binary() and check_if_command_exists("uv"):
         #     return Argv("uv", "run", "--no-project", "--python", self.lock_config.get_venv_binary(), "python", *extra)
@@ -296,11 +367,18 @@ class UvAPI(VirtualenvPip):
                 if key.startswith("CLEARML") or key.startswith("TRAINS_"):
                     inherited_env_vars.append((key, value))
             # Inherit environment variables environment section of ClearML config
-            if self.session and self.session.config and (self.session.config.get(
-                    "agent.apply_environment", False) or self.session.config.get(
-                    "sdk.apply_environment", False)):
+            if (
+                self.session
+                and self.session.config
+                and (
+                    self.session.config.get("agent.apply_environment", False)
+                    or self.session.config.get("sdk.apply_environment", False)
+                )
+            ):
                 inherited_env_vars += [
-                    (key, value) for key, value in self.session.config.get("environment", {}).items()]
+                    (key, value)
+                    for key, value in self.session.config.get("environment", {}).items()
+                ]
             with open(str(self.lockfile_path / ".env"), "w") as f:
                 # Consider registering an atexit hook to delete the .env file
                 for key, value in inherited_env_vars:
@@ -350,7 +428,12 @@ class UvAPI(VirtualenvPip):
         # get python version
         python_version = self.lock_config.get_python_version()
         if self.python and not python_version:
-            python_version = self.python.split("/")[-1].lower().replace("python", "").replace(".exe", "")
+            python_version = (
+                self.python.split("/")[-1]
+                .lower()
+                .replace("python", "")
+                .replace(".exe", "")
+            )
             try:
                 float(python_version)
             except:  # noqa
@@ -361,22 +444,48 @@ class UvAPI(VirtualenvPip):
             # if no python version requested or it's the same as ours create a new venv from the currenbt one
             if not python_version or python_version_string() == python_version:
                 if UvConfig.USE_UV_BIN:
-                    command = Argv(self.lock_config.get_uv_bin(), "venv",
-                                   "--python", sys.executable, *self.create_flags(), str(self.path))
+                    command = Argv(
+                        self.lock_config.get_uv_bin(),
+                        "venv",
+                        "--python",
+                        sys.executable,
+                        *self.create_flags(),
+                        str(self.path),
+                    )
                 else:
                     command = pip_venv.get_python_command(
-                        extra=("-m", "uv", "venv",
-                               "--python", sys.executable, *self.create_flags(), str(self.path))
+                        extra=(
+                            "-m",
+                            "uv",
+                            "venv",
+                            "--python",
+                            sys.executable,
+                            *self.create_flags(),
+                            str(self.path),
+                        )
                     )
             else:
                 # create and download the new python version
                 if UvConfig.USE_UV_BIN:
-                    command = Argv(self.lock_config.get_uv_bin(), "venv",
-                                   "--python", python_version, *self.create_flags(), str(self.path))
+                    command = Argv(
+                        self.lock_config.get_uv_bin(),
+                        "venv",
+                        "--python",
+                        python_version,
+                        *self.create_flags(),
+                        str(self.path),
+                    )
                 else:
                     command = pip_venv.get_python_command(
-                        extra=("-m", "uv", "venv",
-                               "--python", python_version, *self.create_flags(), str(self.path))
+                        extra=(
+                            "-m",
+                            "uv",
+                            "venv",
+                            "--python",
+                            python_version,
+                            *self.create_flags(),
+                            str(self.path),
+                        )
                     )
 
             print(python_version, python_version_string(), command)
@@ -393,16 +502,24 @@ class UvAPI(VirtualenvPip):
         if not uv_version:
             if self.lock_config:
                 uv_version = self.lock_config.get_uv_version()
-            uv_version = uv_version or self.session.config.get("agent.package_manager.uv_version", None)
+            uv_version = uv_version or self.session.config.get(
+                "agent.package_manager.uv_version", None
+            )
 
         # check the installed version
         existing_uv_version = None
         pip_venv = VirtualenvPip(
-            session=self.session, python=self.python, requirements_manager=None,
-            path=self.path, interpreter=self.lock_config.get_binary())
+            session=self.session,
+            python=self.python,
+            requirements_manager=None,
+            path=self.path,
+            interpreter=self.lock_config.get_binary(),
+        )
         packages = (pip_venv.freeze(freeze_full_environment=True) or dict()).get("pip")
         if packages:
-            existing_uv_version = get_specific_package_version({"pip": packages}, package_name="uv")
+            existing_uv_version = get_specific_package_version(
+                {"pip": packages}, package_name="uv"
+            )
 
         argv = None
         version = None
@@ -414,10 +531,10 @@ class UvAPI(VirtualenvPip):
             # get uv version
             version = version.replace(" ", "")
             if (
-                    ("=" in version)
-                    or ("~" in version)
-                    or ("<" in version)
-                    or (">" in version)
+                ("=" in version)
+                or ("~" in version)
+                or ("<" in version)
+                or (">" in version)
             ):
                 version = version
             elif version:
@@ -425,9 +542,10 @@ class UvAPI(VirtualenvPip):
 
             if existing_uv_version:
                 from clearml_agent.helper.package.requirements import SimpleVersion
+
                 need_install = not SimpleVersion.compare_versions(
-                    existing_uv_version,
-                    *SimpleVersion.split_op_version(version))
+                    existing_uv_version, *SimpleVersion.split_op_version(version)
+                )
 
             if need_install:
                 # (we are not running it yet)
@@ -461,11 +579,18 @@ class UvAPI(VirtualenvPip):
             else:
                 print("Installing `uv`")
 
-            self._uv_install_path = str(self.path)[:-1] if str(self.path)[-1] == os.pathsep else str(self.path)
+            self._uv_install_path = (
+                str(self.path)[:-1]
+                if str(self.path)[-1] == os.pathsep
+                else str(self.path)
+            )
             self._uv_install_path += self.VENV_SUFFIX
             pip_venv = VirtualenvPip(
-                session=self.session, python=self.python,
-                requirements_manager=None, path=self._uv_install_path)
+                session=self.session,
+                python=self.python,
+                requirements_manager=None,
+                path=self._uv_install_path,
+            )
             pip_venv.create()
 
             # now install uv
@@ -481,7 +606,8 @@ class UvAPI(VirtualenvPip):
         else:
             print(
                 "Notice: `uv` {}was found, version required is {}, skipping uv installation".format(
-                    existing_uv_version + " ", version)
+                    existing_uv_version + " ", version
+                )
             )
 
         return pip_venv
@@ -499,4 +625,3 @@ class UvAPI(VirtualenvPip):
         if uv_path and uv_path[-1] == os.pathsep:
             uv_path = uv_path[:-1]
         rm_tree(uv_path + self.VENV_SUFFIX)
-
