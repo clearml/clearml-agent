@@ -19,8 +19,6 @@ MLOps/LLMOps scheduler & orchestration solution supporting Linux, macOS and Wind
 
 ### ClearML-Agent
 
-#### *Formerly known as Trains Agent*
-
 * Run jobs (experiments) on any local or cloud based resource
 * Implement optimized resource utilization policies
 * Deploy execution environments with either virtualenv or fully docker containerized with zero effort
