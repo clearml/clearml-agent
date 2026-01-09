@@ -224,7 +224,7 @@ class LiteralScriptManager(object):
             return f.name
 
     def create_notebook_file(self, task, execution, repo_info):
-        # type: (tasks_api.Task, ExecutionInfo, Optional[RepoInfo]) -> Tuple[str, str]
+        # type: (tasks_api.Task, ExecutionInfo, Optional[RepoInfo]) -> Tuple[str, str, str]
         """
         Create notebook file in appropriate location
         :return: directory and script path
@@ -255,19 +255,31 @@ class LiteralScriptManager(object):
                     "found task with `script.working_dir` (`%s`) but without `script.repository`, ignoring",
                     execution.working_dir,
                 )
-            if not execution.entry_point:
-                execution.entry_point = 'untitled.sh' if is_bash_binary else 'untitled.py'
-            elif not target_file_name_module_call:
-                # ignore any folders in the entry point we only need the file name
-                execution.entry_point = execution.entry_point.split(os.path.sep)[-1]
             location = None
+
         location = location or (repo_info and repo_info.root)
         if not location:
             location = Path(self.venv_folder, WORKING_STANDALONE_DIR)
             location.mkdir(exist_ok=True, parents=True)
-        log.debug("selected execution directory: %s", location)
+
+        if not execution.entry_point:
+            execution.entry_point = 'untitled.sh' if is_bash_binary else 'untitled.py'
+        elif not target_file_name_module_call:
+            # try shlex parsing first, decide if we managed based on the filename extension
+            try:
+                file_name = shlex.split(execution.entry_point)[0].split(os.path.sep)[-1]
+                if is_bash_binary and (file_name.endswith(".sh") or file_name.endswith(".bash")):
+                    target_file_name_module_call = file_name
+                elif is_python_binary and file_name.endswith(".py"):
+                    target_file_name_module_call = file_name
+            except Exception:
+                pass
+
+        log.debug("selected execution directory: {}".format(location))
         target_file = self.write(task, location, target_file_name_module_call or execution.entry_point)
-        return Text(location), execution.entry_point if target_file_name_module_call else target_file
+        return (Text(location),
+                execution.entry_point if target_file_name_module_call else target_file,
+                target_file)
 
 
 def get_repo_auth_string(user, password):
@@ -3168,10 +3180,6 @@ class Worker(ServiceCommandSection):
         # print("Running task id [%s]:" % current_task.id)
         print(self._task_logging_pass_control_message.format(current_task.id))
 
-        # check if we need to patch entry point script
-        if ENV_AGENT_FORCE_TASK_INIT.get():
-            patch_add_task_init_call((Path(script_dir) / execution.entry_point).as_posix())
-
         is_python_binary, is_bash_binary = check_is_binary_python_or_bash(current_task.script.binary)
 
         extra = []
@@ -3185,6 +3193,8 @@ class Worker(ServiceCommandSection):
             # if we needed some arguments for bash, that's where we will add them
             extra = []
 
+        script_full_path = None
+
         # check if this is a module load, then load it.
         # noinspection PyBroadException
         try:
@@ -3195,11 +3205,15 @@ class Worker(ServiceCommandSection):
                     _org_env = copy(os.environ)
                     os.environ.update(self._get_job_os_envs(current_task, log_level))
                     os.environ.update(self._get_task_os_env(self._session.config, current_task) or dict())
-                    extra.extend(shlex.split(os.path.expandvars(execution.entry_point)))
+                    parsed_cmd = shlex.split(os.path.expandvars(execution.entry_point))
+                    script_full_path = Path(script_dir) / parsed_cmd[0]
+                    extra.extend(parsed_cmd)
                     # restore (just in case, so we do not interfere with our local execution)
                     os.environ = _org_env
                 else:
-                    extra.extend(shlex.split(execution.entry_point))
+                    parsed_cmd = shlex.split(execution.entry_point)
+                    script_full_path = Path(script_dir) / parsed_cmd[0]
+                    extra.extend(parsed_cmd)
             elif (is_python_binary and execution.entry_point and
                   execution.entry_point.strip().lower().endswith('.ipynb')):
 
@@ -3214,18 +3228,30 @@ class Worker(ServiceCommandSection):
                         exit_code, execution.entry_point))
 
                 converted_script_filename = Path(execution.entry_point).with_suffix(".py").as_posix()
-
-                if ENV_AGENT_FORCE_TASK_INIT.get():
-                    patch_add_task_init_call(converted_script_filename)
+                script_full_path = Path(script_dir) / converted_script_filename
 
                 extra.append(converted_script_filename)
             elif is_bash_binary and execution.entry_point and execution.entry_point.strip().split()[0].strip() == '-c':
                 extra.append("-c")
                 extra.append(" ".join(execution.entry_point.strip().split()[1:]))
             else:
-                extra.append(execution.entry_point)
+                if not (Path(script_dir) / Path(execution.entry_point)).exists():
+                    parsed_cmd = shlex.split(execution.entry_point)
+                    script_full_path = Path(script_dir) / parsed_cmd[0]
+                    extra.extend(parsed_cmd)
+                    print("INFO: script entrypoint contains args, "
+                          "parsing and passing directly to execution: {}".format(extra))
+                else:
+                    script_full_path = Path(script_dir) / execution.entry_point
+                    extra.append(execution.entry_point)
+
         except Exception:
+            script_full_path = Path(script_dir) / execution.entry_point
             extra.append(execution.entry_point)
+
+        # check if we need to patch entry point script
+        if ENV_AGENT_FORCE_TASK_INIT.get() and script_full_path:
+            patch_add_task_init_call(Path(script_full_path).as_posix())
 
         if is_python_binary:
             command = self.package_api.get_python_command(extra)
@@ -3470,14 +3496,20 @@ class Worker(ServiceCommandSection):
                     task=task, vcs=vcs, execution_info=execution, repo_info=repo_info
                 )
             script_file = Path(directory) / execution.entry_point
+            if not script_file.is_file():
+                # try to parse with shlex
+                try:
+                    script_file = Path(directory) / shlex.split(execution.entry_point)[0]
+                except Exception:
+                    pass
 
         if is_literal_script:
             self.log.info("found literal script in `script.diff`")
-            directory, script = literal_script.create_notebook_file(
+            directory, entry_point, script = literal_script.create_notebook_file(
                 task, execution, repo_info
             )
-            execution.entry_point = script
-            script_file = Path(execution.entry_point)
+            execution.entry_point = entry_point
+            script_file = Path(script)
         else:
             # in case of no literal script, there is not difference between empty working dir and `.`
             execution.working_dir = execution.working_dir or "."
@@ -3767,6 +3799,47 @@ class Worker(ServiceCommandSection):
                                                          cached_requirements=cached_requirements, cwd=cwd,
                                                          package_api=package_api if package_api else self.package_api)
 
+    def _patch_python_requirements(self, execution, package_api, cached_requirements):
+        self.log("Found task requirements section, trying to install")
+        cached_requirements = cached_requirements or {}
+
+        if ENV_AGENT_FORCE_TASK_INIT.get():
+            # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
+            print("Force clearml Task.init patch adding clearml package to requirements")
+            if not cached_requirements or cached_requirements.get('pip'):
+                cached_requirements["pip"] = ("clearml\n" + cached_requirements.get("pip", "")) \
+                    if isinstance(cached_requirements.get("pip", ""), str) else \
+                    (["clearml"] + cached_requirements.get("pip", []))
+            if cached_requirements.get('conda'):
+                cached_requirements["conda"] = ("clearml\n" + cached_requirements["conda"]) \
+                    if isinstance(cached_requirements["conda"], str) else \
+                    (["clearml"] + cached_requirements["conda"])
+
+        # check if we need to push jupyter nbconvert if we need to run ipynb
+        if execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb'):
+            print("Force nbconvert patch to convert .ipynb to python")
+            # now we have to make sure we run it with jupyter notebook
+            if not cached_requirements or cached_requirements.get('pip'):
+                cached_requirements["pip"] = ("nbconvert\nipython\n" + cached_requirements.get("pip", "")) \
+                    if isinstance(cached_requirements.get("pip", ""), str) else \
+                    (["nbconvert", "ipython"] + cached_requirements.get("pip", []))
+            if cached_requirements.get('conda'):
+                cached_requirements["conda"] = ("nbconvert\nipython\n" + cached_requirements["conda"]) \
+                    if isinstance(cached_requirements["conda"], str) else \
+                    (["nbconvert", "ipython"] + cached_requirements["conda"])
+
+        if cached_requirements and (cached_requirements.get('conda') or cached_requirements.get('pip')):
+            try:
+                package_api.load_requirements(cached_requirements)
+            except Exception as e:
+                self.log_traceback(e)
+                raise ValueError("Could not install task requirements!\n{}".format(e))
+            else:
+                self.log("task requirements installation passed")
+                return True
+
+        return False
+
     def install_requirements_for_package_api(
         self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None, package_api=None,
     ):
@@ -3827,57 +3900,15 @@ class Worker(ServiceCommandSection):
         if requirements_manager:
             requirements_manager.set_cwd(cwd)
 
-        cached_requirements_failed = False
-        if not repo_info or (
-                cached_requirements and
-                (cached_requirements.get('pip') is not None or
-                 cached_requirements.get('conda') is not None)
-        ):
-            self.log("Found task requirements section, trying to install")
-            cached_requirements = cached_requirements or {}
-
-            if ENV_AGENT_FORCE_TASK_INIT.get():
-                # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
-                print("Force clearml Task.init patch adding clearml package to requirements")
-                if not cached_requirements or cached_requirements.get('pip'):
-                    cached_requirements["pip"] = ("clearml\n" + cached_requirements.get("pip", "")) \
-                        if isinstance(cached_requirements.get("pip", ""), str) else \
-                        (["clearml"] + cached_requirements.get("pip", []))
-                if cached_requirements.get('conda'):
-                    cached_requirements["conda"] = ("clearml\n" + cached_requirements["conda"]) \
-                        if isinstance(cached_requirements["conda"], str) else \
-                        (["clearml"] + cached_requirements["conda"])
-
-            # check if we need to push jupyter nbconvert if we need to run ipynb
-            if execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb'):
-                print("Force nbconvert patch to convert .ipynb to python")
-                # now we have to make sure we run it with jupyter notebook
-                if not cached_requirements or cached_requirements.get('pip'):
-                    cached_requirements["pip"] = ("nbconvert\nipython\n" + cached_requirements.get("pip", "")) \
-                        if isinstance(cached_requirements.get("pip", ""), str) else \
-                        (["nbconvert", "ipython"] + cached_requirements.get("pip", []))
-                if cached_requirements.get('conda'):
-                    cached_requirements["conda"] = ("nbconvert\nipython\n" + cached_requirements["conda"]) \
-                        if isinstance(cached_requirements["conda"], str) else \
-                        (["nbconvert", "ipython"] + cached_requirements["conda"])
-
-            try:
-                package_api.load_requirements(cached_requirements)
-            except Exception as e:
-                self.log_traceback(e)
-                cached_requirements_failed = True
-                raise ValueError("Could not install task requirements!\n{}".format(e))
-            else:
-                self.log("task requirements installation passed")
-                return
-
         if not repo_info:
-            if cached_requirements_failed:
-                raise ValueError("Could not install task requirements!")
-            self.log("no repository to install requirements from")
+            # if we had cached_requirements, it will install them (or raise exception if failed)
+            # if we had nothing to install at least output a warning.
+            if not self._patch_python_requirements(execution, package_api, cached_requirements):
+                self.log("no repository to install requirements from")
             return
 
         repo_requirements_installed = False
+        patched_requirements = False
         for parent in reversed(
             (Path(execution.working_dir) / execution.entry_point).parents
         ):
@@ -3888,18 +3919,19 @@ class Worker(ServiceCommandSection):
                 continue
             print("Trying pip install: {}".format(requirements_file))
             requirements_text = requirements_file.read_text()
-            if ENV_AGENT_FORCE_TASK_INIT.get():
+            if ENV_AGENT_FORCE_TASK_INIT.get() and not patched_requirements:
                 # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
                 print("Force clearml Task.init patch adding clearml package to requirements")
                 requirements_text = "clearml\n" + requirements_text
 
-            if execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb'):
+            if (execution.entry_point and execution.entry_point.strip().lower().endswith('.ipynb')
+                    and not patched_requirements):
                 # notice we have PackageCollectorRequirement to protect against double includes of "clearml"
                 print("Force nbconvert patch to convert .ipynb to python")
                 requirements_text = "nbconvert\nipython\n" + requirements_text
 
             new_requirements = requirements_manager.replace(requirements_text)
-
+            patched_requirements = True
             temp_file = None
             try:
                 with self.named_temporary_file(
@@ -3920,10 +3952,14 @@ class Worker(ServiceCommandSection):
             # mark as successful installation
             repo_requirements_installed = True
 
+        # if we still have not installed anything, see if we need to install something becuase we patched
+        if not repo_requirements_installed:
+            repo_requirements_installed = self._patch_python_requirements(execution, package_api, cached_requirements)
+
         # if we reached here without installing anything, and
         # we failed installing from cached requirements, them this is an error
-        if cached_requirements_failed and not repo_requirements_installed:
-            raise ValueError("Failed installing task requirements and repository requirements")
+        if not repo_requirements_installed:
+            print("Warning: installing NO task requirements or repository requirements")
 
     def named_temporary_file(self, *args, **kwargs):
         kwargs.setdefault("delete", not self._session.debug_mode)
