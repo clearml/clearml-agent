@@ -295,6 +295,13 @@ class TemplateResolver:
             self.clear()
             self.update(d)
 
+        def deepcopy(self):
+            resolver = self._resolver
+            self._resolver = None
+            copy = deepcopy(self)
+            self._resolver = copy._resolver = resolver
+            return copy
+
     def __init__(self, task_session, task_id: str, queue_id: str, queue_name: str, worker_id: str, task_info=None):
         self._task_session = task_session
         self.queue_id = queue_id
