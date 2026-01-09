@@ -3805,6 +3805,14 @@ class Worker(ServiceCommandSection):
                 self.package_api = api
             elif package_api == self.global_package_api:
                 self.global_package_api = api
+
+            if ENV_AGENT_FORCE_TASK_INIT.get():
+                # noinspection PyBroadException
+                try:
+                    (package_api or self.package_api or self.global_package_api).load_requirements({'pip': "clearml"})
+                except Exception:
+                    print("Warning: failed to install ClearML package")
+
             return
 
         package_api.upgrade_pip()
