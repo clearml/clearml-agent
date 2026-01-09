@@ -47,6 +47,8 @@ class FolderCache(object):
         # lock so we make sure no one deletes it before we copy it
         # noinspection PyBroadException
         try:
+            print("INFO: acquiring lock [timeout={}s] for cache folder: {}".format(
+                self._lock_timeout_seconds, self._cache_folder))
             self._lock.acquire(timeout=self._lock_timeout_seconds, readonly=True)
         except BaseException as ex:
             warning('Could not lock cache folder {}: {}'.format(self._cache_folder, ex))
@@ -115,6 +117,8 @@ class FolderCache(object):
             if set(keys) - set(cached_keys):
                 # noinspection PyBroadException
                 try:
+                    print("INFO: acquiring lock [timeout={}s] for cache folder: {}".format(
+                        self._lock_timeout_seconds, self._cache_folder))
                     self._lock.acquire(timeout=self._lock_timeout_seconds)
                 except BaseException as ex:
                     warning('Could not lock cache folder {}: {}'.format(self._cache_folder, ex))
@@ -209,6 +213,8 @@ class FolderCache(object):
         # lock so we make sure no one deletes it before we copy it
         # noinspection PyBroadException
         try:
+            print("INFO: acquiring lock [timeout={}s] for cache folder: {}".format(
+                self._lock_timeout_seconds, self._cache_folder))
             self._lock.acquire(timeout=self._lock_timeout_seconds)
         except BaseException as ex:
             warning('Could not lock cache folder {}: {}'.format(self._cache_folder, ex))

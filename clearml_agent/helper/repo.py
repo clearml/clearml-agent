@@ -798,6 +798,7 @@ def clone_repository_cached(session, execution, destination):
         repo_lock = FileLock(filename=(vcs_cache_path / '{}.lock'.format(repo_hash)).as_posix())
         # noinspection PyBroadException
         try:
+            print("INFO: acquiring [timeout={}s] lock for repo cache folder".format(repo_lock_timeout_sec))
             repo_lock.acquire(timeout=repo_lock_timeout_sec)
         except BaseException:
             print('Could not lock cache folder "{}" (timeout {} sec), using temp vcs cache.'.format(
