@@ -140,14 +140,15 @@ class UvConfig:
             self._is_sync = True
 
         # Set the cache dir to venvs dir is SYNCed otherwise use the pip download as cache
-        if self._is_sync:
-            cache_dir = self.session.config.get("agent.venvs_dir", None)
-            if cache_dir is not None:
-                kwargs["env"]["UV_CACHE_DIR"] = cache_dir
-        else:
-            cache_dir = self.session.config.get("agent.pip_download_cache.path", None)
-            if cache_dir is not None:
-                kwargs["env"]["UV_CACHE_DIR"] = cache_dir
+        if not kwargs["env"].get("UV_CACHE_DIR"):
+            if self._is_sync:
+                cache_dir = self.session.config.get("agent.venvs_dir", None)
+                if cache_dir is not None:
+                    kwargs["env"]["UV_CACHE_DIR"] = cache_dir
+            else:
+                cache_dir = self.session.config.get("agent.pip_download_cache.path", None)
+                if cache_dir is not None:
+                    kwargs["env"]["UV_CACHE_DIR"] = cache_dir
 
         # if we need synced it then we cannot specify the python binary
         if not self._is_sync and self._venv_python:
@@ -253,9 +254,19 @@ class UvAPI(VirtualenvPip):
         self.set_lockfile_path(lockfile_path)
 
         if self.enabled:
-            self.lock_config.run(
-                "sync", "--locked", cwd=str(self.lockfile_path), func=Argv.check_call
-            )
+            # noinspection PyBroadException
+            try:
+                args = ["sync"] + (["--locked"] if self.lock_file_exists else [])
+                self.lock_config.run(
+                    "sync", "--locked", cwd=str(self.lockfile_path), func=Argv.check_call
+                )
+            except Exception as e:
+                if not self.lock_file_exists:
+                    raise
+                print("INFO: failed installing using lock file, trying without")
+                args = ["sync"]
+                self.lock_config.run(*args, cwd=str(self.lockfile_path), func=Argv.check_call)
+
             self._installed = True
             # self.lock_config.set_binary(Path(self.lockfile_path) / ".venv" / "bin" / "python")
             return True
