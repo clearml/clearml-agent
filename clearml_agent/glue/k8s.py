@@ -214,6 +214,8 @@ class K8sIntegration(Worker):
         self._min_cleanup_interval_per_ns_sec = 1.0
         self._last_pod_cleanup_per_ns = defaultdict(lambda: 0.)
 
+        self._update_execution_queue_when_enqueueing_to_pending_queue = self._session.feature_set == "basic"
+
         self._server_supports_same_state_transition = (
                 self._session.feature_set != "basic" and self._session.check_min_server_version("3.22.3")
         )
@@ -491,7 +493,7 @@ class K8sIntegration(Worker):
                             "task": task_id,
                             "queue": self.k8s_pending_queue_id,
                             "status_reason": "k8s pending scheduler",
-                            "update_execution_queue": False,
+                            "update_execution_queue": self._update_execution_queue_when_enqueueing_to_pending_queue,
                         }
                     )
                     if res.ok:
