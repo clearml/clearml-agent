@@ -104,6 +104,7 @@ class Session(TokenManager):
         client=None,
         config=None,
         http_retries_config=None,
+        custom_default_config_paths=None,
         **kwargs
     ):
         # add backward compatibility support for old environment variables
@@ -112,11 +113,11 @@ class Session(TokenManager):
         if config is not None:
             self.config = config
         else:
-            self.config = load()
+            self.config = load(*(custom_default_config_paths or ()))
             if initialize_logging:
                 self.config.initialize_logging(debug=kwargs.get('debug', False))
 
-        super(Session, self).__init__(config=config, **kwargs)
+        super(Session, self).__init__(config=self.config, **kwargs)
 
         self._verbose = verbose if verbose is not None else ENV_VERBOSE.get()
         self._logger = logger

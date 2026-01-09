@@ -122,6 +122,7 @@ class K8sIntegration(Worker):
             pod_name_prefix=None,
             limit_pod_label=None,
             force_system_packages=None,
+            *args,
             **kwargs
     ):
         """
@@ -153,7 +154,7 @@ class K8sIntegration(Worker):
         :param bool force_system_packages: true when running tasks in containers (i.e. docker mode or k8s glue).
             (default: true)
         """
-        super(K8sIntegration, self).__init__()
+        super(K8sIntegration, self).__init__(*args, **kwargs)
         self.kind = os.environ.get("CLEARML_K8S_GLUE_KIND", "pod").strip().lower()
         if self.kind not in self.SUPPORTED_KIND:
             raise UsageError(f"Kind '{self.kind}' not supported (expected {','.join(self.SUPPORTED_KIND)})")
