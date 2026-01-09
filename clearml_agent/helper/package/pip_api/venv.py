@@ -72,6 +72,9 @@ class VirtualenvPip(SystemPip, PackageManager):
             self.session.command(
                 self.python, "-m", "virtualenv", self.path, *self.create_flags()
             ).check_call()
+            # doublecheck the path exists, because sometimes, the return exitcode is zero and there is still an error
+            if not Path(self.path).is_dir():
+                raise EnvironmentError("virtualenv failed with [{}]".format(self.python))
         except Exception as ex:
             try:
                 # let's try with std library instead
