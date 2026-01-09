@@ -101,9 +101,10 @@ class CustomTemplate(Template):
             return None
         return cls.queue_id_to_name_map.get(queue_id)
 
-    def __init__(self, template, support_ops=True):
+    def __init__(self, template, support_ops=True, force_yaml_string_quotes=True):
         super().__init__(template)
         self._support_ops = support_ops
+        self._force_yaml_string_quotes = force_yaml_string_quotes
 
     def default_custom_substitute(
         self,
@@ -127,6 +128,7 @@ class CustomTemplate(Template):
                 config=config,
                 user_vaults=user_vaults,
                 user_info=user_info,
+                force_yaml_string_quotes=self._force_yaml_string_quotes
             )
         )
 
@@ -204,6 +206,7 @@ class CustomTemplate(Template):
         config: Mapping = None,
         user_vaults: Mapping = None,
         user_info: Mapping = None,
+        force_yaml_string_quotes = False,
     ):
         """
         Notice CLEARML_ prefix omitted! (i.e. ${QUEUE_ID} is ${QUEUE_ID})
@@ -236,6 +239,7 @@ class CustomTemplate(Template):
         :param queue_name: queue_name (str)
         :param key: key to be replaced
         :param default: default value, None will raise exception
+        :param force_yaml_string_quotes: when resolving a string, add a YAML directive to force string quoting
         :return: string value
         """
         single_field_mapping = {
@@ -258,11 +262,16 @@ class CustomTemplate(Template):
                 return single_field_mapping[prefix] or default
             elif prefix in nested_field_mapping:
                 cur = nested_field_mapping[prefix] or {}
+                if cur is None:
+                    raise KeyError((key,))
                 for part in path:
                     cur = cur.get(part)
                     if cur is None:
                         break
                 if isinstance(cur, str):
+                    if force_yaml_string_quotes:
+                        # !!str is a YAML directive to cast to string (will use quotes)
+                        return f"!!str {cur}"
                     return cur
                 elif isinstance(cur, bool):
                     return "true" if cur else "false"
@@ -302,7 +311,15 @@ class TemplateResolver:
             self._resolver = copy._resolver = resolver
             return copy
 
-    def __init__(self, task_session, task_id: str, queue_id: str, queue_name: str, worker_id: str, task_info=None):
+    def __init__(
+        self,
+        task_session,
+        task_id: str,
+        queue_id: str,
+        queue_name: str,
+        worker_id: str,
+        task_info=None,
+    ):
         self._task_session = task_session
         self.queue_id = queue_id
         self.queue_name = queue_name
@@ -353,8 +370,8 @@ class TemplateResolver:
         token_dict = self.task_session.get_decoded_token(self.task_session.token, verify=False)
         return deepcopy(token_dict.get("providers_info") or {})
 
-    def resolve_string_from_template(self, template: str) -> str:
-        tmpl = CustomTemplate(template)
+    def resolve_string_from_template(self, template: str, force_yaml_string_quotes=True) -> str:
+        tmpl = CustomTemplate(template, force_yaml_string_quotes=force_yaml_string_quotes)
         return tmpl.default_custom_substitute(
             queue_id=self.queue_id,
             queue_name=self.queue_name,
@@ -366,7 +383,9 @@ class TemplateResolver:
             user_info=self.user_info,
         )
 
-    def resolve_from_template(self, template: str) -> Result:
-        resolved_template_str = self.resolve_string_from_template(template)
+    def resolve_from_template(self, template: str, force_yaml_string_quotes=True) -> Result:
+        resolved_template_str = self.resolve_string_from_template(
+            template, force_yaml_string_quotes=force_yaml_string_quotes
+        )
         template = yaml.safe_load(resolved_template_str)
         return self.Result(self, template)
