@@ -257,9 +257,7 @@ class UvAPI(VirtualenvPip):
             # noinspection PyBroadException
             try:
                 args = ["sync"] + (["--locked"] if self.lock_file_exists else [])
-                self.lock_config.run(
-                    "sync", "--locked", cwd=str(self.lockfile_path), func=Argv.check_call
-                )
+                self.lock_config.run(*args, cwd=str(self.lockfile_path), func=Argv.check_call)
             except Exception as e:
                 if not self.lock_file_exists:
                     raise
@@ -322,7 +320,6 @@ class UvAPI(VirtualenvPip):
         ).splitlines()
         # fix local filesystem reference in freeze
         from clearml_agent.external.requirements_parser.requirement import Requirement
-
         packages = [Requirement.parse(p) for p in lines]
         for p in packages:
             if p.local_file and p.editable:
