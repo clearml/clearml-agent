@@ -2550,7 +2550,7 @@ class Worker(ServiceCommandSection):
         try:
             self._session.send_api(
                 tasks_api.EditRequest(
-                    task_id, script=dict(version_num=repo_info.commit), force=True
+                    task_id, script=dict(binary=None, version_num=repo_info.commit), force=True
                 )
             )
         except Exception:
