@@ -17,6 +17,9 @@ def parse(reqstr, cwd=None):
     :param cwd: Optional current working dir for -r file.txt loading
     :returns: a *generator* of Requirement objects
     """
+    if not reqstr:
+        return
+
     if isinstance(reqstr, list) and reqstr and isinstance(reqstr[0], str):
         lines = reqstr
     else:
