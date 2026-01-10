@@ -248,6 +248,13 @@ class Argv(Executable):
             return self.ARGV_SEPARATOR.join(map(double_quote, self))
         return self.ARGV_SEPARATOR.join(map(quote, self))
 
+    def update_envs(self, envs):
+        if not envs:
+            return
+        if not self._env:
+            self._env = dict()
+        self._env.update(envs)
+
     def call_subprocess(self, func, censor_password=False, *args, **kwargs):
         self._log.debug("running: %s: %s", func.__name__, list(self))
         if self._env:
