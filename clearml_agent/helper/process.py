@@ -254,7 +254,7 @@ class Argv(Executable):
             return
         if not self._env:
             self._env = dict()
-        self._env.update(envs)
+        self._env.update(copy(envs))
 
     def call_subprocess(self, func, censor_password=False, *args, **kwargs):
         self._log.debug("running: %s: %s", func.__name__, list(self))

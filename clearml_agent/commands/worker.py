@@ -3281,13 +3281,13 @@ class Worker(ServiceCommandSection):
         print("Environment setup completed successfully\n")
 
         # update the jobs global environment variable
-        os.environ.update(self._get_job_os_envs(current_task, log_level, command))
+        os.environ.update(self._get_job_os_envs(current_task, log_level))
 
         if repo_info:
             self._update_commit_id(current_task.id, execution, repo_info)
 
         # get Task Environments variables and update the process (if enabled)
-        os.environ.update(self._get_task_os_env(self._session.config, current_task, command) or dict())
+        os.environ.update(self._get_task_os_env(self._session.config, current_task) or dict())
 
         # Add the script CWD to the python path
         if repo_info and repo_info.root and self._session.config.get('agent.force_git_root_python_path', None):
@@ -3343,6 +3343,9 @@ class Worker(ServiceCommandSection):
         # remove our internal env
         os.environ.pop("CLEARML_APT_INSTALL", None)
         os.environ.pop("TRAINS_APT_INSTALL", None)
+
+        # if we are using a Command i.e. not execs update command env vars
+        command.update_envs(os.environ)
 
         print("Starting Task Execution:\n".format(current_task.id))
         exit_code = -1
@@ -3413,7 +3416,7 @@ class Worker(ServiceCommandSection):
 
         return 1 if exit_code is None else exit_code
 
-    def _get_job_os_envs(self, current_task, log_level, command=None):
+    def _get_job_os_envs(self, current_task, log_level):
         sdk_env = {
             # config_file updated in session.py
             "task_id": current_task.id,
@@ -3426,11 +3429,9 @@ class Worker(ServiceCommandSection):
             for key, value in sdk_env.items()
             for sdk_key in ENVIRONMENT_SDK_PARAMS[key]
         }
-        if command:
-            command.update_envs(envs)
         return envs
 
-    def _get_task_os_env(self, config, current_task, command=None):
+    def _get_task_os_env(self, config, current_task):
         if not config.get('agent.enable_task_env', None):
             return None
         if not self._session.check_min_api_version('2.9'):
@@ -3442,8 +3443,7 @@ class Worker(ServiceCommandSection):
             hyper_params = {
                 str(p['name']): str(p['value'])
                 for p in hyper_params['params'][0]['hyperparams'] if p['section'] == 'Environment'}
-            if command:
-                command.update_envs(hyper_params)
+
             return hyper_params
         except Exception:
             return None
