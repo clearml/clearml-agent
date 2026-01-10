@@ -101,7 +101,7 @@ class CustomTemplate(Template):
             return None
         return cls.queue_id_to_name_map.get(queue_id)
 
-    def __init__(self, template, support_ops=True, force_yaml_string_quotes=True):
+    def __init__(self, template, support_ops=True, force_yaml_string_quotes=False):
         super().__init__(template)
         self._support_ops = support_ops
         self._force_yaml_string_quotes = force_yaml_string_quotes
@@ -370,7 +370,7 @@ class TemplateResolver:
         token_dict = self.task_session.get_decoded_token(self.task_session.token, verify=False)
         return deepcopy(token_dict.get("providers_info") or {})
 
-    def resolve_string_from_template(self, template: str, force_yaml_string_quotes=True) -> str:
+    def resolve_string_from_template(self, template: str, force_yaml_string_quotes=False) -> str:
         tmpl = CustomTemplate(template, force_yaml_string_quotes=force_yaml_string_quotes)
         return tmpl.default_custom_substitute(
             queue_id=self.queue_id,
@@ -383,7 +383,7 @@ class TemplateResolver:
             user_info=self.user_info,
         )
 
-    def resolve_from_template(self, template: str, force_yaml_string_quotes=True) -> Result:
+    def resolve_from_template(self, template: str, force_yaml_string_quotes=False) -> Result:
         resolved_template_str = self.resolve_string_from_template(
             template, force_yaml_string_quotes=force_yaml_string_quotes
         )
