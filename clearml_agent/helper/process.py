@@ -81,7 +81,7 @@ def terminate_process(pid, timeout=10., ignore_zombie=True, include_children=Fal
         return True
 
 
-def kill_all_child_processes(pid=None, include_parent=True):
+def kill_all_child_processes(pid=None, include_parent=True, debug=False):
     # get current process if pid not provided
     if not pid:
         pid = os.getpid()
@@ -91,7 +91,8 @@ def kill_all_child_processes(pid=None, include_parent=True):
         parent = psutil.Process(pid)
     except psutil.Error as ex:
         # could not find process id
-        print("ERROR: could not find process id {}: {}".format(pid, ex))
+        if debug:
+            print("WARNING: could not find process id {}: {}".format(pid, ex))
         return
     for child in parent.children(recursive=True):
         try:

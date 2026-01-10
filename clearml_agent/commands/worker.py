@@ -1748,7 +1748,7 @@ class Worker(ServiceCommandSection):
                     terminate_all_child_processes(timeout=20, include_parent=False)
 
                 # if we are here, just kill all sub processes
-                kill_all_child_processes()
+                kill_all_child_processes(debug=self._session.debug_mode if self._session else False)
 
             # unregister dynamic GPU worker, if we were terminated while setting up a Task
             if dynamic_gpus_worker_id:
@@ -2419,7 +2419,8 @@ class Worker(ServiceCommandSection):
                             level="ERROR",
                             session=session,
                         )
-                        kill_all_child_processes(process.pid)
+                        kill_all_child_processes(
+                            process.pid, debug=self._session.debug_mode if self._session else False)
                 else:
                     sleep(self._polling_interval)
                     status = process.poll()
@@ -2465,7 +2466,7 @@ class Worker(ServiceCommandSection):
         except KeyboardInterrupt:
             # so someone else will catch us
             if process:
-                kill_all_child_processes(process.pid)
+                kill_all_child_processes(process.pid, debug=self._session.debug_mode if self._session else False)
             raise
         except Exception:
             # we should not get here, but better safe than sorry
