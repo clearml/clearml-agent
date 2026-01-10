@@ -3083,6 +3083,14 @@ class Worker(ServiceCommandSection):
             alternative_code_folder = None
             if ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get():
                 venv_folder, requirements_manager, is_cached = None, None, False
+                if ENV_AGENT_SKIP_PIP_VENV_INSTALL.get():
+                    venv_folder, _, _ = self.install_virtualenv(
+                        standalone_mode=standalone_mode,
+                        requested_python_version=python_ver,
+                        execution_info=execution,
+                        cached_requirements=requirements,
+                    )
+
                 # we need to create a folder for the code to be dumped into
                 code_folder = self._session.config.get("agent.venvs_dir")
                 code_folder = Path(os.path.expanduser(os.path.expandvars(code_folder)))
