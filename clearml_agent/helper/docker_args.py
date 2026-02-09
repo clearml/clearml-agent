@@ -299,6 +299,7 @@ class DockerArgsTemplateResolver(TemplateResolver):
                     config=self.task_session.config,
                     user_vaults=self.user_vaults,
                     user_info=self.user_info,
+                    project_info=self.project_info,
                 )
             except Exception as ex:
                 print("Failed parsing ClearML Template argument [{}] skipped: error ()".format(token, ex))

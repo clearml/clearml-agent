@@ -56,13 +56,14 @@ class CustomTemplate(Template):
         ${QUEUE_NAME}
         ${WORKER_ID}
         ${QUEUE_ID}
+        ${PROJECT_NAME}
+        ${PROJECT_ID}
 
         Complex variables are also supported:
 
         ${TASK.id}
         ${TASK.name}
-        ${TASK.project.id}
-        ${TASK.project.name}
+        ${TASK.project}
         ${TASK.hyperparams.properties.user_key.value}
         ${PROVIDERS_INFO...}
         ${CONFIG...}
@@ -101,10 +102,17 @@ class CustomTemplate(Template):
             return None
         return cls.queue_id_to_name_map.get(queue_id)
 
-    def __init__(self, template, support_ops=True, force_yaml_string_quotes=False):
+    def __init__(
+        self,
+        template,
+        support_ops: bool = True,
+        force_yaml_string_quotes: bool = False,
+        default_list_delimiter: str = ','
+    ):
         super().__init__(template)
         self._support_ops = support_ops
         self._force_yaml_string_quotes = force_yaml_string_quotes
+        self._default_list_delimiter = default_list_delimiter
 
     def default_custom_substitute(
         self,
@@ -115,7 +123,8 @@ class CustomTemplate(Template):
         provider_info: Mapping = None,
         config: Mapping = None,
         user_vaults: Mapping = None,
-        user_info: Mapping = None
+        user_info: Mapping = None,
+        project_info: Mapping = None,
     ):
         return self.custom_substitute(
             partial(
@@ -128,7 +137,9 @@ class CustomTemplate(Template):
                 config=config,
                 user_vaults=user_vaults,
                 user_info=user_info,
-                force_yaml_string_quotes=self._force_yaml_string_quotes
+                project_info=project_info,
+                force_yaml_string_quotes=self._force_yaml_string_quotes,
+                default_list_delimiter=self._default_list_delimiter,
             )
         )
 
@@ -206,7 +217,9 @@ class CustomTemplate(Template):
         config: Mapping = None,
         user_vaults: Mapping = None,
         user_info: Mapping = None,
-        force_yaml_string_quotes = False,
+        project_info: Mapping = None,
+        force_yaml_string_quotes: bool = False,
+        default_list_delimiter: str = ',',
     ):
         """
         Notice CLEARML_ prefix omitted! (i.e. ${QUEUE_ID} is ${QUEUE_ID})
@@ -216,13 +229,14 @@ class CustomTemplate(Template):
         ${QUEUE_NAME}
         ${WORKER_ID}
         ${QUEUE_ID}
+        ${PROJECT_NAME}
+        ${PROJECT_ID}
 
         Complex variables are also supported:
 
         ${TASK.id}
         ${TASK.name}
-        ${TASK.project.id}
-        ${TASK.project.name}
+        ${TASK.project}
         ${TASK.hyperparams.properties.user_key.value}
         ${PROVIDERS_INFO...}
         ${CONFIG...}
@@ -240,12 +254,15 @@ class CustomTemplate(Template):
         :param key: key to be replaced
         :param default: default value, None will raise exception
         :param force_yaml_string_quotes: when resolving a string, add a YAML directive to force string quoting
+        :param default_list_delimiter: the default delimiter used when formatting lists (default is a comma)
         :return: string value
         """
         single_field_mapping = {
             "QUEUE_ID": queue_id,
             "QUEUE_NAME": queue_name,
             "WORKER_ID": worker_id,
+            "PROJECT_NAME": project_info.get("name", "unknown"),
+            "PROJECT_ID": project_info.get("id", "unknown"),
         }
         nested_field_mapping = {
             "TASK": task_info or {},
@@ -254,6 +271,18 @@ class CustomTemplate(Template):
             "USER_VAULTS": user_vaults or {},
             "USER": user_info or {},
         }
+
+        def format_base_type_to_string(v, force_yaml=True) -> Optional[str]:
+            if isinstance(v, str):
+                if force_yaml and force_yaml_string_quotes:
+                    # !!str is a YAML directive to cast to string (will use quotes)
+                    return f"!!str {v}"
+                return v
+            elif isinstance(v, bool):
+                return "true" if v else "false"
+            elif isinstance(v, (int, float)):
+                return str(v)
+
         try:
             prefix, *path = key.split(".")
             if prefix in single_field_mapping:
@@ -268,16 +297,19 @@ class CustomTemplate(Template):
                     cur = cur.get(part)
                     if cur is None:
                         break
-                if isinstance(cur, str):
-                    if force_yaml_string_quotes:
-                        # !!str is a YAML directive to cast to string (will use quotes)
-                        return f"!!str {cur}"
-                    return cur
-                elif isinstance(cur, bool):
-                    return "true" if cur else "false"
-                elif isinstance(cur, (int, float)):
-                    return str(cur)
-                if default:
+                value = format_base_type_to_string(cur)
+                if value is not None:
+                    return value
+                elif isinstance(cur, list) and all(isinstance(item, (str, bool, int, float)) for item in cur):
+                    # support list of base types
+                    return format_base_type_to_string(
+                        default_list_delimiter.join(
+                            format_base_type_to_string(item, force_yaml=False)
+                            for item in cur
+                        )
+                    )
+                # [[ ",${CLEARML_TASK_tags}," == *",$X,"* ]]
+                elif default:
                     return default
                 raise ValueError()
 
@@ -329,6 +361,7 @@ class TemplateResolver:
         self.user_info = LazyDict("user info", self._load_user_info, error_cb=self._error)
         self.task_info = task_info if task_info else LazyDict("task info", self._load_task_info, self._error)
         self.provider_info = LazyDict("provider info", self._load_provider_info, self._error)
+        self.project_info = LazyDict("project info", self._load_project_info, self._error)
 
     @property
     def task_session(self):
@@ -366,6 +399,22 @@ class TemplateResolver:
         # we should not fail here
         return result.json().get("data", {}).get("tasks", [])[0] or {}
 
+    def _load_project_info(self):
+        project_id = self.task_info.get("project")
+        result = self.task_session.send_request(
+            service="projects",
+            action="get_all",
+            version='2.20',
+            method=Request.def_method,
+            json={"id": [project_id], "search_hidden": True}  # check hidden required?
+        )
+        # we should not fail here
+        project = result.json().get("data", {}).get("projects", [])[0]
+        return {
+            "name": project.get("name"),
+            "id": project.get("id")
+        }
+
     def _load_provider_info(self):
         token_dict = self.task_session.get_decoded_token(self.task_session.token, verify=False)
         return deepcopy(token_dict.get("providers_info") or {})
@@ -381,6 +430,7 @@ class TemplateResolver:
             config=self.task_session.config,
             user_vaults=self.user_vaults,
             user_info=self.user_info,
+            project_info=self.project_info,
         )
 
     def resolve_from_template(self, template: str, force_yaml_string_quotes=False) -> Result:
