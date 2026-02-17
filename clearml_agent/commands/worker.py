@@ -3516,7 +3516,7 @@ class Worker(ServiceCommandSection):
                 is_file = script_file.is_file()
             except OSError:
                 is_file = False
-            if is_file:
+            if not is_file:
                 # try to parse with shlex
                 try:
                     script_file = Path(directory) / shlex.split(execution.entry_point)[0]
