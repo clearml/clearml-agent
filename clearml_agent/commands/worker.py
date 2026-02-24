@@ -988,6 +988,7 @@ class Worker(ServiceCommandSection):
         self._suppress_cr = self._session.config.get("agent.suppress_carriage_return", True)
         self._host_ssh_cache = None
         self._truncate_task_output_files = bool(self._session.config.get("agent.truncate_task_output_files", False))
+        self._use_podman = False
 
         # True - supported
         # None - not initialized
@@ -1988,8 +1989,26 @@ class Worker(ServiceCommandSection):
         return self._resolve_queue_names(queues=queues, create_if_missing=create_if_missing)
 
     def daemon(self, queues, log_level, foreground=False, docker=False, detached=False, order_fairness=False, **kwargs):
+        use_docker = docker not in (False, None)
+
+        podman = kwargs.get("podman", None)
+        self._use_podman = podman not in (False, None)
+
+        if self._use_podman:
+            # We need to potentially turn on docker support
+            if not use_docker:
+                use_docker = True
+                docker = podman
+            elif podman is not True and docker is not True and podman != docker:
+                # both specify container and/or args, raise an error since they might be different
+                raise ValueError(
+                    "Running in docker+podman mode, different containers provided. "
+                    "Please use --docker or --podman with container details, not both."
+                )
+
+        # We use containers with podman - this is identical to
         # check that we have docker command if we need it
-        if docker not in (False, None) and not check_if_command_exists("docker"):
+        if use_docker and not check_if_command_exists("docker"):
             raise ValueError("Running in Docker mode, 'docker' command was not found")
 
         self.is_daemon = True
@@ -2019,7 +2038,7 @@ class Worker(ServiceCommandSection):
         if self._services_mode and dynamic_gpus:
             raise ValueError("Combining --dynamic-gpus and --services-mode is not supported")
 
-        if self._dynamic_gpus == "fractional" and docker in (None, False):
+        if self._dynamic_gpus == "fractional" and not use_docker:
             raise ValueError("Fractional GPUs are only supported in docker-mode, "
                              "add --docker to allow docker-mode operation")
 
@@ -2081,7 +2100,7 @@ class Worker(ServiceCommandSection):
             suffix=".cfg", prefix=".clearml_agent.", mode='w+t').name
 
         # print docker image
-        if docker is not False and docker is not None:
+        if use_docker:
             self._force_current_version = kwargs.get('force_current_version', False)
             self.set_docker_variables(docker, clean_api_credentials=self._impersonate_as_task_owner)
         else:
@@ -4832,7 +4851,10 @@ class Worker(ServiceCommandSection):
                 dockers_nvidia_visible_devices = gpu_devices
             else:
                 # replace back "." to ":" MIG support
-                base_cmd += ['--gpus', '\"device={}\"'.format(gpu_devices.replace(".", ":")), ]
+                if self._use_podman:
+                    base_cmd += ['--gpus', str(gpu_devices.replace(".", ":")), ]
+                else:
+                    base_cmd += ['--gpus', '\"device={}\"'.format(gpu_devices.replace(".", ":")), ]
             # We are using --gpu, so we should not pass NVIDIA_VISIBLE_DEVICES, I think.
             # base_cmd += ['-e', 'NVIDIA_VISIBLE_DEVICES=' + gpu_devices, ]
         elif gpu_devices.strip() == 'none':

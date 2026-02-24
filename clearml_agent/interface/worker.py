@@ -53,6 +53,16 @@ DAEMON_ARGS = dict({
         'help': 'Pipe full log to stdout/stderr, should not be used if running in background',
         'action': 'store_true',
     },
+    '--podman': {
+        'help': 'Run execution task inside a container using podman. Optional args <image> <arguments> or '
+                'specify default docker image in agent.default_docker.image / agent.default_docker.arguments '
+                'use --gpus/--cpu-only (or set NVIDIA_VISIBLE_DEVICES) to limit gpu visibility for docker. '
+                'This is identical to the --docker flag other than the fact the resulting docker run command will '
+                'contain the appropriate adjustments required by podman.',
+        'nargs': '*',
+        'default': False,
+        'group': 'Docker support',
+    },
     '--docker': {
         'help': 'Run execution task inside a docker (v19.03 and above). Optional args <image> <arguments> or '
                 'specify default docker image in agent.default_docker.image / agent.default_docker.arguments '
