@@ -719,6 +719,7 @@ class K8sIntegration(Worker):
             namespace=namespace,
             task_token=task_session.token.encode("ascii") if task_session else None,
             base_spec=base_spec,
+            task_data=task_data,
         )
 
         print('kubectl output:\n{}\n{}'.format(error, output))
@@ -858,12 +859,13 @@ class K8sIntegration(Worker):
     def get_task_worker_id(self, template, task_id, pod_name, namespace, queue):
         return f"{self.worker_id}:{task_id}"
 
-    def use_image_entrypoint(self, queue: str, task_id: str, docker_image: str) -> bool:
+    def use_image_entrypoint(self, queue: str, task_id: str, docker_image: str, task_data: dict = None) -> bool:
         return ENV_POD_USE_IMAGE_ENTRYPOINT.get()
 
     def _create_template_container(
         self, pod_name: str, task_id: str, docker_image: str, docker_args: List[str], queue: str,
-        docker_bash: str, clearml_conf_create_script: List[str], task_worker_id: str, task_token: str = None
+        docker_bash: str, clearml_conf_create_script: List[str], task_worker_id: str, task_token: str = None,
+        task_data: dict = None
     ) -> dict:
         container = self._get_docker_args(
             docker_args,
@@ -884,7 +886,7 @@ class K8sIntegration(Worker):
         # Set worker ID
         add_or_update_env_var('CLEARML_WORKER_ID', task_worker_id)
 
-        if self.use_image_entrypoint(queue=queue, task_id=task_id, docker_image=docker_image):
+        if self.use_image_entrypoint(queue=queue, task_id=task_id, docker_image=docker_image, task_data=task_data):
             # Don't add a cmd and args, just the image
 
             # Add the task ID and token since we need it (it's usually in the init script passed to us
@@ -950,6 +952,7 @@ class K8sIntegration(Worker):
         pod_number=None,
         task_token=None,
         base_spec: dict = None,  # base values for the spec (might be overridden)
+        task_data: dict = None,
     ):
         if "apiVersion" not in template:
             template["apiVersion"] = "batch/v1" if self.using_jobs else "v1"
@@ -1002,6 +1005,7 @@ class K8sIntegration(Worker):
             task_worker_id=task_worker_id,
             task_token=task_token,
             queue=queue,
+            task_data=task_data,
         )
 
         if containers:
