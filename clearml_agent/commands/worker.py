@@ -3833,7 +3833,7 @@ class Worker(ServiceCommandSection):
                                                          cached_requirements=cached_requirements, cwd=cwd,
                                                          package_api=package_api if package_api else self.package_api)
 
-    def _patch_python_requirements(self, execution, package_api, cached_requirements):
+    def _install_patched_python_requirements(self, execution, package_api, cached_requirements):
         self.log("Found task requirements section, trying to install")
         cached_requirements = cached_requirements or {}
 
@@ -3934,10 +3934,19 @@ class Worker(ServiceCommandSection):
         if requirements_manager:
             requirements_manager.set_cwd(cwd)
 
+        # use task requirements when explicitly provided
+        # if the section exists but is empty, we install the requirements.txt files
+        if (
+            cached_requirements
+            and (cached_requirements.get("pip") is not None or cached_requirements.get("conda") is not None)
+        ):
+            if self._install_patched_python_requirements(execution, package_api, cached_requirements):
+                return
+
         if not repo_info:
             # if we had cached_requirements, it will install them (or raise exception if failed)
             # if we had nothing to install at least output a warning.
-            if not self._patch_python_requirements(execution, package_api, cached_requirements):
+            if not self._install_patched_python_requirements(execution, package_api, cached_requirements):
                 self.log("no repository to install requirements from")
             return
 
@@ -3988,7 +3997,7 @@ class Worker(ServiceCommandSection):
 
         # if we still have not installed anything, see if we need to install something becuase we patched
         if not repo_requirements_installed:
-            repo_requirements_installed = self._patch_python_requirements(execution, package_api, cached_requirements)
+            repo_requirements_installed = self._install_patched_python_requirements(execution, package_api, cached_requirements)
 
         # if we reached here without installing anything, and
         # we failed installing from cached requirements, them this is an error
