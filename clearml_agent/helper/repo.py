@@ -358,6 +358,9 @@ class VCS(object):
         ssh_git_url_match = self.SSH_URL_GIT_SYNTAX.match(self.url)
         config_user, config_pass = self._get_config_creds(
             config=self.session.config,
+            full_url=self.url
+            if not ssh_git_url_match
+            else f"{ssh_git_url_match.groupdict().get('host')}:{ssh_git_url_match.groupdict().get('path')}",
             url_host=(ssh_git_url_match and ssh_git_url_match.groupdict().get("host")) or furl(self.url).host,
             log=self.log
         )
@@ -542,7 +545,7 @@ class VCS(object):
         return Argv(self.executable_name, *argv)
 
     @classmethod
-    def _get_config_creds(cls, config, url_host, log=None) -> Tuple[Optional[str], Optional[str]]:
+    def _get_config_creds(cls, config, full_url, url_host, log=None) -> Tuple[Optional[str], Optional[str]]:
         config_user = ENV_AGENT_GIT_USER.get() or config.get(f"agent.{cls.executable_name}_user", None)
         config_pass = ENV_AGENT_GIT_PASS.get() or config.get(f"agent.{cls.executable_name}_pass", None)
         config_host = ENV_AGENT_GIT_HOST.get() or config.get(f"agent.{cls.executable_name}_host", None)
@@ -552,7 +555,7 @@ class VCS(object):
         def match_host(h):
             nonlocal url_host
             return (
-                url_host.startswith(h.lower())
+                full_url.startswith(h.lower())
                 if config.get("agent.git_host_match_prefix", False)
                 else url_host == h.lower()
             )
@@ -599,7 +602,7 @@ class VCS(object):
             parsed_url.set(username=None, password=None)
             return parsed_url.url
 
-        config_user, config_pass = cls._get_config_creds(config, parsed_url.host, log=log)
+        config_user, config_pass = cls._get_config_creds(config=config, full_url=url, url_host=parsed_url.host, log=log)
         if (
             (not (parsed_url.username and parsed_url.password))
             and config_user
