@@ -599,6 +599,8 @@ class GpuFractionsHandler:
             # Can't compute
             return [1.0]
 
+        # With CFGI: the env variable below contains a list of fractions of GPU allocated, where every item maxes to 1.000, this is to avoid reporting squared GPUs
+        # With MIG: the env variable below contains a dict of mig topologies
         fractions = (ENV_GPU_FRACTIONS.get() or "").strip()
         if not fractions:
             # No fractions
@@ -662,7 +664,11 @@ class GpuFractionsHandler:
             return ",".join(("{}:{}".format(k, v) for k, v in (limits or {}).items() if cls._mig_re.match(k)))
         elif labels:
             if any(cls._frac_gpu_injector_re.match(x) for x in (labels or {})):
-                return ",".join(str(v) for k, v in sorted(labels.items()) if cls._frac_gpu_injector_re.match(k))
+                # The value below is MAX 1.000 to avoid the issue of GPUs being reported N*N times, it makes sense because it represents the fraction of 1 GPU used
+                # So if the pod uses 3 GPUs, it means it's using 3 times a 1.000 fraction of a GPU.
+                # If the pod is using 0.5 GPUs, it means it's using 1 time a 0.5 fraction of a GPU.
+                # CFGI supports fractions only BELOW 1, so this logic holds.
+                return ",".join(("%.03f" % min(float(v), 1.000)) for k, v in sorted(labels.items()) if cls._frac_gpu_injector_re.match(k))
 
     @staticmethod
     def decode_fractions(fractions: str) -> Union[List[float], Dict[str, int]]:
