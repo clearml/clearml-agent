@@ -261,8 +261,8 @@ class CustomTemplate(Template):
             "QUEUE_ID": queue_id,
             "QUEUE_NAME": queue_name,
             "WORKER_ID": worker_id,
-            "PROJECT_NAME": project_info.get("name", "unknown"),
-            "PROJECT_ID": project_info.get("id", "unknown"),
+            "PROJECT_NAME": project_info.get("name", "unknown") if project_info else "unknown",
+            "PROJECT_ID": project_info.get("id", "unknown") if project_info else "unknown",
         }
         nested_field_mapping = {
             "TASK": task_info or {},
