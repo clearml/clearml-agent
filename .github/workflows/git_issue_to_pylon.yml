@@ -16,7 +16,7 @@ jobs:
               --header 'Content-Type: application/json' \
               --data '{
                 "title": "${{ github.event.issue.title }}",
-                "body_html": "<p><strong>Opened by:</strong> ${{ github.event.issue.user.login }}</p><p>${{ github.event.issue.body }}</p><br/><a href='${{ github.event.issue.html_url }}'>View on GitHub</a>",
+                "body_html": "<p><strong>Repo:</strong> ${{ github.event.repository.full_name }}</p><p><strong>Opened by:</strong> ${{ github.event.issue.user.login }}</p><p>${{ github.event.issue.body }}</p><br/><a href=\"${{ github.event.issue.html_url }}\">View on GitHub</a>",
                 "account_id": "${{ secrets.PYLON_ACCOUNT_ID }}",
                 "tags": ["git issue"],
                 "destination_metadata": { "destination": "internal" }
