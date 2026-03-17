@@ -165,9 +165,7 @@ class PoetryAPI(object):
 
     @property
     def enabled(self):
-        return self.config.enabled and (
-            any((self.path / indicator).exists() for indicator in self.INDICATOR_FILES)
-        )
+        return self.config.enabled and (self.path / "poetry.lock").exists()
 
     def freeze(self, freeze_full_environment=False):
         lines = self.config.run("show", cwd=str(self.path)).splitlines()
