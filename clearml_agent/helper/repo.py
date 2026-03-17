@@ -226,12 +226,15 @@ class VCS(object):
         return branch
 
     # parse scp-like git ssh URLs, e.g: git@host:user/project.git
+    # or git@ssh.dev.azure.com:v3/org/project/repo
     SSH_URL_GIT_SYNTAX = re.compile(
         r"""
         ^
         (?:(?P<user>{regular}*?)@)?
+        (?:ssh\.)?
         (?P<host>{regular}*?)
         :
+        (?:v3/)?
         (?P<path>{regular}.*)?
         $
         """.format(
@@ -260,6 +263,14 @@ class VCS(object):
         match = cls.SSH_URL_GIT_SYNTAX.match(url)
         if match:
             user, host, path = match.groups()
+
+            # handle the dev.azure format by inserting _git between project and repo
+            # as format is https://dev.azure.com/{organization}/{project}/_git/{repo}
+            if "azure" in host:
+                path_components = path.split("/")
+                path_components.insert(-1, "_git")
+                path = "/".join(path_components)
+
             return (
                 furl()
                 .set(scheme=replacement_scheme, username=get_username(user), host=host, path=path)
