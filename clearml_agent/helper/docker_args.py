@@ -217,7 +217,7 @@ class DockerArgsSanitizer:
             return None
 
         # verifying available ports, remapping if necessary
-        port_checks = TcpPorts()
+        port_checks = TcpPorts(allowed_ports_range=config.get('agent.docker_args_allowed_port_range', []))
         for i_p in range(len(port_mapping_filtered)):
             port_map = port_mapping_filtered[i_p]
             if not port_map.strip():
