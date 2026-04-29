@@ -14,6 +14,7 @@ from copy import deepcopy
 from pathlib import Path
 from pprint import pformat
 from time import sleep, time
+from datetime import datetime, timedelta, timezone
 from typing import Text, List, Callable, Any, Collection, Optional, Union, Iterable, Dict, Tuple, Set
 
 from clearml_agent.commands.events import Events
@@ -27,7 +28,7 @@ from clearml_agent.definitions import (
     ENV_AGENT_DEBUG_GET_NEXT_TASK,
 )
 from clearml_agent.errors import APIError, UsageError
-from clearml_agent.glue.errors import GetPodCountError
+from clearml_agent.glue.errors import GetPodCountError, ReenqueueTaskException
 from clearml_agent.glue.utilities import get_path, get_bash_output
 from clearml_agent.glue.pending_pods_daemon import PendingPodsDaemon
 from clearml_agent.helper.base import safe_remove_file
@@ -1159,21 +1160,31 @@ class K8sIntegration(Worker):
                 result = self._session.get(
                     service='tasks',
                     action='get_all',
-                    json={"id": task_ids, "status": ["in_progress", "queued"], "only_fields": ["id", "status", "status_reason"]},
+                    json={"id": task_ids, "status": ["in_progress", "queued"], "only_fields": ["id", "status", "status_reason", "last_change"]},
                     method=Request.def_method,
                 )
                 tasks_to_abort = result["tasks"]
         except Exception as ex:
             self.log.warning('Failed getting running tasks for deleted {}(s): {}'.format(self.kind, ex))
 
+        valid_status = [
+            "pushed back by policy manager",
+            "allocated by policy manager",
+            "k8s pending scheduler"
+        ]
+        
         for task in tasks_to_abort:
             task_id = task.get("id")
             status = task.get("status")
             status_reason = (task.get("status_reason") or "").lower()
+            last_change = task.get("last_change")
             if not task_id or not status:
                 self.log.warning('Failed getting task information: id={}, status={}'.format(task_id, status))
                 continue
-            if status == "queued" and "pushed back by policy manager" in status_reason:
+            # only cleanup tasks we can tell are stale
+            if last_change and datetime.now(timezone.utc) - last_change < timedelta(minutes=5):
+                continue
+            if status == "queued" and any(valid_status_entry in status_reason for valid_status_entry in valid_status):
                 # Task was pushed back to policy queue by policy manager, don't touch it
                 continue
             try:
@@ -1265,7 +1276,7 @@ class K8sIntegration(Worker):
                     continue
 
             # iterate over queues (priority style, queues[0] is highest)
-            # print("debug> iterating over queues")
+            # print("debug> iterating over queues in order: {}".format(queues))
             for queue in queues:
                 # delete old completed / failed pods
                 self._cleanup_old_pods(namespaces, extra_msg="Cleanup cycle {cmd}")
@@ -1325,7 +1336,15 @@ class K8sIntegration(Worker):
                     )
 
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues, queue=queue, task=task_id))
-                    self.run_one_task(queue, task_id, worker_params, task_session)
+                    try:
+                        self.run_one_task(queue, task_id, worker_params, task_session)
+                    except ReenqueueTaskException as ex:
+                        self._re_enqueue_task(queue=queue, task_id=task_id)
+                        send_log = f"INFO: {ex}"
+                        sleep_log = "Sleeping for {:.1f} seconds".format(self._polling_interval)
+                        self.send_logs(task_id, send_log.splitlines())
+                        print(f"{send_log}. {sleep_log}")
+                        sleep(self._polling_interval)
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
                     break
             else:
@@ -1357,6 +1376,45 @@ class K8sIntegration(Worker):
         return get_next_task(
             self._session, queue=queue, get_task_info=get_task_info
         )
+
+    def _re_enqueue_task(self, queue, task_id):
+        request = {'queue': queue, 'task': task_id}
+        result = self._session.send_request(
+            service='queues',
+            action='add_task',
+            version='2.14',
+            json=request,
+            method=Request.def_method,
+        )
+        if not result.ok:
+            send_log = f"ERROR: Could not re-enqueue task {task_id}, error: {result.text}"
+            self.log.error(send_log)
+            self.send_logs(task_id, send_log.splitlines())
+            try:
+                self._session.get(
+                    service='tasks',
+                    action='failed',
+                    json={
+                        "task": task_id,
+                        "force": True,
+                        "status_reason": 'Task could not be re-enqueued',
+                        "status_message": 'Task could not be re-enqueued',
+                    },
+                    method=Request.def_method,
+                )
+            except Exception as exc:
+                self.log.warning('Failed setting task {} to status "{}": {}'.format(task_id, 'failed', exc))
+        result = self._session.send_request(
+            service='queues',
+            action='move_task_to_front',
+            version='2.14',
+            json=request,
+            method=Request.def_method,
+        )
+        if not result.ok:
+            send_log = f"ERROR: Could not move task {task_id} to front after re-enqueue, error: {result.text}"
+            self.log.error(send_log)
+            self.send_logs(task_id, send_log.splitlines())
 
     def _resolve_template(self, task_session, task_data, queue, task_id):
         if self.template_dict:

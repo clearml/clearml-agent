@@ -10,3 +10,6 @@ class GetJobsError(Exception):
 class GetPodCountError(Exception):
     pass
 
+class ReenqueueTaskException(Exception):
+    pass
+
