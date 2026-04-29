@@ -253,14 +253,18 @@ class UvAPI(VirtualenvPip):
         if self.enabled:
             # noinspection PyBroadException
             try:
-                args = ["sync"] + (["--locked"] if self.lock_file_exists else [])
+                args = ["sync"]
+                if (
+                        self.lock_file_exists
+                        and self.session.config.get("agent.package_manager.uv_sync_locked_if_lock_file", True)
+                ):
+                    args += ["--locked"]
                 self.lock_config.run(*args, cwd=str(self.lockfile_path), func=Argv.check_call)
             except Exception as e:
                 if not self.lock_file_exists:
                     raise
                 print("INFO: failed installing using lock file, trying without")
-                args = ["sync"]
-                self.lock_config.run(*args, cwd=str(self.lockfile_path), func=Argv.check_call)
+                self.lock_config.run("sync", cwd=str(self.lockfile_path), func=Argv.check_call)
 
             self._installed = True
             # self.lock_config.set_binary(Path(self.lockfile_path) / ".venv" / "bin" / "python")
