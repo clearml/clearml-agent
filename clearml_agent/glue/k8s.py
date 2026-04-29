@@ -53,6 +53,8 @@ class K8sIntegration(Worker):
     K8S_DEFAULT_NAMESPACE = "clearml"
     AGENT_LABEL = "CLEARML=agent"
     QUEUE_LABEL = "clearml-agent-queue"
+    QUEUE_NAME_LABEL = "clearml-agent-queue-name"
+    PARENT_LABEL = "clearml-parent-task-id"
 
     KUBECTL_APPLY_CMD = "kubectl apply --namespace={namespace} -f"
 
@@ -824,10 +826,15 @@ class K8sIntegration(Worker):
             print(f"ERROR: Failed getting runtime properties for task {task_id}: {ex}")
 
     def _get_pod_labels(self, queue, queue_name, task_data):
+        labels = {
+            self.QUEUE_LABEL: self._safe_k8s_label_value(queue),
+            self.QUEUE_NAME_LABEL: self._safe_k8s_label_value(queue_name),
+            self.PARENT_LABEL: (task_data or {}).get("parent", "")
+        }
+
         return [
             self._get_agent_label(),
-            "{}={}".format(self.QUEUE_LABEL, self._safe_k8s_label_value(queue)),
-            "{}-name={}".format(self.QUEUE_LABEL, self._safe_k8s_label_value(queue_name))
+            *(f"{label}={value}" for label, value in labels.items() if value)
         ]
 
     def _get_docker_args(self, docker_args, flags, target=None, convert=None):
