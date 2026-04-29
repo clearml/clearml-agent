@@ -11,7 +11,7 @@ from .._vendor.pathlib2 import Path
 from clearml_agent import definitions
 from clearml_agent.session import Session
 
-HEADER = 'CLEARML-AGENT Deep Learning DevOps'
+HEADER = 'CLEARML-AGENT AI Orchestration DevOps'
 
 
 class Parser(argparse.ArgumentParser):

@@ -146,7 +146,6 @@ TOKEN_EXPIRATION_SECONDS = int(timedelta(days=2).total_seconds())
 
 METADATA_EXTENSION = ".json"
 
-DEFAULT_VENV_UPDATE_URL = "https://raw.githubusercontent.com/Yelp/venv-update/v3.2.4/venv_update.py"
 WORKING_REPOSITORY_DIR = "task_repository"
 WORKING_STANDALONE_DIR = "code"
 DEFAULT_VCS_CACHE = normalize_path(CONFIG_DIR, "vcs-cache")
@@ -162,6 +161,7 @@ ENV_AGENT_FORCE_CODE_DIR = EnvironmentConfig("CLEARML_AGENT_FORCE_CODE_DIR")
 ENV_AGENT_FORCE_EXEC_SCRIPT = EnvironmentConfig("CLEARML_AGENT_FORCE_EXEC_SCRIPT")
 ENV_AGENT_FORCE_POETRY = EnvironmentConfig("CLEARML_AGENT_FORCE_POETRY", type=bool)
 ENV_AGENT_FORCE_UV = EnvironmentConfig("CLEARML_AGENT_FORCE_UV", type=bool)
+ENV_BOOTSTRAP_UV_EXEC = EnvironmentConfig("CLEARML_BOOTSTRAP_UV_EXEC", type=str)
 ENV_AGENT_FORCE_TASK_INIT = EnvironmentConfig("CLEARML_AGENT_FORCE_TASK_INIT", type=bool)
 ENV_DOCKER_SKIP_GPUS_FLAG = EnvironmentConfig("CLEARML_DOCKER_SKIP_GPUS_FLAG", "TRAINS_DOCKER_SKIP_GPUS_FLAG")
 ENV_AGENT_GIT_USER = EnvironmentConfig("CLEARML_AGENT_GIT_USER", "TRAINS_AGENT_GIT_USER")

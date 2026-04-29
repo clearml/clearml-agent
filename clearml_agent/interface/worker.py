@@ -259,5 +259,26 @@ COMMANDS = {
     },
     'init': {
         'help': 'ClearML-Agent configuration wizard',
-    }
+    },
+    'install-bootstrap': {
+        'help': 'Install or update the clearml-agent-bootstrap package (default from GitHub Releases)',
+        'args': {
+            '--check': {
+                'help': 'Preview what would be installed without making changes',
+                'action': 'store_true',
+            },
+            '--force': {
+                'help': 'Force reinstall even if already installed',
+                'action': 'store_true',
+            },
+            '--version': {
+                'help': 'Install a specific release version (e.g. v0.3.0, 0.3.0rc0-42)',
+                'default': None,
+            },
+            '--from-file': {
+                'help': 'Install from a local .whl file instead of downloading the latest published release',
+                'default': None,
+            },
+        },
+    },
 }

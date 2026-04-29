@@ -1,6 +1,12 @@
 from __future__ import unicode_literals
 import re
-from pkg_resources import Requirement as Req
+import sys
+
+if sys.version_info >= (3, 12):
+    # if python version is python 3.12 and up we can use the packaging module
+    from ..._vendor.pkg_resources import Requirement as Req
+else:
+    from pkg_resources import Requirement as Req  # noqa
 
 from .fragment import get_hash_info, parse_fragment, parse_extras_require
 from .vcs import VCS, VCS_SCHEMES

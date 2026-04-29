@@ -91,7 +91,7 @@ class ServiceCommandSection(BaseCommandSection):
 
     _worker_name = None
     MAX_SUGGESTIONS = 10
-    SERVICE_ID_NAME_LOOKUP_CACHE = {}  #  {id: str. dict(timestamp: float, name: str)}
+    SERVICE_ID_NAME_LOOKUP_CACHE = {}  #  {id: dict(timestamp: float, name: str)}
     # todo: add cache size limit, currently only used for queus
     LOOKUP_CACHE_TIMEOUT_SEC = 180  # todo: make configurable from conf file,
 

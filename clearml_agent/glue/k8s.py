@@ -870,6 +870,39 @@ class K8sIntegration(Worker):
     def use_image_entrypoint(self, queue: str, task_id: str, docker_image: str, task_data: dict = None) -> bool:
         return ENV_POD_USE_IMAGE_ENTRYPOINT.get()
 
+    def _create_bash_script_for_container(self, task_id, docker_bash, clearml_conf_create_script):
+        # Create bash script for container and
+        container_bash_script = [self.container_bash_script] if isinstance(self.container_bash_script, str) \
+            else self.container_bash_script
+
+        extra_docker_bash_script = '\n'.join(self._session.config.get("agent.extra_docker_shell_script", None) or [])
+        if docker_bash:
+            extra_docker_bash_script += '\n' + str(docker_bash) + '\n'
+
+        script_encoded = '\n'.join(
+            ['#!/bin/bash', ] +
+            [line.format(extra_bash_init_cmd=self.extra_bash_init_script or '',
+                         task_id=task_id,
+                         extra_docker_bash_script=extra_docker_bash_script,
+                         default_execution_agent_args=ENV_DEFAULT_EXECUTION_AGENT_ARGS.get(),
+                         agent_install_args=ENV_POD_AGENT_INSTALL_ARGS.get())
+             for line in container_bash_script])
+
+        start_agent_script_path = ENV_START_AGENT_SCRIPT_PATH.get() or "~/__start_agent__.sh"
+
+        extra_bash_commands = list(clearml_conf_create_script or [])
+
+        extra_bash_commands.append(
+            "echo '{content}' | base64 --decode >> {script_path} ; /bin/bash {script_path}".format(
+                content=base64.b64encode(
+                    script_encoded.encode('ascii')
+                ).decode('ascii'),
+                script_path=start_agent_script_path
+            )
+        )
+
+        return extra_bash_commands, {}
+
     def _create_template_container(
         self, pod_name: str, task_id: str, docker_image: str, docker_args: List[str], queue: str,
         docker_bash: str, clearml_conf_create_script: List[str], task_worker_id: str, task_token: str = None,
@@ -907,35 +940,10 @@ class K8sIntegration(Worker):
                 container, dict(name=pod_name, image=docker_image)
             )
 
-        # Create bash script for container and
-        container_bash_script = [self.container_bash_script] if isinstance(self.container_bash_script, str) \
-            else self.container_bash_script
+        extra_bash_commands, extra_envs = self._create_bash_script_for_container(task_id, docker_bash, clearml_conf_create_script)
 
-        extra_docker_bash_script = '\n'.join(self._session.config.get("agent.extra_docker_shell_script", None) or [])
-        if docker_bash:
-            extra_docker_bash_script += '\n' + str(docker_bash) + '\n'
-
-        script_encoded = '\n'.join(
-            ['#!/bin/bash', ] +
-            [line.format(extra_bash_init_cmd=self.extra_bash_init_script or '',
-                         task_id=task_id,
-                         extra_docker_bash_script=extra_docker_bash_script,
-                         default_execution_agent_args=ENV_DEFAULT_EXECUTION_AGENT_ARGS.get(),
-                         agent_install_args=ENV_POD_AGENT_INSTALL_ARGS.get())
-             for line in container_bash_script])
-
-        extra_bash_commands = list(clearml_conf_create_script or [])
-
-        start_agent_script_path = ENV_START_AGENT_SCRIPT_PATH.get() or "~/__start_agent__.sh"
-
-        extra_bash_commands.append(
-            "echo '{content}' | base64 --decode >> {script_path} ; /bin/bash {script_path}".format(
-                content=base64.b64encode(
-                    script_encoded.encode('ascii')
-                ).decode('ascii'),
-                script_path=start_agent_script_path
-            )
-        )
+        for extra_env_name, extra_env_value in extra_envs.items():
+            add_or_update_env_var(extra_env_name, extra_env_value)
 
         # Notice: we always leave with exit code 0, so pods are never restarted
         return self._merge_containers(

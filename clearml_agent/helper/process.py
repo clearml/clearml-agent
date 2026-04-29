@@ -419,12 +419,14 @@ class WorkerParams(object):
         optimization=0,
         debug=False,
         trace=False,
+        program_invocation=None,
     ):
         self.trace = trace
         self.log_level = log_level
         self.optimization = optimization
         self.config_file = config_file
         self.debug = debug
+        self.program_invocation = program_invocation
 
     def get_worker_flags(self):
         """
@@ -448,8 +450,9 @@ class WorkerParams(object):
         Get argv for a particular worker command.
         """
         global_args, worker_args = self.get_worker_flags()
+        program_invocation = self.program_invocation or get_program_invocation()
         command_line = (
-            tuple(get_program_invocation())
+            tuple(program_invocation)
             + global_args
             + (command, )
             + worker_args
@@ -524,6 +527,9 @@ def find_executable(executable, path=None):
     A string listing directories separated by 'os.pathsep'; defaults to
     os.environ['PATH'].  Returns the complete filename or None if not found.
     """
+    if not executable:
+        return None
+
     _, ext = os.path.splitext(executable)
     if (sys.platform == 'win32') and (ext != '.exe'):
         executable = executable + '.exe'

@@ -18,7 +18,7 @@ class SystemPip(PackageManager):
         Program interface to the system pip.
         """
         super(SystemPip, self).__init__()
-        self._bin = Path(interpreter or sys.executable)
+        self._bin = Path(interpreter or sys.executable) if interpreter or sys.executable else None
         self.session = session
 
     @property

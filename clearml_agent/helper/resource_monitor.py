@@ -306,6 +306,9 @@ class ResourceMonitor(object):
         if not self._gpustat:
             return
         active_gpus = os.environ.get("NVIDIA_VISIBLE_DEVICES", "") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if active_gpus in ("none", ):
+            return
+        
         try:
             gpu_stat = self._gpustat.new_query(per_process_stats=False)
             skips_all = True

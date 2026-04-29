@@ -1,5 +1,6 @@
 import logging
 import re
+import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from functools import partial
@@ -71,8 +72,13 @@ class CustomTemplate(Template):
         ${USER...}
     """
 
+    # python 3.6 RE does not support inline ASCII flag (?a:...)
+    if sys.version_info >= (3, 7):
+        idpattern = r'(?a:[_a-z][_a-z0-9|.|:]*)'
+    else:
+        idpattern = r'[_a-zA-Z][_a-zA-Z0-9|.|:]*'
+
     delimiter = '$'
-    idpattern = r'(?a:[_a-z][_a-z0-9|.|:]*)'
     prefix = "CLEARML_"
     filter_sep = "|"
     filter_re = re.compile(r"^(?P<op>[^(]+)(\((?P<args>[^()]*)\))?")

@@ -4,11 +4,16 @@
 # IntelliJ
 .idea
 
+# Zed
+.zed
+.rules
+
 # Python
 *.pyc
 __pycache__
 build/
 dist/
+.venv/
 *.egg-info
 virtualenv
 .venv
@@ -18,3 +23,8 @@ virtualenv
 
 # MirrorD
 .mirrord
+
+# SOPS encryption
+.sops.yaml
+
+.venv

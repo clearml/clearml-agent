@@ -1,5 +1,6 @@
 from __future__ import print_function, division, unicode_literals
 
+import base64
 import errno
 import functools
 import json
@@ -49,7 +50,6 @@ from clearml_agent.commands.resolver import resolve_default_container
 from clearml_agent.definitions import (
     ENVIRONMENT_SDK_PARAMS,
     PROGRAM_NAME,
-    DEFAULT_VENV_UPDATE_URL,
     ENV_DOCKER_IMAGE,
     ENV_TASK_EXECUTE_AS_USER,
     ENV_DOCKER_HOST_MOUNT,
@@ -134,7 +134,6 @@ from clearml_agent.helper.package.priority_req import PriorityPackageRequirement
 from clearml_agent.helper.package.pytorch import PytorchRequirement
 from clearml_agent.helper.package.requirements import (
     RequirementsManager, )
-from clearml_agent.helper.package.venv_update_api import VenvUpdateAPI
 from clearml_agent.helper.process import (
     kill_all_child_processes,
     WorkerParams,
@@ -158,6 +157,7 @@ from clearml_agent.helper.singleton import Singleton
 from clearml_agent.helper.docker_args import DockerArgsSanitizer, DockerArgsTemplateResolver
 from clearml_agent.session import Session
 from .events import Events
+from clearml_agent.commands import bootstrap
 
 DOCKER_ROOT_CONF_FILE = "/tmp/clearml.conf"  # assuming we can always access/mount this file
 DOCKER_DEFAULT_CONF_FILE = "~/default_clearml.conf"
@@ -928,6 +928,8 @@ class Worker(ServiceCommandSection):
         super(Worker, self).__init__(*args, **kwargs)
         self._debug_context = ENV_DEBUG_INFO.get()
         self.monitor = None
+        self._bootstrap = False
+        self._compiled = False
         self.log = self._session.get_logger(__name__)
         self.register_signal_handler()
         self._worker_registered = False
@@ -960,7 +962,6 @@ class Worker(ServiceCommandSection):
         self.package_api = None  # type: Optional[PackageManager]
         self.global_package_api = None
 
-        self.is_venv_update = self._session.config.agent.venv_update.enabled
         self.poetry = PoetryConfig(self._session)
         self.uv = UvConfig(self._session)
         self.docker_image_func = None
@@ -1976,13 +1977,6 @@ class Worker(ServiceCommandSection):
                     'Invalid config key "{}": {.message}'.format(key, e)
                 )
 
-        if is_windows_platform():
-            # if not self.is_conda:
-            #     self.warning("Worker on Windows without Conda are not supported")
-            if self._session.config.agent.venv_update:
-                # self.warning("venv-update is not supported on Windows")
-                self.is_venv_update = False
-
         self._session.print_configuration()
 
     def resolve_daemon_queue_names(self, queues, create_if_missing=False):
@@ -2077,8 +2071,17 @@ class Worker(ServiceCommandSection):
         if dynamic_gpus:
             self._register_dynamic_gpus(gpu_indexes)
 
-        # check if we have the latest version
-        start_check_update_daemon()
+        # check if we have bootstrap package installed
+        if bootstrap.check_bootstrap_package_install(config=self._session.config):
+            if bootstrap.update_bootstrap(config=self._session.config):
+                self._bootstrap = True
+        else:
+            print("WARNING: `clearml_agent_bootstrap` package was not found")
+            print("          To speed up agent job start-up time, run: `clearml-agent install-bootstrap`")
+
+        # check if we have the latest agent version
+        if not self._session.config.get('agent.disable_agent_update_check', None):
+            start_check_update_daemon()
 
         self.check(**kwargs)
         self.log.debug("starting resource monitor thread")
@@ -2692,7 +2695,7 @@ class Worker(ServiceCommandSection):
         if not python_version:
             python_version = self._get_task_python_version(current_task)
 
-        venv_folder, requirements_manager, is_cached = self.install_virtualenv(
+        venv_folder, requirements_manager, is_cached, requested_python_version = self.install_virtualenv(
             venv_dir=target, requested_python_version=python_version, execution_info=execution,
             cached_requirements=requirements)
 
@@ -2734,6 +2737,7 @@ class Worker(ServiceCommandSection):
                 cached_requirements=requirements,
                 cwd=cwd,
                 package_api=self.global_package_api if install_globally else None,
+                requested_python_version=requested_python_version
             )
 
         freeze = self.freeze_task_environment(
@@ -2931,6 +2935,96 @@ class Worker(ServiceCommandSection):
                 )
             )
 
+        # check if we have bootstrap only if we are in docker mode
+        if docker not in (False, None):
+            if (bootstrap.check_bootstrap_package_install(config=self._session.config) and
+                    bootstrap.update_bootstrap(config=self._session.config)):
+                self._bootstrap = True
+
+        # if we are in bootstrap compiled execution run, there is no actual python executable and env.
+        # this means if we are using pip package manager, we need to set to UV so it installs python binaries.
+        if "__compiled__" in globals():
+            self._compiled = True
+            print("INFO: COMPILED BOOTSTRAP AGENT detected - Running as a compiled binary - Verifying or creating Python environment")
+
+            # Get the Task requested execution binary (e.g. "python3", "python3.9", "/usr/bin/python3.10")
+            task_exec_binary = None
+            try:
+                task_exec_binary = (current_task.script.binary or "").strip()
+                if task_exec_binary:
+                    task_exec_binary = basename(task_exec_binary)
+            except Exception:
+                pass
+            task_exec_binary = task_exec_binary or None
+
+            # Check if task_exec_binary looks like a python version string
+            # (e.g. "python", "python3", "python3.9", "python3.9.10")
+            is_python_binary = bool(
+                task_exec_binary and re.match(r'^python\d*(\.\d+)*$', task_exec_binary)
+            )
+            if not is_python_binary:
+                print(f"INFO: Task binary '{task_exec_binary}' is not a Python version identifier, defaulting to 'python3' for bootstrapping")
+                task_exec_binary = "python3"
+
+            print(f"INFO: Task requested execution binary: '{current_task.script.binary}', using '{task_exec_binary}' for bootstrapping")
+
+            # Check what package manager the user requested
+            requested_pkg_manager = self._session.config.get("agent.package_manager.type", None)
+            print(f"INFO: Configured package manager type: '{requested_pkg_manager or 'not specified'}'")
+
+            # Try to find the requested Python version on the system
+            print(f"INFO: Searching for Python executable matching '{task_exec_binary}'...")
+            found_python = None
+            found_python_version = None
+            try:
+                found_python_version, _, found_python = self.find_python_executable_for_version(
+                    task_exec_binary, raise_on_error=False
+                )
+            except Exception:
+                pass
+
+            use_uv = True  # default to UV for compiled agent
+
+            if requested_pkg_manager not in ("pip", ):
+                # UV (explicit or default): use the requested Python if found, otherwise UV will install it
+                if not found_python:
+                    print(f"INFO: No Python executable found matching '{task_exec_binary}' - UV will provide Python and manage packages")
+                else:
+                    sys.executable = found_python
+                    print(f"INFO: Found Python executable: '{sys.executable}' (version {found_python_version or 'unknown'}), UV will use it")
+            else:
+                # User wants pip: find any available Python on the system (even if not the exact requested version)
+                # find_python_executable_for_version already falls back progressively
+                # (e.g. python3.10 -> python3 -> python), so found_python may differ from task_exec_binary
+                if not found_python:
+                    print(f"INFO: pip requested but no Python executable found on system, falling back to UV")
+                else:
+                    sys.executable = found_python
+                    print(f"INFO: Found Python executable: '{sys.executable}' (version {found_python_version or 'unknown'})")
+                    # Check if pip is actually available with this Python
+                    print(f"INFO: pip requested, checking if pip is available with '{sys.executable}'...")
+                    try:
+                        pip_version = subprocess.check_output(
+                            [sys.executable, "-m", "pip", "--version"],
+                            stderr=subprocess.DEVNULL
+                        ).decode("utf-8", errors="replace").strip()
+                        use_uv = False
+                        print(f"INFO: pip is available [{pip_version}], using pip as package manager")
+                    except (subprocess.CalledProcessError, OSError, FileNotFoundError):
+                        print(f"INFO: pip requested but not found with '{sys.executable}', falling back to UV")
+
+            if use_uv:
+                self._session.config.put("agent.package_manager.type", "uv")
+                # When using UV, do not allow it to revert to pip, we might not have it
+                print("INFO: Package manager set to UV")
+
+            self._session.config.put("agent.package_manager.uv_replace_pip", True)
+
+            print(f"INFO: COMPILED BOOTSTRAP AGENT pre-setup initialization complete - "
+                  f"python='{sys.executable or 'none - Pending UV installation'}', "
+                  f"package_manager='{self._session.config.get('agent.package_manager.type', 'not set')}'")
+
+
         if clone:
             try:
                 print("Cloning task id={}".format(task_id))
@@ -2973,7 +3067,7 @@ class Worker(ServiceCommandSection):
         if docker is not False and docker is not None:
             self.set_docker_variables(docker)
 
-        # We expect the same behaviour in case full_monitoring was set, and in case docker mode is used
+        # We expect the same behavior in case full_monitoring was set, and in case docker mode is used
         if full_monitoring or docker is not False:
             if full_monitoring:
                 if not (ENV_WORKER_ID.get() or "").strip():
@@ -2995,6 +3089,7 @@ class Worker(ServiceCommandSection):
                 config_file=self._session.config_file,
                 debug=self._session.debug_mode,
                 trace=self._session.trace,
+                program_invocation=sys.argv[:1] if self._compiled else None
             )
             try:
                 self.report_monitor(ResourceMonitor.StatusReport(task=current_task.id))
@@ -3023,6 +3118,15 @@ class Worker(ServiceCommandSection):
             self.report_monitor(ResourceMonitor.StatusReport(task=current_task.id))
 
         execution = self.get_execution_info(current_task)
+
+        # if we have no repository and binary not python and no requirements.txt
+        # then skip python env creation
+        no_requirements = bool(
+            not current_task.script.requirements or not current_task.script.requirements.get('pip')
+        )
+        if (not execution.repository and no_requirements and
+                (current_task.script.binary and 'python' not in str(current_task.script.binary))):
+            ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.set(1)
 
         if ENV_AGENT_FORCE_EXEC_SCRIPT.get():
             entry_point_parts = str(ENV_AGENT_FORCE_EXEC_SCRIPT.get()).split(":", 1)
@@ -3075,6 +3179,7 @@ class Worker(ServiceCommandSection):
                 print("Warning: {}".format(str(ex)))
                 custom_build_script = None
 
+        requested_python_version = python_ver
         if not custom_build_script:
             if self._session.config.get("agent.package_manager.force_repo_requirements_txt", False):
                 requirements = None
@@ -3084,11 +3189,12 @@ class Worker(ServiceCommandSection):
                 try:
                     requirements = current_task.script.requirements
                     if isinstance(requirements, dict):
+                        # prefer "pip" we do not fill in "conda" entry in the SDK
                         if 'org_pip' in requirements:
                             requirements['pip'] = requirements['org_pip']
                             print("\n[package_manager.force_original_requirements=true] "
                                   "Using original requirements: \n{}\n".format(requirements['org_pip']))
-                        if 'org_conda' in requirements:
+                        elif 'org_conda' in requirements:
                             requirements['conda'] = requirements['org_conda']
                             print("\n[package_manager.force_original_requirements=true] "
                                   "Using original requirements: \n{}\n".format(requirements['org_conda']))
@@ -3104,7 +3210,7 @@ class Worker(ServiceCommandSection):
             if ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get():
                 venv_folder, requirements_manager, is_cached = None, None, False
                 if ENV_AGENT_SKIP_PIP_VENV_INSTALL.get():
-                    venv_folder, _, _ = self.install_virtualenv(
+                    venv_folder, _, _, _ = self.install_virtualenv(
                         standalone_mode=standalone_mode,
                         requested_python_version=python_ver,
                         execution_info=execution,
@@ -3122,7 +3228,7 @@ class Worker(ServiceCommandSection):
                     code_folder.mkdir(parents=True, exist_ok=True)
                 alternative_code_folder = code_folder.as_posix()
             else:
-                venv_folder, requirements_manager, is_cached = self.install_virtualenv(
+                venv_folder, requirements_manager, is_cached, requested_python_version = self.install_virtualenv(
                     standalone_mode=standalone_mode,
                     requested_python_version=python_ver,
                     execution_info=execution,
@@ -3135,7 +3241,7 @@ class Worker(ServiceCommandSection):
 
                     print("\n")
 
-            # if we force code directory - by definition we do not clone or apply any changes
+            # if we force code directory - by definition, we do not clone or apply any changes
             if ENV_AGENT_FORCE_CODE_DIR.get():
                 directory, vcs, repo_info = ENV_AGENT_FORCE_CODE_DIR.get(), None, None
             else:
@@ -3178,6 +3284,7 @@ class Worker(ServiceCommandSection):
                         requirements_manager=requirements_manager,
                         cached_requirements=requirements,
                         cwd=cwd,
+                        requested_python_version=requested_python_version,
                     )
                 elif not self.package_api:
                     # check if we have to manually configure package API, it will be readonly
@@ -3195,13 +3302,19 @@ class Worker(ServiceCommandSection):
             if self._get_node_rank():
                 skip_freeze_update = True
 
-            freeze = self.freeze_task_environment(
-                task_id=current_task.id,
-                requirements_manager=requirements_manager,
-                add_venv_folder_cache=venv_folder,
-                execution_info=execution,
-                update_requirements=not skip_freeze_update,
-            )
+            # skip python freeze if we installed nothing
+            # (i.e. no requirements and no git repo to install requirement from there)
+            skip_freeze = ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get() or (no_requirements and not execution.repository)
+
+            if not skip_freeze:
+                freeze = self.freeze_task_environment(
+                    task_id=current_task.id,
+                    requirements_manager=requirements_manager,
+                    add_venv_folder_cache=venv_folder,
+                    execution_info=execution,
+                    update_requirements=not skip_freeze_update,
+                )
+
             script_dir = (directory if isinstance(directory, Path) else Path(directory)
                           ).expanduser().absolute().as_posix()
 
@@ -3285,7 +3398,9 @@ class Worker(ServiceCommandSection):
         if is_python_binary:
             command = self.package_api.get_python_command(extra)
         elif is_bash_binary:
-            command = Argv(Path(os.environ.get("SHELL", "/bin/bash")), *extra)
+            # TODO: check that the venv we created for the Task is available in the bash when running `python``
+            bash_binary = os.environ.get("SHELL", "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh")
+            command = Argv(Path(bash_binary), *extra)
         else:
             # actually we should not be here because we default to python is we do not recognize the binary
             raise ValueError("Task execution binary requested {} is not supported!".format(current_task.script.binary))
@@ -3363,6 +3478,10 @@ class Worker(ServiceCommandSection):
         # remove our internal env
         os.environ.pop("CLEARML_APT_INSTALL", None)
         os.environ.pop("TRAINS_APT_INSTALL", None)
+        # remove UV stuff, just in case
+        os.environ.pop("UV_CACHE_DIR", None)
+        os.environ.pop("UV_PYTHON_CACHE_DIR", None)
+        os.environ.pop("UV_PYTHON_INSTALL_DIR", None)
 
         # if we are using a Command i.e. not execs update command env vars
         command.update_envs(os.environ)
@@ -3382,15 +3501,15 @@ class Worker(ServiceCommandSection):
                         # if we have an on_abort callback still running, wait for it
                         if stop_signal:
                             stop_signal.stop_monitor_thread()
-                        exit(exit_code)
+                        sys.exit(exit_code)
                 except subprocess.CalledProcessError as ex:
                     # non zero return code
                     exit_code = ex.returncode
                     if not use_execv:
-                        exit(exit_code)
+                        sys.exit(exit_code)
                 except Exception as ex:
                     if not use_execv:
-                        exit(-1)
+                        sys.exit(-1)
                     raise ex
             else:
                 # store stdout/stderr into file, and send to backend
@@ -3826,12 +3945,14 @@ class Worker(ServiceCommandSection):
         return None
 
     def install_requirements(
-        self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None, package_api=None
+        self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None,
+            package_api=None, requested_python_version=None
     ):
         ExternalRequirements.cwd = cwd
         return self.install_requirements_for_package_api(execution, repo_info, requirements_manager,
                                                          cached_requirements=cached_requirements, cwd=cwd,
-                                                         package_api=package_api if package_api else self.package_api)
+                                                         package_api=package_api if package_api else self.package_api,
+                                                         requested_python_version=requested_python_version)
 
     def _install_patched_python_requirements(self, execution, package_api, cached_requirements):
         self.log("Found task requirements section, trying to install")
@@ -3875,9 +3996,10 @@ class Worker(ServiceCommandSection):
         return False
 
     def install_requirements_for_package_api(
-        self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None, package_api=None,
+        self, execution, repo_info, requirements_manager, cached_requirements=None, cwd=None,
+            package_api=None, requested_python_version=None,
     ):
-        # type: (ExecutionInfo, RepoInfo, RequirementsManager, Optional[dict], Optional[str], Optional[Any]) -> None
+        # type: (ExecutionInfo, RepoInfo, RequirementsManager, Optional[dict], Optional[str], Optional[Any], Optional[str]) -> None
         """
         :summary: Install requirements for task script using pip.
         :description: A file named "requirements.txt" is looked for in each containing folder between the
@@ -3889,11 +4011,22 @@ class Worker(ServiceCommandSection):
         :param cached_requirements: cached requirements from previous run
         :param cwd: current folder
         :param package_api: package_api to be used when installing requirements
+        :param requested_python_version: requested python version, string format, only uses major/minor version
          """
         if package_api:
             package_api.cwd = cwd
 
+        # convert to tuple
+        # noinspection PyBroadException
+        try:
+            requested_python_version = str(requested_python_version or "3").split(".")
+            requested_python_version = (int(requested_python_version[0]), int(requested_python_version[1]))
+        except Exception:
+            requested_python_version = (3, -1)
+
         api = self._install_poetry_requirements(repo_info, execution.working_dir)
+        is_uv = False
+        is_poetry = bool(api)
         if not api:
             api = self._install_uv_requirements(repo_info, execution.working_dir, cached_requirements)
             # if we could not find a lock file, but UV is installed and enabled, use it instead of pip
@@ -3905,6 +4038,7 @@ class Worker(ServiceCommandSection):
             elif self._session.config.get("agent.package_manager.type", None) == "uv" and not api:
                 # this means `agent.package_manager.uv_replace_pip` is set to true
                 print("INFO: using UV as pip drop-in replacement")
+                is_uv = True
 
         if api:
             # update back the package manager, this hack should be fixed
@@ -3924,11 +4058,12 @@ class Worker(ServiceCommandSection):
 
         package_api.upgrade_pip()
         package_api.set_selected_package_manager()
-        # always install cython,
+        # always install cython, BUT only iif python version is lower than 3.9 (new versions can take care of themselves)
         # if we have a specific version in the requirements,
         # the PriorityPackageRequirement(SimpleSubstitution) will reinstall cython with the specific version
-        if not self.is_conda:
-            package_api.out_of_scope_install_package('Cython')
+        if requested_python_version[1] < 9:
+            if not self.is_conda and not is_uv and not is_poetry:
+                package_api.out_of_scope_install_package('Cython')
 
         # add support for -r <file.txt> in requirements
         if requirements_manager:
@@ -4065,8 +4200,8 @@ class Worker(ServiceCommandSection):
 
         return rreplace(executable_path.split(os.path.sep)[-1], 'python', '', 1)
 
-    def find_python_executable_for_version(self, config_version):
-        # type: (Text) -> Tuple[Text, Text, Text]
+    def find_python_executable_for_version(self, config_version, raise_on_error=True):
+        # type: (Text, bool) -> Tuple[Text, Text, Text]
         """
         Find python executable with version ``config_version``.
         The search starts with the executable named ``python<config_version>``.
@@ -4096,20 +4231,29 @@ class Worker(ServiceCommandSection):
                 ".".join, reversed(list(suffixes(self._get_python_version_suffix(config_version).split("."))))
             )
         ]
+
+        # if we actually have a local python
+        if not self._compiled:
+            python_executables += [("{}.{}".format(sys.version_info.major, sys.version_info.minor), sys.executable)]
+
         default_python = None
         for version, executable in python_executables:
             self.log.debug("Searching for {}".format(executable))
-            if find_executable(executable):
+            found_exec = find_executable(executable)
+            self.log.debug("Found executable: {}".format(found_exec))
+            if found_exec:
                 try:
-                    output = Argv(executable, "--version").get_output(
+                    output = Argv(found_exec, "--version").get_output(
                         stderr=subprocess.STDOUT
                     )
                 except subprocess.CalledProcessError as ex:
                     # Windows returns 9009 code and suggests to install Python from Windows Store
                     if is_windows_platform() and ex.returncode == 9009:
                         self.log.debug("version not found: {}".format(ex))
+                    elif raise_on_error:
+                        self.log.warning("error getting {} version: {}".format(executable, ex))
                     else:
-                        self.log.warning("error getting %s version: %s", executable, ex)
+                        self.log.debug("error getting {} version: {}".format(executable, ex))
                     continue
                 except FileNotFoundError as ex:
                     self.log.debug("version not found: {}".format(ex))
@@ -4135,13 +4279,18 @@ class Worker(ServiceCommandSection):
                     )
 
         if default_python:
-            self.log.warning(
-                "Python executable with version {!r} requested by the Task, "
-                "not found in path, using \'{}\' (v{}) instead".format(
-                    config_version, find_executable(default_python[-1]), default_python[0]
+            if raise_on_error:
+                # only log waning is we rais on error, otherwise this is not an issue
+                self.log.warning(
+                    "Python executable with version {!r} requested by the Task, "
+                    "not found in path, using \'{}\' (v{}) instead".format(
+                        config_version, find_executable(default_python[-1]), default_python[0]
+                    )
                 )
-            )
             return default_python
+
+        if not raise_on_error:
+            return "", "", ""
 
         raise CommandFailedError(
             "Python executable with version {!r} requested by the Task, "
@@ -4258,7 +4407,7 @@ class Worker(ServiceCommandSection):
         execution_info=None,
         cached_requirements=None,
     ):
-        # type: (str, str, bool, ExecutionInfo, dict) -> Tuple[Path, RequirementsManager, bool]
+        # type: (str, str, bool, ExecutionInfo, dict) -> Tuple[Path, RequirementsManager, bool, str]
         """
         Install a new python virtual environment, removing the old one if exists
         If skip_pip_venv_install is True or contains a string (or if CLEARML_SKIP_PIP_VENV_INSTALL is set)
@@ -4270,6 +4419,12 @@ class Worker(ServiceCommandSection):
 
         if self._session.config.get("agent.ignore_requested_python_version", None):
             requested_python_version = ''
+
+        # if we have no requested version at all, and this is compiled, so no preinstalled default version
+        # just assume generic python version 3 (if we found something we will use it,
+        # otherwise we will revert to the compiled version python)
+        if self._compiled and not requested_python_version:
+            requested_python_version = "3"
 
         requested_python_version = \
             requested_python_version or \
@@ -4291,12 +4446,13 @@ class Worker(ServiceCommandSection):
                         "Warning: interpreter {} could not be found. "
                         "Reverting to the default interpreter resolution".format(skip_pip_venv_install)
                     )
+
             if override_interpreter_path:
                 print("Python interpreter {} is set from environment var".format(override_interpreter_path))
                 executable_name = override_interpreter_path
                 executable_version_suffix = (get_python_version(executable_name, self.log) or
                                              self._get_python_version_suffix(executable_name))
-            else:
+            elif not self.uv.enabled:
                 try:
                     executable_version, executable_version_suffix, executable_name = \
                         self.find_python_executable_for_version(requested_python_version)
@@ -4308,9 +4464,34 @@ class Worker(ServiceCommandSection):
                         requested_python_version, def_python_version))
                     executable_version, executable_version_suffix, executable_name = \
                         self.find_python_executable_for_version(def_python_version)
+            else:
+                # this is UV, we find it just so we know what we have there
+                # noinspection PyBroadException
+                try:
+                    executable_version, executable_version_suffix, executable_name = \
+                        self.find_python_executable_for_version(requested_python_version, raise_on_error=False)
+                except Exception:
+                    executable_version = executable_version_suffix = executable_name = None
+                # make sure we have at least major.minor version in the requested version,
+                # otherwise use what we found
+                if "." not in str(requested_python_version):
+                    requested_python_version = executable_version_suffix
+                # if the requested python version is Not what we found,
+                # we do not want UV to use it, we want UV to install python, so we set executable_name to None
+                if requested_python_version != executable_version_suffix:
+                    executable_name = None
+                    executable_version_suffix = requested_python_version
 
-            self._session.config.put("agent.default_python", executable_version_suffix)
-            self._session.config.put("agent.python_binary", executable_name)
+            self.debug("debug: requested_python_version={}, executable_name={}".format(
+                executable_version_suffix, executable_name))
+
+            if executable_version_suffix:
+                self._session.config.put("agent.default_python", executable_version_suffix)
+            else:
+                executable_version_suffix = requested_python_version or "3"
+
+            if executable_name:
+                self._session.config.put("agent.python_binary", executable_name)
 
         venv_dir = Path(venv_dir) if venv_dir else \
             Path(self._session.config["agent.venvs_dir"], executable_version_suffix)
@@ -4329,7 +4510,6 @@ class Worker(ServiceCommandSection):
             is_windows_platform()
             or self.is_conda
             or not venv_dir.is_dir()
-            or not self.is_venv_update
         )
 
         if not standalone_mode:
@@ -4362,7 +4542,7 @@ class Worker(ServiceCommandSection):
                 destination_folder=Path(venv_dir))
         ):
             print('::: Using Cached environment {} :::'.format(self.package_api.get_last_used_entry_cache()))
-            return venv_dir, requirements_manager, True
+            return venv_dir, requirements_manager, True, requested_python_version
 
         # create the initial venv
         if not skip_pip_venv_install:
@@ -4372,7 +4552,7 @@ class Worker(ServiceCommandSection):
             if not venv_dir.exists():
                 venv_dir.mkdir(parents=True, exist_ok=True)
 
-        return venv_dir, requirements_manager, False
+        return venv_dir, requirements_manager, False, requested_python_version
 
     def _setup_package_api(
         self, executable_name, executable_version_suffix, venv_dir, execution_info,
@@ -4413,12 +4593,7 @@ class Worker(ServiceCommandSection):
                     package_manager_params['interpreter'] = executable_name
                     self.package_api = VirtualenvPip(**package_manager_params)
             else:
-                if self.is_venv_update:
-                    self.package_api = VenvUpdateAPI(
-                        url=self._session.config["agent.venv_update.url"] or DEFAULT_VENV_UPDATE_URL,
-                        **package_manager_params
-                    )
-                elif self.uv.enabled:
+                if self.uv.enabled:
                     self.uv.initialize()
                     self.package_api = self.uv.get_api(**package_manager_params)
                 else:
@@ -5016,7 +5191,7 @@ class Worker(ServiceCommandSection):
             local_wheel = os.path.expanduser(os.environ.get('FORCE_LOCAL_CLEARML_AGENT_WHEEL'))
             docker_wheel = '/tmp/{}'.format(basename(local_wheel))
             base_cmd += ['-v', local_wheel + ':' + docker_wheel]
-            clearml_agent_wheel = '\"{}\"'.format(docker_wheel)
+            clearml_agent_wheel = docker_wheel if self._bootstrap else '\"{}\"'.format(docker_wheel)
         elif force_agent_repo:
             clearml_agent_wheel = force_agent_repo
         else:
@@ -5030,7 +5205,7 @@ class Worker(ServiceCommandSection):
         mount_poetry_cache = mount_poetry_cache or '/root/.cache/pypoetry'
         mount_git_ro = "{}.git".format(mount_ssh_ro.rstrip("/"))
 
-        if not standalone_mode:
+        if not standalone_mode and not self._bootstrap:
             if not bash_script:
                 # Find the highest python version installed, or install from apt-get
                 # python+pip is the requirement to match
@@ -5095,26 +5270,51 @@ class Worker(ServiceCommandSection):
             context="docker"
         )
 
+        if self._bootstrap:
+            base_cmd += bootstrap.get_bootstrap_docker_configuration(
+                config=self._session.config)
+
+            if preprocess_bash_script:
+                preprocess_bash_script_str = "\n".join([line for line in preprocess_bash_script if line]) \
+                    if not isinstance(preprocess_bash_script, str) else preprocess_bash_script
+
+                base_cmd += ["-e", "CLEARML_BOOTSTRAP_CUSTOM_CMD_BASE64={}".format(
+                    base64.b64encode(preprocess_bash_script_str.encode('ascii')).decode('ascii'))]
+
+            if extra_shell_script:
+                base_cmd += ["-e", "CLEARML_PRE_CUSTOM_CMD={}".format(extra_shell_script)]
+
+            if clearml_agent_wheel:
+                base_cmd += ["-e", "CLEARML_AGENT_VERSION={}".format(clearml_agent_wheel)]
+
         base_cmd += (
             (['--name', name] if name else []) +
-            ['-v', conf_file+':'+DOCKER_ROOT_CONF_FILE] +
+            ['-v', conf_file + ':' + DOCKER_ROOT_CONF_FILE] +
             ['-e', "CLEARML_CONFIG_FILE={}".format(DOCKER_ROOT_CONF_FILE)] +
-            (['-v', host_ssh_cache+':'+mount_ssh_ro] if host_ssh_cache else []) +
-            (['-v', host_apt_cache+':'+mount_apt_cache] if host_apt_cache else []) +
-            (['-v', host_pip_cache+':'+mount_pip_cache] if host_pip_cache else []) +
-            (['-v', host_poetry_cache + ':'+mount_poetry_cache] if host_poetry_cache else []) +
-            (['-v', host_pip_dl+':'+mounted_pip_dl] if host_pip_dl else []) +
-            (['-v', host_cache+':'+mounted_cache] if host_cache else []) +
-            (['-v', host_vcs_cache+':'+mounted_vcs_cache] if host_vcs_cache else []) +
+            (['-v', host_ssh_cache + ':' + mount_ssh_ro] if host_ssh_cache else []) +
+            (['-v', host_apt_cache + ':' + mount_apt_cache] if host_apt_cache else []) +
+            (['-v', host_pip_cache + ':' + mount_pip_cache] if host_pip_cache else []) +
+            (['-v', host_poetry_cache + ':' + mount_poetry_cache] if host_poetry_cache else []) +
+            (['-v', host_pip_dl + ':' + mounted_pip_dl] if host_pip_dl else []) +
+            (['-v', host_cache + ':' + mounted_cache] if host_cache else []) +
+            (['-v', host_vcs_cache + ':' + mounted_vcs_cache] if host_vcs_cache else []) +
             (['-v', host_venvs_cache + ':' + mounted_venvs_cache] if host_venvs_cache else []) +
-            (['--rm'] if use_rm else []) +
-            [docker_image, 'bash', '-c',
+            (['--rm'] if use_rm else [])
+        )
+
+        if self._bootstrap:
+            base_cmd += [
+                docker_image, 'bash', '-c', "$CLEARML_BOOTSTRAP_DIR/bootstrap.sh "
+            ]
+        else:
+            base_cmd += [
+                docker_image, 'bash', '-c',
                 update_scheme +
                 extra_shell_script +
                 "cp {} {} ; ".format(DOCKER_ROOT_CONF_FILE, DOCKER_DEFAULT_CONF_FILE) +
                 "NVIDIA_VISIBLE_DEVICES={nv_visible} $LOCAL_PYTHON -u -m clearml_agent ".format(
                     nv_visible=dockers_nvidia_visible_devices, python=python_version)
-             ])
+             ]
 
         return base_cmd
 
@@ -5252,7 +5452,7 @@ class Worker(ServiceCommandSection):
 
         if self.worker_id is None:
             error('Instance with the same WORKER_ID [{}] is already running'.format(worker_id))
-            exit(1)
+            sys.exit(1)
         # update folders based on free slot
         self._session.create_cache_folders(slot_index=worker_slot)
 

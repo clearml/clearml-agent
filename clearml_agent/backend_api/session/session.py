@@ -27,6 +27,7 @@ from .token_manager import TokenManager
 from ..config import load
 from ..utils import get_http_session_with_retry, urllib_log_warning_setup
 from ...backend_config.environment import backward_compatibility_support
+from ...helper.dicts import get_dict_leaves
 from ...version import __version__
 
 sys_random = SystemRandom()
@@ -109,13 +110,13 @@ class Session(TokenManager):
     ):
         # add backward compatibility support for old environment variables
         backward_compatibility_support()
-
+        self._debug = kwargs.get('debug', False)
         if config is not None:
             self.config = config
         else:
             self.config = load(*(custom_default_config_paths or ()))
             if initialize_logging:
-                self.config.initialize_logging(debug=kwargs.get('debug', False))
+                self.config.initialize_logging(debug=self._debug)
 
         super(Session, self).__init__(config=self.config, **kwargs)
 
@@ -296,6 +297,8 @@ class Session(TokenManager):
                 if d:
                     r = ConfigFactory.parse_string(d)
                     if isinstance(r, (ConfigTree, dict)):
+                        if self._debug:
+                            print("vault keys loaded: {}".format(get_dict_leaves(r)))
                         return r
             except Exception as e:
                 print("Failed parsing vault {}: {}".format(vault.get("description", "<unknown>"), e))

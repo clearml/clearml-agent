@@ -21,3 +21,26 @@ def merge_dicts(dict1, dict2, custom_merge_func=None):
         else:
             dict1[k] = dict2[k]
     return dict1
+
+
+def leaf_keys(d, prefix=""):
+    # type: (Dict, str) -> str
+    for key, value in d.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            # recurse deeper
+            yield from leaf_keys(value, full_key)
+        else:
+            # leaf node
+            yield full_key
+
+
+def get_dict_leaves(dict_data):
+    # type: (Dict) -> list
+    return[k for k in leaf_keys(dict_data)]
+
+
+def print_dict_leaves(dict_data):
+    # type: (Dict) -> None
+    for k in leaf_keys(dict_data):
+        print(k)
