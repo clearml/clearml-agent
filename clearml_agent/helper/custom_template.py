@@ -125,6 +125,7 @@ class CustomTemplate(Template):
         user_vaults: Mapping = None,
         user_info: Mapping = None,
         project_info: Mapping = None,
+        additional_mappings: Mapping = None,
     ):
         return self.custom_substitute(
             partial(
@@ -138,9 +139,11 @@ class CustomTemplate(Template):
                 user_vaults=user_vaults,
                 user_info=user_info,
                 project_info=project_info,
+                additional_mappings=additional_mappings,
                 force_yaml_string_quotes=self._force_yaml_string_quotes,
                 default_list_delimiter=self._default_list_delimiter,
-            )
+            ),
+            additional_mappings=additional_mappings,
         )
 
     def _apply_ops(self, ops, value):
@@ -161,13 +164,21 @@ class CustomTemplate(Template):
                 log.error(f"Failed applying op {op} with args {args}: {e}")
         return value
 
-    def custom_substitute(self, mapping_func, disable_ops_processing=False):
+    def custom_substitute(self, mapping_func, additional_mappings=None, disable_ops_processing=False):
         # Helper function for .sub()
         def convert(mo):
             named = mo.group('named') or mo.group('braced')
-            if not named or not str(named).startswith(self.prefix):
+            if not named:
                 return mo.group()
-            named = named[len(self.prefix):]
+
+            if not str(named).startswith(self.prefix):
+                if additional_mappings is None:
+                    return mo.group()
+                elif str(named) not in additional_mappings:
+                    raise ValueError('Named group substitution not found', named)
+
+            if str(named).startswith(self.prefix):
+                named = named[len(self.prefix):]
 
             if named is not None:
                 parsed_ops: List[Union[str, Tuple[str, str]]] = self.default_ops[:]
@@ -218,6 +229,7 @@ class CustomTemplate(Template):
         user_vaults: Mapping = None,
         user_info: Mapping = None,
         project_info: Mapping = None,
+        additional_mappings: Mapping = None,
         force_yaml_string_quotes: bool = False,
         default_list_delimiter: str = ',',
     ):
@@ -312,6 +324,10 @@ class CustomTemplate(Template):
                 elif default:
                     return default
                 raise ValueError()
+            elif additional_mappings and prefix in additional_mappings:
+                if path:
+                    raise ValueError(f"Field {prefix} does not support any path")
+                return additional_mappings[prefix] or default
 
         except Exception:
             raise KeyError((key,))
@@ -419,7 +435,7 @@ class TemplateResolver:
         token_dict = self.task_session.get_decoded_token(self.task_session.token, verify=False)
         return deepcopy(token_dict.get("providers_info") or {})
 
-    def resolve_string_from_template(self, template: str, force_yaml_string_quotes=False) -> str:
+    def resolve_string_from_template(self, template: str, force_yaml_string_quotes=False, additional_mappings=None) -> str:
         tmpl = CustomTemplate(template, force_yaml_string_quotes=force_yaml_string_quotes)
         return tmpl.default_custom_substitute(
             queue_id=self.queue_id,
@@ -431,11 +447,14 @@ class TemplateResolver:
             user_vaults=self.user_vaults,
             user_info=self.user_info,
             project_info=self.project_info,
+            additional_mappings=additional_mappings,
         )
 
-    def resolve_from_template(self, template: str, force_yaml_string_quotes=False) -> Result:
+    def resolve_from_template(self, template: str, force_yaml_string_quotes=False, additional_mappings=None) -> Result:
         resolved_template_str = self.resolve_string_from_template(
-            template, force_yaml_string_quotes=force_yaml_string_quotes
+            template,
+            force_yaml_string_quotes=force_yaml_string_quotes,
+            additional_mappings=additional_mappings
         )
         template = yaml.safe_load(resolved_template_str)
         return self.Result(self, template)
