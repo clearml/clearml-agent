@@ -120,6 +120,7 @@ from clearml_agent.helper.base import (
 from clearml_agent.helper.check_update import start_check_update_daemon
 from clearml_agent.helper.console import ensure_text, print_text, decode_binary_lines
 from clearml_agent.helper.environment.converters import strtobool
+from clearml_agent.helper.gpu.util import detect_rocm_env
 from clearml_agent.helper.os.daemonize import daemonize_process
 from clearml_agent.helper.package.base import PackageManager, get_specific_package_version
 from clearml_agent.helper.package.conda_api import CondaAPI
@@ -4903,6 +4904,34 @@ class Worker(ServiceCommandSection):
 
         return len(output.splitlines()) if output else 0
 
+    @staticmethod
+    def _amd_gpu_docker_args(visible=None):
+        # AMD render nodes live at /dev/dri/renderD{128+N} for GPU N.
+        args = ['--device=/dev/kfd']
+        if visible:
+            indices = [tok.strip() for tok in str(visible).split(',') if tok.strip()]
+            for idx in indices:
+                try:
+                    n = int(idx)
+                except ValueError:
+                    continue
+                args.append('--device=/dev/dri/renderD{}'.format(128 + n))
+            joined = ','.join(indices)
+            if joined:
+                args += ['-e', 'HIP_VISIBLE_DEVICES={}'.format(joined),
+                         '-e', 'ROCR_VISIBLE_DEVICES={}'.format(joined)]
+        else:
+            try:
+                render_nodes = sorted(
+                    name for name in os.listdir('/dev/dri') if name.startswith('renderD')
+                )
+            except OSError:
+                render_nodes = []
+            for name in render_nodes:
+                args.append('--device=/dev/dri/{}'.format(name))
+        args += ['--group-add', 'video']
+        return args
+
     def _filter_docker_args(self, docker_args):
         # type: (List[str]) -> List[str]
         """
@@ -5028,11 +5057,15 @@ class Worker(ServiceCommandSection):
             if ENV_DOCKER_SKIP_GPUS_FLAG.get():
                 dockers_nvidia_visible_devices = Session.get_nvidia_visible_env() or \
                                                  dockers_nvidia_visible_devices
+            elif detect_rocm_env():
+                base_cmd += self._amd_gpu_docker_args()
             else:
                 base_cmd += ['--gpus', 'all', ]
         elif gpu_devices.strip() and gpu_devices.strip() != 'none':
             if ENV_DOCKER_SKIP_GPUS_FLAG.get():
                 dockers_nvidia_visible_devices = gpu_devices
+            elif detect_rocm_env():
+                base_cmd += self._amd_gpu_docker_args(visible=gpu_devices)
             else:
                 # replace back "." to ":" MIG support
                 if self._use_podman:
