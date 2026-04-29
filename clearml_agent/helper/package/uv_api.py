@@ -144,6 +144,19 @@ class UvConfig:
                 chain.from_iterable(('--extra-index-url', x) for x in PIP_EXTRA_INDICES)
             )
 
+        if (
+            self.session
+            and self.session.config
+            and self.session.config.get("agent.package_manager.uv_unsafe_best_match", False)
+        ):
+            existing_env = kwargs["env"].get("UV_INDEX_STRATEGY")
+            if existing_env:
+                print("INFO: skipping uv_unsafe_best_match, UV_INDEX_STRATEGY already set to '{}'".format(existing_env))
+            elif any(str(a).startswith("--index-strategy") for a in args):
+                print("INFO: skipping uv_unsafe_best_match, --index-strategy already passed to uv")
+            else:
+                kwargs["env"]["UV_INDEX_STRATEGY"] = "unsafe-best-match"
+
         # Set the cache dir to venvs dir is SYNCed otherwise use the pip download as cache
         if not kwargs["env"].get("UV_CACHE_DIR"):
             if self._is_sync:

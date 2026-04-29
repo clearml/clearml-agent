@@ -69,6 +69,7 @@ def get_bootstrap_container_env_vars(config):
         GIT_SSL_NO_VERIFY=config.get("agent.bootstrap.git_insecure", None),
         UV_DEFAULT_INDEX=config.get("agent.bootstrap.uv_default_index_url", None),
         UV_INDEX=config.get("agent.bootstrap.uv_index_url", None),
+        UV_INDEX_STRATEGY="unsafe-best-match" if config.get("agent.package_manager.uv_unsafe_best_match", False) else None,
     )
     return {k: ("1" if v else "0") if isinstance(v, bool) else str(v) for k, v in envs.items() if v is not None}
 

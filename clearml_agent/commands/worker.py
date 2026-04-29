@@ -2999,6 +2999,9 @@ class Worker(ServiceCommandSection):
                 # (e.g. python3.10 -> python3 -> python), so found_python may differ from task_exec_binary
                 if not found_python:
                     print(f"INFO: pip requested but no Python executable found on system, falling back to UV")
+                    if self._session.config.get("agent.package_manager.uv_unsafe_best_match", None) is None:
+                        self._session.config.put("agent.package_manager.uv_unsafe_best_match", True)
+                        print("INFO: Enabling uv_unsafe_best_match for UV fallback")
                 else:
                     sys.executable = found_python
                     print(f"INFO: Found Python executable: '{sys.executable}' (version {found_python_version or 'unknown'})")
@@ -3013,6 +3016,9 @@ class Worker(ServiceCommandSection):
                         print(f"INFO: pip is available [{pip_version}], using pip as package manager")
                     except (subprocess.CalledProcessError, OSError, FileNotFoundError):
                         print(f"INFO: pip requested but not found with '{sys.executable}', falling back to UV")
+                        if self._session.config.get("agent.package_manager.uv_unsafe_best_match", None) is None:
+                            self._session.config.put("agent.package_manager.uv_unsafe_best_match", True)
+                            print("INFO: Enabling uv_unsafe_best_match for UV fallback")
 
             if use_uv:
                 self._session.config.put("agent.package_manager.type", "uv")
