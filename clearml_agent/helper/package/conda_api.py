@@ -212,7 +212,6 @@ class CondaAPI(PackageManager):
             self.conda,
             "create",
             "--yes",
-            "--mkdir",
             "--prefix",
             self.path,
             "python={}".format(self.python),
