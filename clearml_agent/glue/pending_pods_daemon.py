@@ -7,7 +7,7 @@ from clearml_agent.glue.utilities import get_bash_output
 from .daemon import K8sDaemon
 from .utilities import get_path
 from .errors import GetPodsError
-from .definitions import ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION
+from .definitions import ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION, ENV_POD_MONITOR_EVICTION_REASONS
 
 
 class PendingPodsDaemon(K8sDaemon):
@@ -99,7 +99,7 @@ class PendingPodsDaemon(K8sDaemon):
 
                         msg = reason + (" ({})".format(message) if message else "")
 
-                        if reason == 'ImagePullBackOff':
+                        if reason in ENV_POD_MONITOR_EVICTION_REASONS.get():
                             self.delete_k8s_resource(k8s_resource=pod, msg=reason)
                             try:
                                 self._session.api_client.tasks.failed(

@@ -14,6 +14,9 @@ ENV_POD_MONITOR_LOG_BATCH_SIZE = EnvEntry("K8S_GLUE_POD_MONITOR_LOG_BATCH_SIZE",
 ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION = EnvEntry(
     "K8S_GLUE_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION", default=False, converter=bool
 )
+ENV_POD_MONITOR_EVICTION_REASONS = EnvEntry("K8S_GLUE_POD_MONITOR_EVICTION_REASONS",
+                                            default={'ImagePullBackOff', 'InvalidImageName'},
+                                            converter=lambda x: set(shlex.split(x)))
 
 ENV_POD_USE_IMAGE_ENTRYPOINT = EnvEntry("K8S_GLUE_POD_USE_IMAGE_ENTRYPOINT", default=False, converter=bool)
 """
