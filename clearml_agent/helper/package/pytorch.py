@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+import os
 import re
 import sys
 import platform
@@ -18,6 +19,7 @@ from .requirements import (
     compare_version_rules, )
 from ...definitions import ENV_PACKAGE_PYTORCH_RESOLVE
 from ...external.requirements_parser.requirement import Requirement
+from ..gpu.util import detect_rocm_env
 
 OS_TO_WHEEL_NAME = {"linux": "linux_x86_64", "windows": "win_amd64"}
 
@@ -174,8 +176,11 @@ class PytorchRequirement(SimpleSubstitution):
 
     extra_index_url_template = 'https://download.pytorch.org/whl/cu{}/'
     nightly_extra_index_url_template = 'https://download.pytorch.org/whl/nightly/cu{}/'
+    rocm_extra_index_url_template = 'https://download.pytorch.org/whl/rocm{}.{}/'
+    nightly_rocm_extra_index_url_template = 'https://download.pytorch.org/whl/nightly/rocm{}.{}/'
     torch_index_url_lookup = {}
     resolver_types = ("pip", "direct", "none")
+    _rocm_version_cache = False  # sentinel: False means not-yet-detected; None means no version found
 
     def __init__(self, *args, **kwargs):
         os_name = kwargs.pop("os_override", None)
@@ -197,6 +202,12 @@ class PytorchRequirement(SimpleSubstitution):
         if self.config.get("agent.package_manager.nightly_extra_index_url_template", None):
             self.nightly_extra_index_url_template = \
                 self.config.get("agent.package_manager.nightly_extra_index_url_template", None)
+        if self.config.get("agent.package_manager.rocm_extra_index_url_template", None):
+            self.rocm_extra_index_url_template = \
+                self.config.get("agent.package_manager.rocm_extra_index_url_template", None)
+        if self.config.get("agent.package_manager.nightly_rocm_extra_index_url_template", None):
+            self.nightly_rocm_extra_index_url_template = \
+                self.config.get("agent.package_manager.nightly_rocm_extra_index_url_template", None)
         # allow override pytorch lookup pages
         if self.config.get("agent.package_manager.torch_page", None):
             SimplePytorchRequirement.page_lookup_template = \
@@ -670,7 +681,89 @@ class PytorchRequirement(SimpleSubstitution):
             return MarkerRequirement(Requirement.parse(self._fix_setuptools))
         return None
 
+    @classmethod
+    def _detect_rocm_version(cls):
+        # Returns (major, minor) tuple or None. Cached across calls.
+        if cls._rocm_version_cache is not False:
+            return cls._rocm_version_cache
+
+        version = None
+        rocm_path = os.environ.get('ROCM_PATH') or '/opt/rocm'
+        version_files = (
+            os.path.join(rocm_path, '.info', 'version'),
+            os.path.join(rocm_path, '.info', 'version-dev'),
+            os.path.join(rocm_path, '.info', 'version-utils'),
+        )
+        for path in version_files:
+            # noinspection PyBroadException
+            try:
+                if os.path.isfile(path):
+                    with open(path, 'r') as f:
+                        raw = f.read().strip()
+                    m = re.match(r'(\d+)\.(\d+)', raw)
+                    if m:
+                        version = (int(m.group(1)), int(m.group(2)))
+                        break
+            except Exception:
+                pass
+
+        if version is None:
+            # noinspection PyBroadException
+            try:
+                candidates = []
+                for name in os.listdir('/opt'):
+                    m = re.match(r'^rocm-?(\d+)\.(\d+)', name)
+                    if m:
+                        candidates.append((int(m.group(1)), int(m.group(2))))
+                if candidates:
+                    version = max(candidates)
+            except Exception:
+                pass
+
+        cls._rocm_version_cache = version
+        return version
+
+    def get_rocm_torch_index_url(self, rocm_version=None, nightly=False):
+        template = self.nightly_rocm_extra_index_url_template if nightly \
+            else self.rocm_extra_index_url_template
+        # Default to a recent ROCm version and walk down if unknown.
+        major, minor = rocm_version if rocm_version else (6, 4)
+        cache_key = 'rocm{}.{}{}'.format(major, minor, '-nightly' if nightly else '')
+        if cache_key in self.torch_index_url_lookup:
+            return self.torch_index_url_lookup[cache_key], cache_key
+
+        # PyTorch has published ROCm wheels since ROCm 4.x; stop probing below that.
+        min_major = 4
+        # Cap the number of probes so we don't spin forever on a broken template.
+        for _ in range(30):
+            if major < min_major:
+                break
+            torch_url = template.format(major, minor)
+            # noinspection PyBroadException
+            try:
+                if requests.get(torch_url, timeout=10).ok:
+                    print('Torch ROCm {}.{} {}index page found, adding `{}`'.format(
+                        major, minor, 'nightly ' if nightly else '', torch_url))
+                    self.torch_index_url_lookup[cache_key] = torch_url
+                    return self.torch_index_url_lookup[cache_key], cache_key
+            except Exception:
+                pass
+            if minor > 0:
+                minor -= 1
+            else:
+                major -= 1
+                minor = 9
+        return None
+
     def get_torch_index_url(self, cuda_version, nightly=False):
+        # If we're running on a ROCm-only host, resolve a ROCm torch index first
+        # and fall back to the CUDA/CPU flow only if ROCm resolution fails.
+        if detect_rocm_env():
+            rocm_result = self.get_rocm_torch_index_url(
+                self._detect_rocm_version(), nightly=nightly)
+            if rocm_result:
+                return rocm_result
+
         # noinspection PyBroadException
         try:
             cuda = int(cuda_version)
@@ -707,7 +800,11 @@ class PytorchRequirement(SimpleSubstitution):
             except Exception:
                 pass
 
-        keys = sorted(self.torch_index_url_lookup.keys(), reverse=True)
+        # only compare against int (CUDA) keys — ROCm entries use string keys
+        keys = sorted(
+            (k for k in self.torch_index_url_lookup.keys() if isinstance(k, int)),
+            reverse=True,
+        )
         for k in keys:
             if k <= cuda:
                 return self.torch_index_url_lookup[k], k
