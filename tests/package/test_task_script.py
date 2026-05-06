@@ -29,7 +29,7 @@ SHORT_TIMEOUT = 30
 
 @fixture(scope="session")
 def client():
-    return APIClient(api_version="2.2")
+    return APIClient()
 
 
 @contextmanager

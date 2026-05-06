@@ -68,6 +68,18 @@ def param(url, expected, user=False, password=False):
         ),
     ],
 )
+
+
+# TODO: add tests for conversion:
+# git+https://bitbucket.org/seematics/trains-internal.git@master#subdirectory=.
+# git+ssh://git@bitbucket.org/seematics/trains-internal.git@main#subdirectory=a
+# git+git://git@bitbucket.org/seematics/trains-internal.git@master#subdirectory=b
+#
+# git+https://github.com/clearml/clearml.git@master#subdirectory=.
+# git+ssh://git@github.com/clearml/clearml.git@main#subdirectory=a
+# git+git://git@github.com/clearml/clearml.git@master#subdirectory=b
+
+
 def test(url, user, password, expected):
     config = {"agent": {"git_user": user, "git_pass": password}}
     result = Git.add_auth(config, url)
