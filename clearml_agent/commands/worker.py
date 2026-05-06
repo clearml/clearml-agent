@@ -2074,11 +2074,17 @@ class Worker(ServiceCommandSection):
 
         # check if we have bootstrap package installed
         if bootstrap.check_bootstrap_package_install(config=self._session.config):
+            check_latest = kwargs.get('check_bootstrap', False) or self._session.config.get(
+                "agent.bootstrap.check_for_latest", False
+            )
+            if check_latest:
+                bootstrap.check_latest_bootstrap_version(
+                    timeout=self._session.config.get("agent.bootstrap.check_for_latest_timeout", 5)
+                )
             if bootstrap.update_bootstrap(config=self._session.config):
                 self._bootstrap = True
         else:
-            print("WARNING: `clearml_agent_bootstrap` package was not found")
-            print("          To speed up agent job start-up time, run: `clearml-agent install-bootstrap`")
+            bootstrap.print_bootstrap_missing_notice()
 
         # check if we have the latest agent version
         if not self._session.config.get('agent.disable_agent_update_check', None):

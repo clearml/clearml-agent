@@ -49,10 +49,10 @@ def _api_headers(accept: str = "application/vnd.github+json") -> dict:
     }
 
 
-def _fetch_json(url: str) -> object:
+def _fetch_json(url: str, timeout: float = 30) -> object:
     """Fetch a URL and return the parsed JSON response."""
     req = urllib.request.Request(url, headers=_api_headers())
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -68,7 +68,7 @@ def _get_installed_version() -> str | None:
         return None
 
 
-def _find_whl(version: str | None = None) -> tuple[str, int, str]:
+def _find_whl(version: str | None = None, timeout: float = 30) -> tuple[str, int, str]:
     """Return ``(tag, asset_id, filename)`` for a release with a .whl asset.
 
     When *version* is None the ``/releases/latest`` endpoint is used (returns
@@ -89,7 +89,7 @@ def _find_whl(version: str | None = None) -> tuple[str, int, str]:
         for tag in candidates:
             url = "{}/tags/{}".format(RELEASES_API, tag)
             try:
-                release = _fetch_json(url)
+                release = _fetch_json(url, timeout=timeout)
                 break
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
@@ -103,7 +103,7 @@ def _find_whl(version: str | None = None) -> tuple[str, int, str]:
     else:
         url = "{}/latest".format(RELEASES_API)
         try:
-            release = _fetch_json(url)
+            release = _fetch_json(url, timeout=timeout)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise RuntimeError("No releases found in {}.".format(BOOTSTRAP_REPO))
@@ -246,6 +246,26 @@ def _install_and_verify(
             )
     else:
         print("WARNING: installation completed but package could not be imported")
+
+
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+
+def get_latest_bootstrap_version(timeout: float = 30) -> str | None:
+    """Return the latest released bootstrap tag (without leading 'v'), or None on error."""
+    try:
+        tag, _, _ = _find_whl(version=None, timeout=timeout)
+    except Exception:
+        return None
+    return tag.lstrip("v") if tag else None
+
+
+def get_installed_bootstrap_version() -> str | None:
+    """Return the currently installed bootstrap version (without leading 'v'), or None."""
+    current = _get_installed_version()
+    return current.lstrip("v") if current else None
 
 
 # ---------------------------------------------------------------------------
