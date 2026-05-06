@@ -277,6 +277,66 @@ appended. For example, to stop the first of the above shown same machine, single
 clearml-agent daemon --detached --gpus 0 --queue default --docker nvidia/cuda:11.0.3-cudnn8-runtime-ubuntu20.04 --stop
 ```
 
+### ClearML Agent Bootstrap
+
+> Bootstrap is supported when using ClearML Agent version `3.0.0` and up.
+
+The [`clearml-agent-bootstrap`](https://github.com/clearml/clearml-agent-bootstrap) package is a self-contained
+initialization system that runs inside any container launched by the ClearML Agent. It ships precompiled binaries for
+**Python**, **Git**, **ClearML Agent**, and essential utilities, so task containers do not need these tools
+pre-installed.
+
+When the agent launches a containerized task, the bootstrap script runs first: it detects the container's architecture
+and distribution, sets up a working Python environment, ensures Git is available, and then hands off to the ClearML
+Agent to execute the task.
+
+**Why use it**
+
+- **Faster cold starts** — precompiled binaries avoid slow package-manager installs at task launch time.
+- **Broader container compatibility** — tasks can run in minimal images (Alpine, slim, distroless-adjacent) that lack Python or Git.
+- **Consistent environments** — every task gets the same known-good toolchain regardless of the base image.
+- **Offline support** — all critical binaries are bundled, no internet access is required for the initial setup.
+
+Supports `x86_64` and `aarch64` architectures on any Linux distribution that provides `apt-get`, `dnf`, `yum`, or `apk`
+(Ubuntu, Debian, CentOS, RHEL, Fedora, Rocky Linux, Alpine, ...).
+
+#### Bare-metal / VM usage
+
+Install the agent (version 3.0.0 and up) and then install the bootstrap support:
+
+```bash
+pip install clearml-agent
+clearml-agent install-bootstrap
+```
+
+This downloads the latest `clearml-agent-bootstrap` distribution and installs it locally. From this point on, when the
+agent runs in docker mode, it will automatically unpack the bootstrap binaries, mount them into task containers, and
+make sure the bootstrap script runs on container startup. The `install-bootstrap` command does not require a ClearML
+server connection and can be run before `clearml-agent init`.
+
+Common flags:
+
+- `--check` — preview a dry-run of the command without making changes.
+- `--force` — force reinstall even if the same version is already installed.
+- `--version TAG` — install a specific release version (e.g., `v1.0.0`).
+- `--from-file PATH` — install from a local `.whl` file instead of downloading from the official GitHub Releases.
+
+#### Kubernetes (Enterprise Helm chart)
+
+> Bootstrap support for Kubernetes is available only in the ClearML Enterprise Agent Helm chart.
+
+Enable bootstrap in your `clearml-agent-values.override.yaml`:
+
+```yaml
+bootstrap:
+  enabled: true
+```
+
+#### More details
+
+See the [agent-bootstrap README](https://github.com/clearml/clearml-agent-bootstrap) and the
+[ClearML Agent Bootstrap docs](https://clear.ml/docs/latest/docs/clearml_agent/clearml_agent_bootstrap) for full details.
+
 ### How do I create an experiment on the ClearML Server? <a name="from-scratch"></a>
 
 * Integrate [ClearML](https://github.com/clearml/clearml) with your code
