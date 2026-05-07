@@ -334,7 +334,7 @@ class K8sIntegration(Worker):
             return self.AGENT_LABEL
 
         if not self._agent_label:
-            h = hashlib.md5()
+            h = hashlib.md5(usedforsecurity=False)  # FIPS requirement
             h.update(str(self.worker_id).encode('utf-8'))
             self._agent_label = '{}-{}'.format(self.AGENT_LABEL, h.hexdigest()[:8])
 

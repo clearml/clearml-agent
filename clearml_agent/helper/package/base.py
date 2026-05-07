@@ -376,7 +376,7 @@ class PackageManager(object):
                 pip_reqs=str(pip_reqs or ''),
                 conda_reqs=str(conda_reqs or ''),
             )
-            keys.append(md5(ensure_binary(hash_text)).hexdigest())
+            keys.append(md5(ensure_binary(hash_text), usedforsecurity=False).hexdigest())  # FIPS requirement
         return sorted(list(set(keys)))
 
     def _get_cache_manager(self):

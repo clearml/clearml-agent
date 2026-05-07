@@ -859,7 +859,7 @@ def clone_repository_cached(session, execution, destination):
         cached_repo_path = clone_folder
     else:
         vcs_cache_path = Path(session.config["agent.vcs_cache.path"]).expanduser()
-        repo_hash = md5(ensure_binary(repo_url)).hexdigest()
+        repo_hash = md5(ensure_binary(repo_url), usedforsecurity=False).hexdigest()  # FIPS requirement
         # create lock
         repo_lock = FileLock(filename=(vcs_cache_path / '{}.lock'.format(repo_hash)).as_posix())
         # noinspection PyBroadException
