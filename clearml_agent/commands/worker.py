@@ -5104,11 +5104,21 @@ class Worker(ServiceCommandSection):
 
         # decide on order of docker args when merging overlapping arguments
         # from extra_docker_args and the Task's docker_args
-        base_cmd += DockerArgsSanitizer.merge_docker_args(
+        merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
             config=self._session.config,
             task_docker_arguments=docker_arguments,
             extra_docker_arguments=extra_docker_arguments
         )
+        base_cmd += merged
+
+        if stripped_switches:
+            warn_msg = (
+                "clearml-agent: ignoring docker argument(s) {}; "
+                "they would override the agent startup script and prevent the task from running"
+            ).format(", ".join("--{}".format(s) for s in stripped_switches))
+            self.log.warning(warn_msg)
+            if env_task_id:
+                self.send_logs(env_task_id, [warn_msg + '\n'], session=self._session)
 
         # check if we have mapped ports
         try:

@@ -157,7 +157,23 @@ class DockerArgsSanitizer:
         return args
 
     @staticmethod
-    def merge_docker_args(config, task_docker_arguments: List[str], extra_docker_arguments: List[str]) -> List[str]:
+    def merge_docker_args(
+            config, task_docker_arguments: List[str], extra_docker_arguments: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        forbidden_switches = config.get("agent.forbidden_docker_args", [])
+        present = set()
+        for args in (task_docker_arguments, extra_docker_arguments):
+            if args:
+                present |= set(DockerArgsSanitizer.get_list_of_switches(args)) & set(forbidden_switches)
+        stripped_switches = sorted(present)
+        if stripped_switches:
+            if task_docker_arguments:
+                task_docker_arguments = DockerArgsSanitizer.filter_switches(
+                    task_docker_arguments, exclude_switches=stripped_switches)
+            if extra_docker_arguments:
+                extra_docker_arguments = DockerArgsSanitizer.filter_switches(
+                    extra_docker_arguments, exclude_switches=stripped_switches)
+
         base_cmd = []
         # currently only resolving --network, --ipc, --privileged
         override_switches = config.get(
@@ -183,7 +199,7 @@ class DockerArgsSanitizer:
             if extra_docker_arguments:
                 extra_docker_arguments = DockerArgsSanitizer.filter_switches(extra_docker_arguments, switches)
                 base_cmd += [a for a in extra_docker_arguments if a]
-        return base_cmd
+        return base_cmd, stripped_switches
 
     @staticmethod
     def resolve_port_mapping(config, docker_arguments: List[str]) -> Optional[tuple]:
