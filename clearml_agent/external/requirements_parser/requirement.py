@@ -1,12 +1,12 @@
 from __future__ import unicode_literals
 import re
-import sys
 
-if sys.version_info >= (3, 12):
-    # if python version is python 3.12 and up we can use the packaging module
-    from ..._vendor.pkg_resources import Requirement as Req
-else:
+# setuptools >= 82 removed pkg_resources, so on any Python where
+# the user has a newer setuptools we fall back to the vendored copy.
+try:
     from pkg_resources import Requirement as Req  # noqa
+except ImportError:
+    from ..._vendor.pkg_resources import Requirement as Req
 
 from .fragment import get_hash_info, parse_fragment, parse_extras_require
 from .vcs import VCS, VCS_SCHEMES

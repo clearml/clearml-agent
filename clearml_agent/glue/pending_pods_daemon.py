@@ -247,7 +247,7 @@ class PendingPodsDaemon(K8sDaemon):
             )
 
             # update last msg for this task
-            self._last_tasks_msgs[task_id] = msg
+            self._last_tasks_msgs[task_id] = (msg, tags)
         except Exception as ex:
             self.log.warning(
                 'K8S Glue pods monitor: Failed setting status message for task "{}"\nMSG: {}\nEX: {}'.format(
