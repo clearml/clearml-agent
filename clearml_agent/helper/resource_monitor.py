@@ -562,6 +562,7 @@ class GpuFractionsHandler:
     _number_re = re.compile(r"^clear\.ml/fraction(-\d+)?$")
     _mig_re = re.compile(r"^nvidia\.com/mig-(?P<compute>[0-9]+)g\.(?P<memory>[0-9]+)gb$")
     _frac_gpu_injector_re = re.compile(r"^clearml-injector/fraction$")
+    _custom_gpu_fraction_re = re.compile(r"^gpu-fraction$")
 
     _gpu_name_to_memory_gb = {
         "NVIDIA-A30": 24,
@@ -660,7 +661,17 @@ class GpuFractionsHandler:
         return 0
 
     @classmethod
-    def encode_fractions(cls, limits: dict, labels: dict) -> str:
+    def get_custom_fractions_total(cls, annotations: dict) -> Optional[float]:
+        try:
+            if not any(cls._custom_gpu_fraction_re.match(x) for x in annotations):
+                return None
+            return sum(float(v) for k, v in annotations.items() if cls._custom_gpu_fraction_re.match(k))
+        except Exception as ex:
+            log.error("Failed summing up fractions from {}: {}".format(annotations, ex))
+        return 0
+
+    @classmethod
+    def encode_fractions(cls, limits: dict, labels: dict, annotations: dict) -> str:
         if limits:
             if any(cls._number_re.match(x) for x in (limits or {})):
                 return ",".join(str(v) for k, v in sorted(limits.items()) if cls._number_re.match(k))
@@ -672,6 +683,9 @@ class GpuFractionsHandler:
                 # If the pod is using 0.5 GPUs, it means it's using 1 time a 0.5 fraction of a GPU.
                 # CFGI supports fractions only BELOW 1, so this logic holds.
                 return ",".join(("%.03f" % min(float(v), 1.000)) for k, v in sorted(labels.items()) if cls._frac_gpu_injector_re.match(k))
+        elif annotations:
+            if any(cls._custom_gpu_fraction_re.match(x) for x in (annotations or {})):
+                return ",".join(str(v) for k, v in sorted(annotations.items()) if cls._custom_gpu_fraction_re.match(k))
 
     @staticmethod
     def decode_fractions(fractions: str) -> Union[List[float], Dict[str, int]]:

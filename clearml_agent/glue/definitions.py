@@ -33,3 +33,13 @@ kubectl actually works and starts the pod)
 ENV_DEFAULT_SCHEDULER_QUEUE_TAGS = EnvEntry(
     "K8S_GLUE_DEFAULT_SCHEDULER_QUEUE_TAGS", default=["k8s-glue"], converter=shlex.split
 )
+
+ENV_COMPLETED_POD_DELETION_DELAY_MINUTES = EnvEntry(
+    "K8S_GLUE_COMPLETED_POD_DELETION_DELAY_MINUTES", default=0, converter=float
+)
+"""
+Minutes to keep completed/failed pods (or jobs, when using jobs) before the cleanup loop deletes them.
+Defaults to 0 (delete as soon as the cleanup loop sees them). When set to a positive value, the cleanup loop
+checks the actual completion time (container terminated.finishedAt for pods, status.completionTime for jobs)
+and skips deletion until at least this many minutes have elapsed since completion.
+"""

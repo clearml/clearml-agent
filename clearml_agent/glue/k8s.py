@@ -44,6 +44,7 @@ from clearml_agent.glue.definitions import (
     ENV_POD_USE_IMAGE_ENTRYPOINT,
     ENV_KUBECTL_IGNORE_ERROR,
     ENV_DEFAULT_SCHEDULER_QUEUE_TAGS,
+    ENV_COMPLETED_POD_DELETION_DELAY_MINUTES,
 )
 from .._vendor import pyyaml as yaml
 
@@ -411,25 +412,28 @@ class K8sIntegration(Worker):
         except Exception as ex:
             self.log.warning('Failed parsing kubectl output:\n{}\nEx: {}'.format(output, ex))
 
-    def get_pods_for_jobs(self, job_condition: str = None, pod_filters: List[str] = None, debug_msg: str = None):
+    def get_pods_for_jobs(
+        self, job_condition: str = None, pod_filters: List[str] = None, debug_msg: str = None, ns: str = None
+    ):
         # Use metadata.uid so job related pods can be found filterin g following list with this param
         controller_uids = self.get_jobs_info(
-            "metadata.uid", condition=job_condition, debug_msg=debug_msg
+            "metadata.uid", condition=job_condition, namespace=ns, debug_msg=debug_msg
         )
         if not controller_uids:
             # No pods were found for these jobs
             return []
-        pods = self.get_pods(filters=pod_filters, debug_msg=debug_msg)
+        pods = self.get_pods(filters=pod_filters, debug_msg=debug_msg, ns=ns)
         return [
             pod for pod in pods
             if get_path(pod, "metadata", "labels", "controller-uid") in controller_uids
         ]
 
-    def get_pods(self, filters: List[str] = None, debug_msg: str = None):
+    def get_pods(self, filters: List[str] = None, debug_msg: str = None, ns: str = None):
         kubectl_cmd = self.get_kubectl_command(
             "get pods",
             filters=filters,
             labels=False if self.using_jobs else None,
+            ns=ns,
         )
         if debug_msg:
             self.log.debug(debug_msg.format(cmd=kubectl_cmd))
@@ -1086,58 +1090,145 @@ class K8sIntegration(Worker):
         self.log.debug(" - deleted pods %s", ", ".join(lines))
         return lines
 
-    def _delete_jobs_by_names(self, names_to_ns: Dict[str, str], msg: str = None) -> List[str]:
-        if not names_to_ns:
+    def _delete_jobs_by_names(self, names: List[str], namespace: str, msg: str = None) -> List[str]:
+        if not names:
             return []
-        ns_to_names = defaultdict(list)
-        for name, ns in names_to_ns.items():
-            ns_to_names[ns].append(name)
-
-        results = []
-        for ns, names in ns_to_names.items():
-            kubectl_cmd = "kubectl delete job --namespace={ns} --output=name {names}".format(
-                ns=ns, names=" ".join(names)
-            )
-            self.log.debug("Deleting jobs {}: {}".format(
-                msg or "", kubectl_cmd
-            ))
-            lines = self._process_bash_lines_response(kubectl_cmd)
-            if not lines:
-                continue
+        kubectl_cmd = "kubectl delete job --namespace={ns} --output=name {names}".format(
+            ns=namespace, names=" ".join(names)
+        )
+        self.log.debug("Deleting jobs {}: {}".format(msg or "", kubectl_cmd))
+        lines = self._process_bash_lines_response(kubectl_cmd)
+        if lines:
             self.log.debug(" - deleted jobs %s", ", ".join(lines))
-            results.extend(lines)
-        return results
+        return lines
+
+    @staticmethod
+    def _pod_completion_time(pod) -> Optional[datetime]:
+        """Return the latest container terminated.finishedAt from a pod (incl. init containers), or None."""
+        statuses = list(get_path(pod, "status", "containerStatuses") or [])
+        statuses += list(get_path(pod, "status", "initContainerStatuses") or [])
+        finished_times = []
+        for s in statuses:
+            finished_at = get_path(s, "state", "terminated", "finishedAt")
+            if not finished_at:
+                continue
+            try:
+                finished_times.append(datetime.fromisoformat(finished_at.replace("Z", "+00:00")))
+            except Exception:
+                continue
+        return max(finished_times) if finished_times else None
+
+    def _delete_pods_by_names(self, names: List[str], namespace: str, msg: str = None) -> List[str]:
+        if not names:
+            return []
+        kubectl_cmd = "kubectl delete pod --namespace={ns} --output=name {names}".format(
+            ns=namespace, names=" ".join(names)
+        )
+        self.log.debug("Deleting pods {}: {}".format(msg or "", kubectl_cmd))
+        lines = self._process_bash_lines_response(kubectl_cmd)
+        if lines:
+            self.log.debug(" - deleted pods %s", ", ".join(lines))
+        return lines
+
+    def _get_completed_jobs_with_completion_time(self, namespace=None, debug_msg: str = None) \
+            -> List[Tuple[str, str, Optional[str]]]:
+        """
+        Return a list of (job_name, namespace, completion_time_iso_or_None) for jobs with status.succeeded==1.
+        """
+        output_format = (
+            "jsonpath='{range .items[?(@.status.succeeded==1)]}"
+            "{@.metadata.name}|{@.metadata.namespace}|{@.status.completionTime}{\"\\n\"}{end}'"
+        )
+        kubectl_cmd = self.get_kubectl_command("get job", output=output_format, ns=namespace)
+        if debug_msg:
+            self.log.debug(debug_msg.format(cmd=kubectl_cmd))
+        output = stringify_bash_output(get_bash_output(kubectl_cmd))
+        output = output.strip().strip("'")
+        result = []
+        for line in output.splitlines():
+            parts = line.strip().split("|")
+            if len(parts) < 2 or not parts[0]:
+                continue
+            name = parts[0]
+            ns = parts[1]
+            completion = parts[2] if len(parts) > 2 and parts[2] else None
+            result.append((name, ns, completion))
+        return result
 
     def _delete_completed_or_failed_pods(self, namespace, msg: str = None):
-        if not self.using_jobs:
-            return self._delete_pods(
-                selectors=["status.phase!=Pending", "status.phase!=Running"], namespace=namespace, msg=msg
-            )
+        delay_minutes = ENV_COMPLETED_POD_DELETION_DELAY_MINUTES.get()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=delay_minutes)) if delay_minutes > 0 else None
 
-        job_names_to_delete = {}
+        if not self.using_jobs:
+            if cutoff is None:
+                return self._delete_pods(
+                    selectors=["status.phase!=Pending", "status.phase!=Running"], namespace=namespace, msg=msg
+                )
+            # Delay enabled: list candidates, filter by completion time, delete by name.
+            pods = self.get_pods(
+                filters=["status.phase!=Pending", "status.phase!=Running"],
+                debug_msg="Listing completed/failed pods (delay enabled): {cmd}",
+                ns=namespace,
+            ) or []
+            names = []
+            for pod in pods:
+                pod_name = get_path(pod, "metadata", "name")
+                if not pod_name:
+                    continue
+                completion = self._pod_completion_time(pod)
+                if completion is None:
+                    # No completion timestamp yet; defer to a later cycle.
+                    continue
+                if completion <= cutoff:
+                    names.append(pod_name)
+            return self._delete_pods_by_names(names=names, namespace=namespace, msg=msg)
+
+        job_names_to_delete = set()
 
         # locate failed pods for jobs
         failed_pods = self.get_pods_for_jobs(
             job_condition="status.active=1",
             pod_filters=["status.phase!=Pending", "status.phase!=Running", "status.phase!=Terminating"],
-            debug_msg="Deleting failed pods: {cmd}"
-        )
-        if failed_pods:
-            job_names_to_delete = {
-                get_path(pod, "metadata", "labels", "job-name"): get_path(pod, "metadata", "namespace")
-                for pod in failed_pods
-                if get_path(pod, "metadata", "labels", "job-name")
-            }
+            debug_msg="Deleting failed pods: {cmd}",
+            ns=namespace,
+        ) or []
+        for pod in failed_pods:
+            job_name = get_path(pod, "metadata", "labels", "job-name")
+            if not job_name:
+                continue
+            if cutoff is not None:
+                completion = self._pod_completion_time(pod)
+                if completion is None or completion > cutoff:
+                    # No completion timestamp yet, or not aged enough; defer to a later cycle.
+                    continue
+            job_names_to_delete.add(job_name)
+        if job_names_to_delete:
             self.log.debug(f" - found jobs with failed pods: {' '.join(job_names_to_delete)}")
 
-        completed_job_names = self.get_jobs_info(
-            "metadata.name", condition="status.succeeded=1", namespace=namespace, debug_msg=msg
-        )
+        if cutoff is None:
+            completed_job_names = list(self.get_jobs_info(
+                "metadata.name", condition="status.succeeded=1", namespace=namespace, debug_msg=msg
+            ) or {})
+        else:
+            completed_job_names = []
+            for name, _ns, completion_str in self._get_completed_jobs_with_completion_time(
+                namespace=namespace, debug_msg=msg
+            ):
+                if not completion_str:
+                    # No completionTime yet; defer.
+                    continue
+                try:
+                    completion = datetime.fromisoformat(completion_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if completion <= cutoff:
+                    completed_job_names.append(name)
+
         if completed_job_names:
             self.log.debug(f" - found completed jobs: {' '.join(completed_job_names)}")
             job_names_to_delete.update(completed_job_names)
 
-        return self._delete_jobs_by_names(names_to_ns=job_names_to_delete, msg=msg)
+        return self._delete_jobs_by_names(names=list(job_names_to_delete), namespace=namespace, msg=msg)
 
     def _cleanup_old_pods(self, namespaces, extra_msg=None):
         # type: (Iterable[str], Optional[str]) -> Dict[str, List[str]]
