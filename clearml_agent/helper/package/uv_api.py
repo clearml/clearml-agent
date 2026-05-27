@@ -138,6 +138,12 @@ class UvConfig:
             if extra_args:
                 args = args + tuple(extra_args)
             self._is_sync = True
+        elif self.session and self.session.config and args and args[0] == "run":
+            extra_args = self.session.config.get(
+                "agent.package_manager.uv_run_extra_args", None
+            )
+            if extra_args:
+                args = (args[0],) + tuple(extra_args) + tuple(args[1:])
 
         if PIP_EXTRA_INDICES and self._is_sync and args and args[0] == "sync":
             args = tuple(args or []) + tuple(
