@@ -693,7 +693,14 @@ class Git(VCS):
 
     def pull(self):
         self._set_ssh_url()
-        self.call("fetch", "--all", "--tags", "--recurse-submodules", cwd=self.location)
+        fetch_args = self.session.config.get("agent.git_fetch_args")
+        if not isinstance(fetch_args, (list, tuple)):
+            self.log.warning(
+                "agent.git_fetch_args must be a list, got %s; ignoring",
+                type(fetch_args).__name__,
+            )
+            fetch_args = []
+        self.call("fetch", *fetch_args, cwd=self.location)
 
     def _git_pass_auth_wrapper(self, func, *args, **kwargs):
         try:
