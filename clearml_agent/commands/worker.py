@@ -1279,6 +1279,20 @@ class Worker(ServiceCommandSection):
                 docker_params["docker_arguments"] = docker_args_template_resolver.resolve_from_docker_cmd(
                     full_docker_cmd=docker_params["docker_arguments"])
 
+            # Inject the task owner's vault `environment` section as host-side `-e KEY=VAL`
+            # args so they are visible to the docker container (entrypoint, init bash
+            # scripts, etc.) before clearml-agent boots inside it. Only relevant when
+            # impersonating the task owner — the agent's own vault is handled by
+            # _apply_extra_configuration(), so we only inject the owner's vault here.
+            if self._session.config.get("agent.docker_apply_environment_from_vault") \
+                    and self._impersonate_as_task_owner \
+                    and task_session.check_min_api_version("2.20"):
+                vault_env_args = self._load_vault_env_as_docker_args(task_session)
+                if vault_env_args:
+                    docker_params["extra_docker_arguments"] = (
+                        list(self._extra_docker_arguments or []) + vault_env_args
+                    )
+
             full_docker_cmd = self.docker_image_func(env_task_id=task_id, **docker_params)
 
             # if we are using the default docker, update back the Task:
@@ -5021,6 +5035,44 @@ class Worker(ServiceCommandSection):
             elif cmd.startswith("-"):
                 skip_arg = True
 
+        return args
+
+    def _load_vault_env_as_docker_args(self, task_session):
+        # type: (Session) -> List[str]
+        """
+        Load the owner's vault (via task_session) and return its `environment` section
+        formatted as docker `-e KEY=VALUE` argument pairs. Returns [] if the resolved
+        configuration is empty, fails to load, or (after all vaults are merged) has
+        `apply_environment: false`. Vaults are an enterprise-only feature, so task_session 
+        must have the `advanced` feature set.
+        """
+        try:
+            task_session.verify_feature_set('advanced')
+        except ValueError:
+            return []
+
+        try:
+            task_session.load_vaults()
+            vault_config = task_session.config.resolve_override_configs() or {}
+        except Exception as ex:
+            self.log.warning("Failed loading vaults for docker env injection: {}".format(ex))
+            return []
+
+        if not vault_config.get("apply_environment", True):
+            return []
+
+        env_vars = vault_config.get("environment", None) or {}
+        if isinstance(env_vars, (list, tuple)):
+            env_vars = dict(env_vars)
+
+        args = []
+        for key, value in env_vars.items():
+            if not key:
+                self.log.warning(
+                    f"Skipping vault environment entry with empty key for docker env injection (value={value})"
+                )
+                continue
+            args += ["-e", "{}={}".format(key, "" if value is None else value)]
         return args
 
     def _get_docker_cmd(
