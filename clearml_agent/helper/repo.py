@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 from base64 import b64encode
-from hashlib import md5
 from os import environ
 from random import random
 from threading import Lock
@@ -37,6 +36,7 @@ from clearml_agent.helper.base import (
     normalize_path,
     create_file_if_not_exists, safe_remove_file,
 )
+from clearml_agent.helper.hash import md5
 from clearml_agent.helper.os.locks import FileLock
 from clearml_agent.helper.process import DEVNULL, Argv, PathLike, COMMAND_SUCCESS, find_executable
 from clearml_agent.session import Session
@@ -866,7 +866,7 @@ def clone_repository_cached(session, execution, destination):
         cached_repo_path = clone_folder
     else:
         vcs_cache_path = Path(session.config["agent.vcs_cache.path"]).expanduser()
-        repo_hash = md5(ensure_binary(repo_url), usedforsecurity=False).hexdigest()  # FIPS requirement
+        repo_hash = md5(ensure_binary(repo_url)).hexdigest()
         # create lock
         repo_lock = FileLock(filename=(vcs_cache_path / '{}.lock'.format(repo_hash)).as_posix())
         # noinspection PyBroadException

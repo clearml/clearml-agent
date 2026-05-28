@@ -2,7 +2,6 @@ from __future__ import print_function, division, unicode_literals
 
 import base64
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -33,6 +32,7 @@ from clearml_agent.glue.utilities import get_path, get_bash_output
 from clearml_agent.glue.pending_pods_daemon import PendingPodsDaemon
 from clearml_agent.helper.base import safe_remove_file
 from clearml_agent.helper.dicts import merge_dicts
+from clearml_agent.helper.hash import md5
 from clearml_agent.helper.process import get_bash_output, stringify_bash_output
 from clearml_agent.helper.resource_monitor import ResourceMonitor
 from clearml_agent.interface.base import ObjectID
@@ -335,7 +335,7 @@ class K8sIntegration(Worker):
             return self.AGENT_LABEL
 
         if not self._agent_label:
-            h = hashlib.md5(usedforsecurity=False)  # FIPS requirement
+            h = md5()
             h.update(str(self.worker_id).encode('utf-8'))
             self._agent_label = '{}-{}'.format(self.AGENT_LABEL, h.hexdigest()[:8])
 

@@ -3,7 +3,6 @@ from __future__ import unicode_literals
 import abc
 from collections import OrderedDict
 from contextlib import contextmanager
-from hashlib import md5
 from typing import Text, Iterable, Union, Optional, Dict, List
 
 from ..._vendor import six
@@ -12,6 +11,7 @@ from ..._vendor.pathlib2 import Path
 from clearml_agent.definitions import ENV_VENV_CACHE_PATH
 from clearml_agent.helper.base import mkstemp, safe_remove_file, join_lines, select_for_platform
 from clearml_agent.helper.console import ensure_binary
+from clearml_agent.helper.hash import md5
 from clearml_agent.helper.os.folder_cache import FolderCache
 from clearml_agent.helper.process import Executable, Argv, PathLike
 
@@ -376,7 +376,7 @@ class PackageManager(object):
                 pip_reqs=str(pip_reqs or ''),
                 conda_reqs=str(conda_reqs or ''),
             )
-            keys.append(md5(ensure_binary(hash_text), usedforsecurity=False).hexdigest())  # FIPS requirement
+            keys.append(md5(ensure_binary(hash_text)).hexdigest())
         return sorted(list(set(keys)))
 
     def _get_cache_manager(self):
