@@ -1277,6 +1277,8 @@ class K8sIntegration(Worker):
             status = task.get("status")
             status_reason = (task.get("status_reason") or "").lower()
             last_change = task.get("last_change")
+            if isinstance(last_change, str):
+                last_change = datetime.fromisoformat(last_change.replace("Z", "+00:00"))
             if not task_id or not status:
                 self.log.warning('Failed getting task information: id={}, status={}'.format(task_id, status))
                 continue
