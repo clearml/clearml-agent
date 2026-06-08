@@ -17,9 +17,13 @@ MLOps/LLMOps scheduler & orchestration solution supporting Linux, macOS and Wind
 
 ---
 
-### ClearML-Agent
+### ⚡ [ClearML Agent Bootstrap](https://github.com/clearml/clearml-agent#clearml-agent-bootstrap)
 
-#### *Formerly known as Trains Agent*
+Boot agents up to 10x faster with rock-solid stability — git, git-lfs, agent, ssh and UV come precompiled for x86/arm in a single self-contained bootstrap, so there's nothing to install at runtime.
+
+---
+
+### ClearML-Agent
 
 * Run jobs (experiments) on any local or cloud based resource
 * Implement optimized resource utilization policies
@@ -40,7 +44,7 @@ It is a zero configuration fire-and-forget execution agent, providing a full ML/
 3. Create a [job](https://clear.ml/docs/latest/docs/apps/clearml_task) or
    add [ClearML](https://github.com/clearml/clearml) to your code with just 2 lines of code
 4. Change the [parameters](#using-the-clearml-agent) in the UI & schedule for [execution](#using-the-clearml-agent) (or
-   automate with an [AutoML pipeline](#automl-and-orchestration-pipelines-))
+   automate with a [pipeline](#orchestration-pipes))
 5. :chart_with_downwards_trend: :chart_with_upwards_trend: :eyes:  :beer:
 
 "All the Deep/Machine-Learning DevOps your research needs, and then some... Because ain't nobody got time for that"
@@ -380,15 +384,15 @@ clearml-agent daemon --services-mode --detached --queue services --create-queue 
 
 **Note**: It is the user's responsibility to make sure the proper tasks are pushed into the specified queue.
 
-### AutoML and Orchestration Pipelines <a name="automl-pipes"></a>
+### Orchestration Pipelines <a name="orchestration-pipes"></a>
 
-The ClearML Agent can also be used to implement AutoML orchestration and Experiment Pipelines in conjunction with the
+The ClearML Agent can also be used to implement orchestration and Experiment Pipelines in conjunction with the
 ClearML package.
 
-Sample AutoML & Orchestration examples can be found in the
+Sample Orchestration examples can be found in the
 ClearML [example/automation](https://github.com/clearml/clearml/tree/master/examples/automation) folder.
 
-AutoML examples:
+Examples:
 
 - [Toy Keras training experiment](https://github.com/clearml/clearml/blob/master/examples/optimization/hyper-parameter-optimization/base_template_keras_simple.py)
     - In order to create an experiment-template in the system, this code must be executed once manually
