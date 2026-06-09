@@ -1,5 +1,4 @@
 import logging
-import ssl
 import sys
 
 import requests
@@ -46,8 +45,7 @@ class TLSv1HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         self.poolmanager = PoolManager(num_pools=connections,
                                        maxsize=maxsize,
-                                       block=block,
-                                       ssl_version=ssl.PROTOCOL_TLSv1_2)
+                                       block=block)
 
 
 def get_http_session_with_retry(
