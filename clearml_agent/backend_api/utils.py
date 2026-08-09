@@ -4,6 +4,7 @@ import sys
 
 import requests
 from requests.adapters import HTTPAdapter
+import urllib3
 from urllib3.util import Retry
 from urllib3 import PoolManager
 
@@ -44,10 +45,12 @@ def urllib_log_warning_setup(total_retries=10, display_warning_after=5):
 
 class TLSv1HTTPAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        self.poolmanager = PoolManager(num_pools=connections,
-                                       maxsize=maxsize,
-                                       block=block,
-                                       ssl_version=ssl.PROTOCOL_TLSv1_2)
+        kwargs = dict(num_pools=connections, maxsize=maxsize, block=block)
+        if hasattr(ssl, "TLSVersion") and int(urllib3.__version__.split(".")[0]) >= 2:
+            kwargs["ssl_minimum_version"] = ssl.TLSVersion.TLSv1_2
+        else:
+            kwargs["ssl_version"] = ssl.PROTOCOL_TLSv1_2
+        self.poolmanager = PoolManager(**kwargs)
 
 
 def get_http_session_with_retry(
@@ -108,7 +111,6 @@ def get_http_session_with_retry(
                 'certificate verification is strongly advised. See: '
                 'https://urllib3.readthedocs.io/en/latest/advanced-usage.html#ssl-warnings')
         # make sure we only do not see the warning
-        import urllib3
         # noinspection PyBroadException
         try:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
