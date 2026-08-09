@@ -1062,11 +1062,40 @@ class K8sIntegration(Worker):
             process = subprocess.Popen(kubectl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output, error = process.communicate()
         except Exception as ex:
-            return None, str(ex), None
+            return None, self._redact_secrets(str(ex), task_token), None
         finally:
             safe_remove_file(yaml_file)
 
-        return stringify_bash_output(output), stringify_bash_output(error), pod_name
+        output = self._redact_secrets(stringify_bash_output(output), task_token)
+        error = self._redact_secrets(stringify_bash_output(error), task_token)
+        return output, error, pod_name
+
+    @staticmethod
+    def _redact_secrets(text, task_token):
+        """
+        Remove sensitive values from kubectl output/error before it is logged locally or sent to the UI.
+
+        kubectl (and admission webhooks/policy engines) can echo the submitted object back on failure. The
+        applied pod spec embeds several secrets that would then reach whoever can see the task console:
+          * the user auth token, as a plaintext CLEARML_AUTH_TOKEN env var (image-entrypoint path);
+          * base64 blobs injected into the container init as `echo '<blob>' | base64 --decode`, covering the
+            clearml.conf (API access key + secret), the token, and the start-agent / bootstrap scripts (which
+            in turn inline extra_bash_init_script / extra_docker_shell_script / task docker_bash).
+        Redact the token by value and every `echo '<blob>' | base64` blob by pattern (source-agnostic).
+        """
+        if not text:
+            return text
+
+        if task_token:
+            token = task_token.decode("ascii") if isinstance(task_token, bytes) else str(task_token)
+            for secret in (token, base64.b64encode(token.encode("ascii")).decode("ascii")):
+                if secret:
+                    text = text.replace(secret, "<REDACTED>")
+
+        # Redact any base64 blob the agent injects via `echo '<blob>' | base64 [--decode]`, regardless of which
+        # code path built it (clearml.conf, token, __start_agent__.sh, enterprise bootstrap script).
+        text = re.sub(r"(echo ')[A-Za-z0-9+/=]{16,}(' *\| *base64)", r"\1<REDACTED>\2", text)
+        return text
 
     def _process_bash_lines_response(self, bash_cmd: str, raise_error=True):
         res = get_bash_output(bash_cmd, raise_error=raise_error)
