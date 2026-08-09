@@ -57,6 +57,7 @@ class K8sIntegration(Worker):
     QUEUE_LABEL = "clearml-agent-queue"
     QUEUE_NAME_LABEL = "clearml-agent-queue-name"
     PARENT_LABEL = "clearml-parent-task-id"
+    TASK_ID_LABEL = "clearml-task-id"
 
     KUBECTL_APPLY_CMD = "kubectl apply --namespace={namespace} -f"
 
@@ -834,7 +835,8 @@ class K8sIntegration(Worker):
         labels = {
             self.QUEUE_LABEL: self._safe_k8s_label_value(queue),
             self.QUEUE_NAME_LABEL: self._safe_k8s_label_value(queue_name),
-            self.PARENT_LABEL: (task_data or {}).get("parent", "")
+            self.PARENT_LABEL: (task_data or {}).get("parent", ""),
+            self.TASK_ID_LABEL: (task_data or {}).get("id", "")
         }
 
         return [
