@@ -215,7 +215,75 @@ class UvConfig:
             if cwd:
                 self._cwd = cwd
 
+            self._ensure_python_downloads_metadata()
+
             self._initialized = True
+
+    def _ensure_python_downloads_metadata(self):
+        """
+        Point UV at a *local* Python-downloads metadata file (UV_PYTHON_DOWNLOADS_JSON_URL) so it can
+        install Python from an offline resources server - UV reads that variable as a file, not http.
+
+        Driven entirely by `agent.bootstrap.uv_python_meta_file` (no-op if unset):
+          - a local path is used as-is;
+          - an http(s) URL is downloaded and every entry's download-URL host is aligned with the
+            metadata host (repairing a server that baked e.g. "localhost:8080" URLs), then UV is
+            pointed at the local copy.
+        A local file already set in UV_PYTHON_DOWNLOADS_JSON_URL (e.g. by the bootstrap script) wins.
+        The `agent.bootstrap.uv_python_meta_file` can be configured by `CLEARML_AGENT__AGENT__BOOTSTRAP__UV_PYTHON_META_FILE`.
+        Best-effort: any failure falls back to UV's default (public) downloads.
+        """
+        # noinspection PyBroadException
+        try:
+            existing = os.environ.get("UV_PYTHON_DOWNLOADS_JSON_URL")
+            if existing and os.path.isfile(existing):
+                print("INFO: UV Python download source: preconfigured metadata file '{}'".format(existing))
+                return
+
+            meta = None
+            if self.session and self.session.config:
+                meta = self.session.config.get("agent.bootstrap.uv_python_meta_file", None)
+            if not meta:
+                print("INFO: UV Python download source: public downloads (internet) - no offline "
+                      "resources server configured (agent.bootstrap.uv_python_meta_file)")
+                return
+            meta = str(meta)
+
+            if not (meta.startswith("http://") or meta.startswith("https://")):
+                if os.path.isfile(meta):  # local file path, expose as-is
+                    os.environ["UV_PYTHON_DOWNLOADS_JSON_URL"] = meta
+                    print("INFO: UV Python download source: offline metadata file '{}'".format(meta))
+                else:
+                    print("WARNING: UV Python download source: configured metadata file '{}' not found "
+                          "- falling back to public downloads (internet)".format(meta))
+                return
+
+            import json
+            import tempfile
+            from urllib.request import urlopen
+            from urllib.parse import urlsplit, urlunsplit
+
+            # UV needs the metadata as a LOCAL FILE - UV_PYTHON_DOWNLOADS_JSON_URL cannot be an URL
+            # Fetch the JSON here, align the tarball hosts (below), and write it out for UV
+            host = urlsplit(meta)
+            with urlopen(meta, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            # the bootstrap resources server hosts both the JSON and the tarballs, so align every download-URL's scheme/host with the metadata host
+            for entry in (data.values() if isinstance(data, dict) else []):
+                if isinstance(entry, dict) and entry.get("url"):
+                    p = urlsplit(entry["url"])
+                    entry["url"] = urlunsplit((host.scheme, host.netloc, p.path, p.query, p.fragment))
+
+            fd, out_path = tempfile.mkstemp(prefix="clearml_uv_py_meta_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as out_file:
+                json.dump(data, out_file)
+            os.environ["UV_PYTHON_DOWNLOADS_JSON_URL"] = out_path
+            print("INFO: UV Python download source: bootstrap resources server {}://{} (metadata {})"
+                  .format(host.scheme, host.netloc, meta))
+        except Exception as ex:
+            print("WARNING: UV Python download source: failed to use offline resources server ({}) "
+                  "- falling back to public downloads (internet)".format(ex))
 
     def get_api(self, session, python, requirements_manager, path, *args, **kwargs):
         if not self._api:

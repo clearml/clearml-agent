@@ -3047,6 +3047,26 @@ class Worker(ServiceCommandSection):
 
             self._session.config.put("agent.package_manager.uv_replace_pip", True)
 
+            # CLEARML_AGENT_SKIP_PYTHON_ENV_INSTALL is an explicit opt-out: the user guarantees a
+            # usable Python already exists (image/venv), so we honor it and do NOT install or provide
+            # one, not even via the bootstrap. Because the bootstrap installs Python quickly and
+            # locally, the recommended setup is to NOT set this and let the bootstrap manage Python -
+            # so we say so whenever it is set, even when a Python was found. A compiled Agent has no
+            # interpreter of its own (sys.executable is the bootstrap binary), so if the image has no
+            # Python the Task will fail - the accepted consequence of the skip.
+            if is_python_binary and ENV_AGENT_SKIP_PYTHON_ENV_INSTALL.get():
+                if found_python:
+                    print("INFO: CLEARML_AGENT_SKIP_PYTHON_ENV_INSTALL is set - honoring it and using the "
+                          "Python found in the image ('{}'). Note: the bootstrap mode installs Python quickly "
+                          "and locally, so removing this env var and letting the bootstrap manage Python "
+                          "is the recommended setup.".format(found_python))
+                else:
+                    print("WARNING: CLEARML_AGENT_SKIP_PYTHON_ENV_INSTALL is set - honoring it and NOT "
+                          "installing or providing a Python interpreter (not even via the bootstrap mode). No "
+                          "Python was found in the container image, so this Python Task could fail to start. "
+                          "Remove this env var to let the bootstrap install Python quickly and locally "
+                          "(recommended), or use an image that already includes Python.")
+
             print(f"INFO: COMPILED BOOTSTRAP AGENT pre-setup initialization complete - "
                   f"python='{sys.executable or 'none - Pending UV installation'}', "
                   f"package_manager='{self._session.config.get('agent.package_manager.type', 'not set')}'")
