@@ -82,6 +82,9 @@ class CustomTemplate(Template):
     prefix = "CLEARML_"
     filter_sep = "|"
     filter_re = re.compile(r"^(?P<op>[^(]+)(\((?P<args>[^()]*)\))?")
+    # matches the text between the start of a YAML line and a placeholder when the placeholder
+    # is the *entire* scalar value (i.e. right after "key:" or a "-" list indicator)
+    standalone_value_re = re.compile(r"^(\s*-\s+)*([^\n:]+:\s+|-\s+)?$")
     queue_id_to_name_map = {}
 
     remove_newlines_op = "remove_newlines"
@@ -197,11 +200,21 @@ class CustomTemplate(Template):
                         )
                     )
 
+                # A YAML type tag (e.g. "!!str") only works when the placeholder is the whole
+                # scalar value. When it is concatenated with a prefix/suffix or wrapped in quotes
+                # the tag leaks into the output as literal text, so detect that here and let the
+                # resolver skip the tag in that case (the surrounding literal already makes it a string).
+                line_start = self.template.rfind("\n", 0, mo.start()) + 1
+                line_prefix = self.template[line_start:mo.start()]
+                line_end = self.template.find("\n", mo.end())
+                line_suffix = self.template[mo.end():line_end if line_end != -1 else len(self.template)]
+                is_standalone = bool(self.standalone_value_re.match(line_prefix)) and not line_suffix.strip()
+
                 default_value = None
                 try:
                     if ":" in named:
                         named, default_value = named.split(":", 1)
-                    result = str(mapping_func(named, default_value))
+                    result = str(mapping_func(named, default_value, is_value_standalone=is_standalone))
                     if not disable_ops_processing and parsed_ops:
                         result = self._apply_ops(parsed_ops, result)
                     return result
@@ -238,6 +251,7 @@ class CustomTemplate(Template):
         additional_mappings: Mapping = None,
         force_yaml_string_quotes: bool = False,
         default_list_delimiter: str = ',',
+        is_value_standalone: bool = True,
     ):
         """
         Notice CLEARML_ prefix omitted! (i.e. ${QUEUE_ID} is ${QUEUE_ID})
@@ -273,6 +287,9 @@ class CustomTemplate(Template):
         :param default: default value, None will raise exception
         :param force_yaml_string_quotes: when resolving a string, add a YAML directive to force string quoting
         :param default_list_delimiter: the default delimiter used when formatting lists (default is a comma)
+        :param is_value_standalone: True when the placeholder is the entire YAML scalar value; when False
+            (concatenated with other text or wrapped in quotes) the !!str tag is skipped to avoid it leaking
+            into the output as literal text
         :return: string value
         """
         single_field_mapping = {
@@ -292,8 +309,10 @@ class CustomTemplate(Template):
 
         def format_base_type_to_string(v, force_yaml=True) -> Optional[str]:
             if isinstance(v, str):
-                if force_yaml and force_yaml_string_quotes:
-                    # !!str is a YAML directive to cast to string (will use quotes)
+                if force_yaml and force_yaml_string_quotes and is_value_standalone:
+                    # !!str is a YAML directive to cast to string (will use quotes).
+                    # Only valid when the placeholder is the whole scalar value; when it is
+                    # concatenated/quoted the surrounding literal already forces a string.
                     return f"!!str {v}"
                 return v
             elif isinstance(v, bool):
