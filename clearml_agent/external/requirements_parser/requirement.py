@@ -1,12 +1,16 @@
 from __future__ import unicode_literals
 import re
+import sys
 
-# setuptools >= 82 removed pkg_resources, so on any Python where
-# the user has a newer setuptools we fall back to the vendored copy.
-try:
-    from pkg_resources import Requirement as Req  # noqa
-except ImportError:
+# setuptools >= 82 removed pkg_resources; on 3.12+ use the vendored copy.
+# Gate on sys.version_info (not try/except) — the compiled build needs a static branch.
+if sys.version_info >= (3, 12):
     from ..._vendor.pkg_resources import Requirement as Req
+else:
+    try:
+        from pkg_resources import Requirement as Req  # noqa
+    except ImportError:
+        from ..._vendor.pkg_resources import Requirement as Req
 
 from .fragment import get_hash_info, parse_fragment, parse_extras_require
 from .vcs import VCS, VCS_SCHEMES
