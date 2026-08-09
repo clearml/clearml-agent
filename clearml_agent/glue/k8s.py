@@ -751,9 +751,8 @@ class K8sIntegration(Worker):
         )
 
     def _set_task_failed_while_applying(self, session, task_id: str, error: str):
-        send_log = "Running kubectl encountered an error: {}".format(error)
-        self.log.error(send_log)
-        self.send_logs(task_id, send_log.splitlines())
+        self.log.error(error)
+        self.send_logs(task_id, error.splitlines())
 
         # Make sure to remove the task from our k8s pending queue
         self._session.api_client.queues.remove_task(
@@ -901,7 +900,7 @@ class K8sIntegration(Worker):
         extra_bash_commands.append(
             "echo '{content}' | base64 --decode >> {script_path} ; /bin/bash {script_path}".format(
                 content=base64.b64encode(
-                    script_encoded.encode('ascii')
+                    script_encoded.encode('utf-8')
                 ).decode('ascii'),
                 script_path=start_agent_script_path
             )
