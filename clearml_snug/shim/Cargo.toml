@@ -1,0 +1,55 @@
+[package]
+name = "clearml_snug_shim"
+description = "LD_PRELOAD shim that intercepts OpenSSL SSL_write/SSL_read inside ClearML task processes for HTTP/S metering and header injection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# cdylib so the dynamic linker can mmap us via LD_PRELOAD.
+# rlib so cargo test can link the in-tree test harness against the crate
+# (a cdylib-only crate can't be statically linked by another binary in
+# the same workspace). The cdylib is what ships; the rlib is a
+# build-time artifact never installed.
+crate-type = ["cdylib", "rlib"]
+# The output filename - matches the path resolve_shim_path() looks for.
+name = "clearml_snug"
+
+# NOTE: [profile.release] lives at the workspace root (../Cargo.toml), NOT here.
+# Cargo silently ignores [profile.*] in non-root member manifests, so a block here
+# would never apply — the shipped cdylib would build with default release settings
+# (panic=unwind, opt-level=3, not stripped). The block was moved to the root so its
+# panic="abort" (C-ABI safety) + size/opt settings actually take effect.
+
+[dependencies]
+libc = "0.2"
+ctor = "0.2"
+httparse = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+# Atomic Arc swap for hot-reload of the whitelist when the parent's poll
+# thread observes a _snug_whitelist_revision change and sends
+# Control{action:"reload_whitelist"}.
+arc-swap = "1"
+# base64-encoded request/response capture for CallHistoryEntry events
+# (call_history::pair_to_event), emitted only when the call-history capture
+# mode is on for a whitelisted host.
+base64 = "0.22"
+# gzip/zstd decompression of compressed h2 response bodies before the usage
+# scan (decompress.rs). Pure-Rust backends only (miniz_oxide / ruzstd) so no C
+# runs in the task's address space. Some upstreams compress h2 responses and the
+# shim can't force identity over h2 (HPACK), so it inflates by magic-byte.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.7"
+# In-workspace path dependency for the shared wire schema. The eventual
+# Rust executioner depends on the same crate.
+clearml_snug_messages = { path = "../messages" }
+# In-process reporting library: owns the ClearML backend client (auth/refresh/
+# retry + TLS via ureq/rustls/ring) and the reporting sinks, run on a background
+# thread the shim spawns from its ctor and drains + joins from the exit(3) hook.
+clearml_snug_reporter = { path = "../reporter" }
+
+[dev-dependencies]

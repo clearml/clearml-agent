@@ -1,0 +1,28 @@
+/*
+ * v1 cdylib export contract (DOCUMENTATION).
+ *
+ * This file is NOT applied to the link line in current rustc - see
+ * shim/build.rs for the rationale. It is kept as the authoritative
+ * record of which symbols MUST be globally visible on the shim's .so:
+ *
+ *   SSL_write
+ *   SSL_read
+ *   SSL_free
+ *
+ * The contract is enforced at build time by a CI `nm -D` guard, which
+ * fails the build if any global 'T' symbol falls outside this set.
+ * That's a stronger check than a version script: it catches anything
+ * the toolchain accidentally exports, not just what we listed.
+ *
+ * Adding gnutls_record_send / gnutls_record_recv / SSL_*_ex is
+ * additive and does not require a wire-schema version bump - just
+ * widen the ALLOWED regex in the CI guard.
+ */
+CLEARML_SNUG_1.0 {
+  global:
+    SSL_write;
+    SSL_read;
+    SSL_free;
+  local:
+    *;
+};

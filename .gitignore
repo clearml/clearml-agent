@@ -1,3 +1,8 @@
+# Rust / SNUG build artifacts
+clearml_snug/target/
+clearml_agent/snug/lib/
+clearml_agent/snug/bin/
+
 # Mac
 .DS_Store
 
@@ -28,3 +33,5 @@ virtualenv
 .sops.yaml
 
 .venv
+# proxy crate build artifacts
+clearml_snug/proxy/target/

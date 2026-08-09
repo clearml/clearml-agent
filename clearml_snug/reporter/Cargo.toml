@@ -1,0 +1,36 @@
+[package]
+name = "clearml_snug_reporter"
+description = "In-process reporting library linked by the SNUG: owns the ClearML backend client (auth/refresh/retry) and the usage / task-metrics / aggregator sinks, consuming metered events from an in-process channel on a background thread."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "clearml_snug_reporter"
+path = "src/lib.rs"
+
+[dependencies]
+# Shared NDJSON wire schema (Event/Control), reused verbatim from the shim side.
+clearml_snug_messages = { path = "../messages" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Sync HTTP + TLS for the ClearML API client. ureq's default `tls` feature uses
+# rustls + ring + webpki-roots: pure-Rust plus a C (ring) backend that
+# cargo-zigbuild cross-compiles to static musl for both arches, with no system
+# OpenSSL or system cert-store dependency. Custom-CA and verify_certificate=false
+# are honored via an explicit rustls ClientConfig passed to AgentBuilder.
+ureq = "2"
+# base64 for the HTTP Basic auth header (access:secret) and decoding the JWT
+# payload segment to read its `exp` claim (no signature verification, mirroring
+# the Python client). Same crate the shim uses.
+base64 = "0.22"
+# Explicit rustls config for the two custom TLS modes: verify_certificate=false
+# (accept any cert) and a custom CA bundle (PEM). default-features=false +
+# "ring" pins the SAME musl-static crypto backend ureq already uses and avoids
+# pulling aws-lc-rs (which is hard to cross-compile to musl). The version must
+# match ureq's rustls (0.23) so AgentBuilder::tls_config accepts our config.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"

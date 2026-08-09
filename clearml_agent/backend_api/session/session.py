@@ -319,6 +319,54 @@ class Session(TokenManager):
         except Exception as ex:
             print("Failed getting vaults: {}".format(ex))
 
+    def load_monitoring_vault(self):
+        # () -> Optional[bool]
+        """Highest-priority admin overlay, fetched from the NEW backend
+        ``monitoring`` vault type and applied via ``set_priority_overrides`` so
+        it beats env + file - "if an admin decides we must monitor something, a
+        user can't override it."
+
+        Forward-compatible: a backend that does not yet support
+        ``types=monitoring`` must be a clean no-op. Unlike ``load_vaults`` (which
+        raises on a non-404 error), this swallows ALL non-ok statuses and
+        exceptions so it can never break worker init before the backend ships.
+        """
+        if not self.check_min_api_version("2.15") or self.feature_set == "basic":
+            return
+
+        if ENV_DISABLE_VAULT_SUPPORT.get():
+            return
+
+        def parse(vault):
+            # noinspection PyBroadException
+            try:
+                d = vault.get("data", None)
+                if d:
+                    r = ConfigFactory.parse_string(d)
+                    if isinstance(r, (ConfigTree, dict)):
+                        return r
+            except Exception as e:
+                print("Failed parsing monitoring vault {}: {}".format(
+                    vault.get("description", "<unknown>"), e))
+
+        # noinspection PyBroadException
+        try:
+            # Use params (not data/json) to match load_vaults: GET-with-body can
+            # be dropped by strict firewalls.
+            res = self.send_request(
+                "users", "get_vaults",
+                params="enabled=true&types=monitoring&types=monitoring")
+            if res.ok:
+                vaults = res.json().get("data", {}).get("vaults", [])
+                data = list(filter(None, map(parse, vaults)))
+                if data:
+                    self.config.set_priority_overrides(*data)
+                    return True
+            # Any non-ok status (404 unknown action, 400 invalid type enum, an
+            # older server, ...) is a forward-compat no-op: do NOT raise.
+        except Exception as ex:
+            print("Monitoring vault not applied (treated as no-op): {}".format(ex))
+
     def verify_feature_set(self, feature_set):
         if isinstance(feature_set, str):
             feature_set = [feature_set]

@@ -1,0 +1,17 @@
+[package]
+name = "clearml_snug_messages"
+description = "IPC event schema shared between the SNUG and the executioner. Single source of truth for the NDJSON wire format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Plain rlib - linked into both shim and (eventually) executioner.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

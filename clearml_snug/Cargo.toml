@@ -1,0 +1,31 @@
+[workspace]
+# The shim is a cdylib loaded via LD_PRELOAD into the user task process.
+# The messages crate is the canonical wire schema for the in-process event
+# channel; the future Rust executioner imports it as-is.
+# The reporter is an in-process LIBRARY the shim links: it owns the ClearML
+# backend client + reporting sinks and runs on a background thread inside the
+# task process.
+members = ["shim", "messages", "reporter"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The shim links the reporter, whose TLS stack (ureq + rustls + ring) sets the
+# MSRV floor. CI builds on rust:1-bookworm (>=1.85), comfortably above it.
+rust-version = "1.74"
+license = "Apache-2.0"
+publish = false
+
+# Release profile MUST live at the workspace root: Cargo ignores [profile.*] in
+# non-root member manifests, so a member-level [profile.release] would not apply.
+# panic="abort" is non-negotiable for the C ABI — a panic unwinding across libssl
+# would corrupt the host task process. The size/opt settings matter because the
+# cdylib ships in every task container. cargo test is unaffected (the test/bench
+# targets always build with unwind regardless of this setting).
+[profile.release]
+panic = "abort"
+lto = "fat"
+strip = true
+codegen-units = 1
+opt-level = "z"

@@ -75,7 +75,23 @@ setup(
     extras_require={
     },
     package_data={
-         'clearml_agent': ['backend_api/config/default/*.conf', '_vendor/jsonschema/schemas/*.json']
+         'clearml_agent': [
+             'backend_api/config/default/*.conf',
+             '_vendor/jsonschema/schemas/*.json',
+             # SNUG resources. The shared-library files are populated by CI
+             # from the clearml_snug/ Rust workspace; the *.json glob ships the
+             # whitelist schema (whitelist.schema.json). The whitelist itself is
+             # inline config (agent.snug.whitelist).
+             'snug/*.json',
+             # The reporter is linked into the shim, so these are the SNUG
+             # binaries the wheel ships: the Linux .so (LD_PRELOAD) and the macOS
+             # .dylib (DYLD_INSERT_LIBRARIES), both per arch, plus the standalone
+             # proxy ELF (clearml_snug_proxy) that meters clients the preload
+             # shim can't hook — Linux-only, one per arch (resolve_proxy_path()).
+             'snug/lib/*/libclearml_snug.so',
+             'snug/lib/*/libclearml_snug.dylib',
+             'snug/lib/*/clearml_snug_proxy',
+         ]
     },
     include_package_data=True,
     # To provide executable scripts, use entry points in preference to the

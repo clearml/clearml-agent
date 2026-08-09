@@ -1,0 +1,51 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ClearML SNUG whitelist (v1)",
+    "description": "v1 whitelist. The executioner serializes the inline agent.snug.whitelist config block and hands it to the shim base64-encoded via the CLEARML_SNUG_WHITELIST env var. Schema is locked at v1; any field change requires a schema version bump.",
+    "type": "object",
+    "required": ["version", "default_action", "rules"],
+    "additionalProperties": false,
+    "properties": {
+        "version": {
+            "type": "integer",
+            "const": 1,
+            "description": "Schema version. v1 only in this release."
+        },
+        "default_action": {
+            "type": "string",
+            "enum": ["meter", "ignore"],
+            "description": "Behavior for hosts with no matching rule. 'meter' counts bytes; 'ignore' passes through untouched."
+        },
+        "rules": {
+            "type": "array",
+            "description": "Evaluated in order; first match wins.",
+            "items": {
+                "type": "object",
+                "required": ["host"],
+                "additionalProperties": false,
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "Host pattern matched case-insensitively against the Host header. A leading and/or trailing '*' makes it a wildcard: '*.anthropic.com' (suffix), 'api.anthropic.*' (prefix), '*anthropic*' (substring), '*' (any host). No '*' means an exact match. Only a boundary '*' is special; a '*' in the middle is literal."
+                    },
+                    "path_prefix": {
+                        "type": "string",
+                        "default": "/",
+                        "description": "Matched against the request-target path component."
+                    },
+                    "inject_headers": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Whether to splice 'project:' and 'session:' headers into outbound HTTP/1.x requests."
+                    },
+                    "tokenizer": {
+                        "type": "string",
+                        "enum": ["claude", "cl100k", "approx"],
+                        "default": "approx",
+                        "description": "Per-host tokenizer selection. 'approx' = constant 2.72 bytes/token."
+                    }
+                }
+            }
+        }
+    }
+}

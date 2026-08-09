@@ -181,6 +181,14 @@ def is_linux_platform():
     return 'linux' in platform.system().lower()
 
 
+def is_macos_platform():
+    # platform.system() is the OS NAME, not the version: it returns "Darwin" on
+    # EVERY macOS release (the version lives in platform.mac_ver()/release()), so
+    # this is version-independent - exactly like is_linux_platform()'s "linux"
+    # check. macOS 26 -> 27 -> ... all stay "Darwin".
+    return 'darwin' in platform.system().lower()
+
+
 def normalize_path(*paths):
     """
     normalize_path

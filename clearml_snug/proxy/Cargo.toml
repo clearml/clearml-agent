@@ -1,0 +1,50 @@
+[package]
+name = "clearml_snug_proxy"
+description = "Local TLS-terminating forward proxy that decrypts whitelisted LLM HTTPS traffic and feeds it through the SNUG usage parser, for clients that can't be LD_PRELOAD-hooked (statically-linked BoringSSL, e.g. Electron renderers and bun-compiled CLIs). Routes via HTTP CONNECT; presents a leaf cert minted under a locally generated CA the client is told to trust."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Detached from the clearml_snug workspace: this is a standalone side-tool, not
+# shipped in the task container cdylib, so it does NOT inherit the workspace's
+# panic="abort"/opt-z release profile (it wants normal unwinding + threads).
+[workspace]
+
+[[bin]]
+name = "clearml_snug_proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Same rustls stack + version as the reporter, so the two crates share one
+# compiled rustls (0.23, ring backend). Server side terminates the client's TLS;
+# client side opens the upstream leg.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+# Minting the local CA + per-host leaf certs. ring backend to match rustls.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "crypto"] }
+# SHA-256 for the CA SubjectPublicKeyInfo pin (base64(sha256(SPKI))), the value
+# a client passes to `--ignore-certificate-errors-spki-list`. Same ring the
+# rustls/rcgen stack already compiles, so no new native build.
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+httparse = "1"
+# gzip/zstd inflation of compressed h2 bodies (decompress.rs), reused verbatim
+# from the shim. Pure-Rust backends only, same as the shim.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.7"
+# HPACK (HTTP/2 request header) decoding to recover each request's :method/:path
+# on the h2 leg, which the verbatim byte relay never re-frames. Passive: the
+# relayed bytes are untouched, decoding runs on a tee'd copy.
+loona-hpack = "0.4.3"
+base64 = "0.22"
+# The shim's whitelist module (reused verbatim via #[path]) hot-swaps its
+# effective whitelist through an ArcSwap; the proxy only reads it, but the module
+# still compiles the machinery.
+arc-swap = "1"
+# Reuse the shim's in-process reporting path (start_reporter + Descriptor +
+# Event) and wire schema, verbatim.
+clearml_snug_reporter = { path = "../reporter" }
+clearml_snug_messages = { path = "../messages" }

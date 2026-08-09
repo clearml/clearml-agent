@@ -68,6 +68,31 @@ ENV_AGENT_AUTH_TOKEN = EnvironmentConfig("CLEARML_AUTH_TOKEN")
 ENV_AWS_SECRET_KEY = EnvironmentConfig("AWS_SECRET_ACCESS_KEY")
 ENV_AZURE_ACCOUNT_KEY = EnvironmentConfig("AZURE_STORAGE_KEY")
 
+# --- SNUG env vars -----------------------------------------------------
+# Parent-only operator override of the HOCON master switch.
+ENV_AGENT_SNUG_ENABLED = EnvironmentConfig("CLEARML_AGENT_SNUG_ENABLED", type=bool)
+# Parent-only operator override for the report_usage_events HOCON flag.
+ENV_AGENT_SNUG_REPORT_USAGE_EVENTS = EnvironmentConfig(
+    "CLEARML_AGENT_SNUG_REPORT_USAGE_EVENTS", type=bool
+)
+# Parent-only operator override for the report_task_metrics HOCON flag.
+ENV_AGENT_SNUG_REPORT_TASK_METRICS = EnvironmentConfig(
+    "CLEARML_AGENT_SNUG_REPORT_TASK_METRICS", type=bool
+)
+# Parent-only operator override for the initial call_history mode HOCON value
+# ("off" | "collect" | "dump" | "continuous").
+ENV_AGENT_SNUG_CALL_HISTORY = EnvironmentConfig("CLEARML_AGENT_SNUG_CALL_HISTORY")
+# Parent-only operator override for the app-mode profile selector HOCON value
+# (e.g. "claude_desktop"); empty selects no profile, so the app-mode proxy + SDK
+# wrapping stay off. The claude_desktop app image sets this env to turn app-mode
+# metering on without depending on a vault/config-file value.
+ENV_AGENT_SNUG_APP_MODE = EnvironmentConfig("CLEARML_AGENT_SNUG_APP_MODE")
+# CLEARML_AGENT_SNUG_TASK_METRICS_FIELDS (comma-separated) overrides the
+# task_metrics_fields HOCON list. A list value doesn't fit the scalar
+# ENVIRONMENT_CONFIG mapping, so it is read directly from os.environ in
+# _build_descriptor_dict rather than declared as an EnvironmentConfig here.
+# Parent->child: configures the loaded shim. Set by the executioner per task.
+
 ENVIRONMENT_CONFIG = {
     "api.api_server": EnvironmentConfig(
         "CLEARML_API_HOST",
@@ -98,6 +123,11 @@ ENVIRONMENT_CONFIG = {
     "agent.cudnn_version": EnvironmentConfig("CLEARML_CUDNN_VERSION", "TRAINS_CUDNN_VERSION", "CUDNN_VERSION"),
     "agent.cpu_only": EnvironmentConfig(names=("CLEARML_CPU_ONLY", "TRAINS_CPU_ONLY", "CPU_ONLY"), type=bool),
     "agent.crash_on_exception": EnvironmentConfig("CLEARML_AGENT_CRASH_ON_EXCEPTION", type=bool),
+    "agent.snug.enabled": ENV_AGENT_SNUG_ENABLED,
+    "agent.snug.report_usage_events": ENV_AGENT_SNUG_REPORT_USAGE_EVENTS,
+    "agent.snug.report_task_metrics": ENV_AGENT_SNUG_REPORT_TASK_METRICS,
+    "agent.snug.call_history": ENV_AGENT_SNUG_CALL_HISTORY,
+    "agent.snug.app_mode": ENV_AGENT_SNUG_APP_MODE,
     "sdk.aws.s3.key": EnvironmentConfig("AWS_ACCESS_KEY_ID"),
     "sdk.aws.s3.secret": ENV_AWS_SECRET_KEY,
     "sdk.aws.s3.region": EnvironmentConfig("AWS_DEFAULT_REGION"),

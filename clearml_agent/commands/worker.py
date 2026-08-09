@@ -121,6 +121,19 @@ from clearml_agent.helper.check_update import start_check_update_daemon
 from clearml_agent.helper.console import ensure_text, print_text, decode_binary_lines
 from clearml_agent.helper.environment.converters import strtobool
 from clearml_agent.helper.gpu.util import detect_rocm_env
+from clearml_agent.helper.snug import (
+    snug_enabled,
+    resolve_shim_path,
+    resolve_proxy_path,
+    build_shim_descriptor_fd,
+    injection_env_var,
+    macos_dyld_injection_supported,
+)
+from clearml_agent.helper.app_metering import (
+    app_mode_requested,
+    resolve_app_profile,
+    setup_app_metering,
+)
 from clearml_agent.helper.os.daemonize import daemonize_process
 from clearml_agent.helper.package.base import PackageManager, get_specific_package_version
 from clearml_agent.helper.package.conda_api import CondaAPI
@@ -162,6 +175,33 @@ from clearml_agent.commands import bootstrap
 
 DOCKER_ROOT_CONF_FILE = "/tmp/clearml.conf"  # assuming we can always access/mount this file
 DOCKER_DEFAULT_CONF_FILE = "~/default_clearml.conf"
+
+# SNUG env keys whose export into ``os.environ`` must wait until AFTER the SNUG
+# credential descriptor fd is created (see execute_task). Putting ``LD_PRELOAD``
+# in the agent's env before then would cause a helper subprocess forked by the
+# agent (e.g. by git or the package manager) to load the shim before the
+# descriptor exists, so it would start with no reporter (``reporter=stderr``) and
+# emit events to stderr instead of the ClearML UI task log. ``LD_PRELOAD`` is the
+# gating var (without it the shim doesn't load at all); the rest are read by the
+# shim only once loaded, so deferring them together keeps the contract simple.
+# ``CLEARML_SNUG_CRED_FD`` is set in execute_task (not _get_job_os_envs) since the
+# memfd is created at launch time; it is exported alongside the deferred keys.
+_SNUG_DEFERRED_OS_ENVIRON_KEYS = frozenset((
+    "LD_PRELOAD",
+    # macOS preload var; deferred exactly like LD_PRELOAD. Only one of the two
+    # is ever emitted per OS (see snug.injection_env_var()).
+    "DYLD_INSERT_LIBRARIES",
+    "CLEARML_SNUG_CRED_FD",
+    "CLEARML_SNUG_WHITELIST",
+    "CLEARML_SNUG_WHITELIST_ADDITIONS",
+    "CLEARML_SNUG_CALL_HISTORY",
+    "CLEARML_SNUG_CALL_HISTORY_BUFFER",
+    "CLEARML_SNUG_CALL_HISTORY_CAP_BYTES",
+    "CLEARML_PROJECT_ID",
+    "CLEARML_SNUG_DEFAULT_TOKENIZER",
+    "CLEARML_SNUG_PARSE_USAGE",
+    "CLEARML_SNUG_DEBUG_LOG",
+))
 
 
 sys_random = random.SystemRandom()
@@ -1293,6 +1333,18 @@ class Worker(ServiceCommandSection):
                         list(self._extra_docker_arguments or []) + vault_env_args
                     )
 
+            # Mount the SNUG .so into the task container and
+            # tell the in-container agent where to find it. Without this
+            # the LD_PRELOAD path the in-container _get_job_os_envs sets
+            # would point at a path that doesn't exist in the container.
+            snug_docker_args = self._get_snug_docker_args(task_id)
+            if snug_docker_args:
+                docker_params["extra_docker_arguments"] = (
+                    list(docker_params.get("extra_docker_arguments")
+                         or self._extra_docker_arguments or [])
+                    + snug_docker_args
+                )
+
             full_docker_cmd = self.docker_image_func(env_task_id=task_id, **docker_params)
 
             # if we are using the default docker, update back the Task:
@@ -1322,6 +1374,10 @@ class Worker(ServiceCommandSection):
                 '--full-monitoring' if self._services_mode else '--disable-monitoring',
                 '--standalone-mode' if self._standalone_mode else '',
                 task_id)
+
+            # SNUG reporting is in-process: the shim flushes + drains the reporter
+            # on the task's own exit(3), so the container entrypoint needs no
+            # extra drain-wait step.
 
             display_docker_command = DockerArgsSanitizer.sanitize_docker_command(self._session, full_docker_cmd)
 
@@ -2121,7 +2177,8 @@ class Worker(ServiceCommandSection):
 
         # create temp config file with current configuration
         self.temp_config_path = NamedTemporaryFile(
-            suffix=".cfg", prefix=".clearml_agent.", mode='w+t').name
+            suffix=".cfg", prefix=".clearml_agent.", mode='w+t',
+            dir=(ENV_TEMP_STDOUT_FILE_DIR.get() or None)).name
 
         # print docker image
         if use_docker:
@@ -2653,6 +2710,19 @@ class Worker(ServiceCommandSection):
                         restore_key, agent_config[restore_key]
                     ))
                     config["agent"][restore_key] = agent_config[restore_key]
+
+        # Monitoring vault: the backend admin tier that outranks env + file
+        # AND the protected-keys restore above - "if an admin decides we must
+        # monitor something, a user can't override it." Applied as the
+        # highest-priority overlay (after env re-application inside _reload).
+        # Attempted unconditionally (like load_vaults) so an admin can even
+        # enable monitoring on an agent that has it off locally; a backend
+        # without the monitoring vault type is a clean no-op.
+        try:
+            if session.load_monitoring_vault():
+                config = session.config
+        except Exception as ex:
+            print("Error: failed applying monitoring vault: {}".format(ex))
 
         default = config.get("agent.apply_environment", False)
         if ENV_ENABLE_ENV_CONFIG_SECTION.get(default=default):
@@ -3462,8 +3532,51 @@ class Worker(ServiceCommandSection):
 
         print("Environment setup completed successfully\n")
 
-        # update the jobs global environment variable
-        os.environ.update(self._get_job_os_envs(current_task, log_level))
+        # Decide whether SNUG is active for THIS task launch. On macOS, dyld
+        # strips DYLD_INSERT_LIBRARIES for SIP-protected / hardened interpreters
+        # (e.g. the system /usr/bin/python3), which would silently no-op the
+        # shim — or, worse, SIGKILL the task at load under hardened-runtime
+        # library validation. Probe the actual task interpreter and degrade
+        # gracefully (run the task WITHOUT SNUG) when injection won't survive.
+        # No-op on Linux (macos_dyld_injection_supported() short-circuits True).
+        _snug_active = snug_enabled(self._session)
+        if _snug_active:
+            try:
+                _snug_interp = command.argv[0].as_posix()
+            except Exception:
+                _snug_interp = ""
+            if _snug_interp and not macos_dyld_injection_supported(_snug_interp):
+                self.log.warning(
+                    "SNUG: DYLD_INSERT_LIBRARIES cannot be injected into "
+                    "interpreter '{}' (macOS System Integrity Protection / "
+                    "hardened runtime); the instrumentation shim cannot be "
+                    "loaded, so this task will run WITHOUT SNUG metering. Use a "
+                    "Homebrew/pyenv/conda Python (or an interpreter with the "
+                    "com.apple.security.cs.allow-dyld-environment-variables "
+                    "entitlement) to enable it.".format(_snug_interp)
+                )
+                _snug_active = False
+
+        # Compute the job env vars now but DEFER putting any SNUG-related
+        # entries (most importantly LD_PRELOAD / DYLD_INSERT_LIBRARIES) into
+        # os.environ. We must not let the preload var enter the agent's process
+        # env until after the SNUG credential descriptor fd is created below;
+        # otherwise any helper subprocess the agent spawns between here and that
+        # point (e.g. a `git`/HTTP/`apt` child) would load the shim before the
+        # descriptor exists, start with no reporter (reporter=stderr), and emit
+        # events to the agent's stderr instead of reporting them (a violation of
+        # the SNUG event-routing contract).
+        #
+        # Non-SNUG entries (CLEARML_TASK_ID, CLEARML_LOG_LEVEL,
+        # CLEARML_CONFIG_FILE, ...) are still applied immediately so the
+        # rest of the existing setup keeps working unchanged.
+        _job_envs = self._get_job_os_envs(current_task, log_level, snug_active=_snug_active)
+        _snug_deferred_envs = {
+            k: v for k, v in _job_envs.items() if k in _SNUG_DEFERRED_OS_ENVIRON_KEYS
+        }
+        os.environ.update(
+            {k: v for k, v in _job_envs.items() if k not in _SNUG_DEFERRED_OS_ENVIRON_KEYS}
+        )
 
         if repo_info:
             self._update_commit_id(current_task.id, execution, repo_info)
@@ -3496,6 +3609,10 @@ class Worker(ServiceCommandSection):
         else:
             use_execv = is_linux_platform() and not isinstance(self.package_api, (PoetryAPI, UvAPI ,CondaAPI))
 
+        # SNUG imposes no execv constraint: reporting is in-process and the shim
+        # flushes + drains the reporter on the task's own exit(3), so the agent
+        # may execv into the task as usual.
+
         self._session.api_client.tasks.started(
             task=current_task.id,
             status_reason="worker starting task execution",
@@ -3514,6 +3631,129 @@ class Worker(ServiceCommandSection):
                 bash_cwd=script_dir
             )
             stop_signal.start_monitor_thread(polling_interval_sec=self._polling_interval)
+
+        # Build the SNUG credential descriptor and hand it to the shim via an
+        # anonymous memfd BEFORE exporting LD_PRELOAD. The shim (loaded into the
+        # task process via LD_PRELOAD) reads CLEARML_SNUG_CRED_FD at its ctor,
+        # parses the descriptor (creds + task + sink config), closes the fd, and
+        # runs the in-process reporter. No on-disk artifact; the fd is inheritable
+        # so it survives execv (and is passed explicitly via pass_fds on the
+        # non-execv subprocess path below).
+        #
+        # Ordering note: this runs BEFORE the SNUG entries of ``_job_envs``
+        # (LD_PRELOAD, ...) are exported, so the descriptor fd exists before any
+        # subprocess can inherit LD_PRELOAD and load the shim - every shim load
+        # then gets reporter=in_process instead of falling back to stderr.
+        snug_cred_fd = None
+        if _snug_active:
+            try:
+                snug_cred_fd = build_shim_descriptor_fd(
+                    session=self._session,
+                    task_id=current_task.id,
+                    worker_id=getattr(self, "worker_id", "") or "",
+                    user=getattr(current_task, "user", "") or "",
+                    project=getattr(current_task, "project", "") or "",
+                )
+                _snug_deferred_envs["CLEARML_SNUG_CRED_FD"] = str(snug_cred_fd)
+                print("SNUG: in-process reporting (shim links clearml_snug_reporter)")
+            except Exception as ex:
+                print("WARNING: could not build SNUG descriptor: {}".format(ex))
+                snug_cred_fd = None
+
+        # SNUG app-mode: STRICTLY gated so the default agent is byte-identical.
+        # Only when an app profile is selected (agent.snug.app_mode) do we stand
+        # up the metering: launch the
+        # bundled forward proxy (decrypt-all), wrap the app's Electron
+        # launcher(s) to route Chromium through it + trust its CA (via the SPKI the
+        # proxy publishes), and start a watcher that wraps the app's SDK binary the
+        # same way. All of this is app-launch plumbing in helper/app_metering.py
+        # and it deliberately does NOT touch the task-wide env (the proxy/CA env
+        # lives INSIDE the wrapper scripts, not in _get_job_os_envs).
+        app_metering_handle = None
+        _app_mode_name = app_mode_requested(self._session.config)
+        _app_profile = resolve_app_profile(self._session.config)
+        if _app_mode_name:
+            # SNUG app-mode metering is MANDATORY: an app task must never run
+            # un-metered. If app-mode is requested at all (agent.snug.app_mode is
+            # set) we must establish metering or FAIL the task (reported FAILED
+            # with a non-zero exit, like the other fatal setup errors in
+            # execute()) -- never launch the app un-metered. The gate is the raw
+            # requested name, NOT the resolved profile: a name that doesn't
+            # resolve (a typo like 'claude-desktop', or a renamed/removed profile)
+            # must fail closed here, otherwise it would silently skip metering.
+            try:
+                if _app_profile is None:
+                    raise CommandFailedError(
+                        "SNUG app-mode '{}' is set but is not a known app profile; "
+                        "refusing to run the task un-metered".format(_app_mode_name)
+                    )
+                _proxy_bin = resolve_proxy_path()
+                if not _proxy_bin:
+                    raise CommandFailedError(
+                        "SNUG app-mode '{}' enabled but no proxy binary is bundled "
+                        "for this platform; refusing to run the task un-metered".format(
+                            _app_profile.app_id)
+                    )
+                app_metering_handle = setup_app_metering(
+                    profile=_app_profile,
+                    session=self._session,
+                    task_id=current_task.id,
+                    project=getattr(current_task, "project", "") or "",
+                    home=os.path.expanduser("~"),
+                    proxy_bin=_proxy_bin,
+                    config=self._session.config,
+                    worker_id=getattr(self, "worker_id", "") or "",
+                    user=getattr(current_task, "user", "") or "",
+                )
+                if not app_metering_handle.metering_active:
+                    # setup_app_metering already exhausted its bounded retry (a
+                    # fresh port per attempt) and tore down the last proxy, or the
+                    # launcher could not be wrapped -- either way the app would run
+                    # un-metered, which is not allowed.
+                    raise CommandFailedError(
+                        "SNUG app-mode '{}' metering could not be established "
+                        "(no live proxy / launcher not wrapped); refusing to run "
+                        "the task un-metered".format(_app_profile.app_id)
+                    )
+                print("SNUG: app-mode '{}' metering active (proxy + launcher wrapper + sdk wrapper)".format(_app_profile.app_id))
+            except Exception:
+                # Mandatory metering failed. This block runs BEFORE the launch
+                # try/finally, so the finally teardown (below) and the cred-fd
+                # close are never reached on this path -- do both inline here so we
+                # don't orphan the spawned proxy (still holding its loopback port)
+                # or leak the descriptor fd, then re-raise so the task is reported
+                # FAILED and the app is never launched.
+                if app_metering_handle is not None:
+                    try:
+                        app_metering_handle.teardown()
+                    except Exception:
+                        pass
+                    app_metering_handle = None
+                if snug_cred_fd is not None:
+                    try:
+                        os.close(snug_cred_fd)
+                    except OSError:
+                        pass
+                    snug_cred_fd = None
+                raise
+
+        # App-mode metering owns live resources (the proxy child, the SDK watcher,
+        # and the shadowed launcher) that must be torn down / restored when the
+        # task ends. That cleanup runs in the launch block's finally, which the
+        # execv path skips (os.execv replaces this process image, so nothing after
+        # it runs). So when app-mode metering is active, force the monitoring
+        # (subprocess) launch path: it keeps this process alive as the parent and
+        # reaches the finally teardown. No effect on the app's real deployment
+        # (full-monitoring already takes the non-execv path); this just makes the
+        # "execv never enables app-mode" invariant true instead of assumed.
+        if app_metering_handle is not None:
+            use_execv = False
+
+        # The descriptor fd now exists (or SNUG is disabled / setup failed and the
+        # shim's stderr fallback is accepted). It is now safe to export LD_PRELOAD
+        # + CLEARML_SNUG_CRED_FD: any subprocess that inherits them from here on
+        # loads the shim with reporter=in_process.
+        os.environ.update(_snug_deferred_envs)
 
         # check if we need to add encoding to the subprocess
         if sys.getfilesystemencoding() == 'ascii' and not os.environ.get("PYTHONIOENCODING"):
@@ -3542,9 +3782,16 @@ class Worker(ServiceCommandSection):
                     sys.stderr.flush()
                     os.chdir(script_dir)
                     if use_execv:
+                        # The inheritable SNUG descriptor fd (if any) survives
+                        # execv; the shim reads + closes it at its ctor.
                         os.execv(command.argv[0].as_posix(), tuple([command.argv[0].as_posix()])+command.argv[1:])
                     else:
-                        exit_code = command.check_call(cwd=script_dir)
+                        # Pass the SNUG descriptor fd to the task subprocess
+                        # (subprocess close_fds=True would otherwise drop it).
+                        exit_code = command.check_call(
+                            cwd=script_dir,
+                            **({"pass_fds": [snug_cred_fd]} if snug_cred_fd is not None else {}),
+                        )
                         # if we have an on_abort callback still running, wait for it
                         if stop_signal:
                             stop_signal.stop_monitor_thread()
@@ -3567,11 +3814,21 @@ class Worker(ServiceCommandSection):
                     dir=(ENV_TEMP_STDOUT_FILE_DIR.get() or None)
                 )
                 print("Storing stdout and stderr log into [%s]" % temp_stdout_fname)
+                # Forward the SNUG descriptor fd to the task subprocess on this
+                # (monitoring / non-execv) path too. _log_command_output spawns
+                # via subprocess.Popen, whose default close_fds=True drops every
+                # inherited fd except 0/1/2 unless it's in pass_fds — so without
+                # this the shim in the task would find CLEARML_SNUG_CRED_FD
+                # pointing at a closed/reused number and silently fall back to
+                # reporter=stderr (losing all metering). This path is the only
+                # non-execv launch on macOS (use_execv is Linux-gated) and is
+                # also reached by a direct `clearml-agent execute <task>`.
                 exit_code, _ = self._log_command_output(
                     task_id=current_task.id,
                     cmd=command,
                     stdout_path=temp_stdout_fname,
                     cwd=script_dir,
+                    **({"pass_fds": [snug_cred_fd]} if snug_cred_fd is not None else {}),
                 )
         except KeyboardInterrupt:
             self.handle_user_abort(current_task.id)
@@ -3580,10 +3837,38 @@ class Worker(ServiceCommandSection):
             self.log.warning(str(e))
             self.log_traceback(e)
             exit_code = -1
+        finally:
+            # Tear down SNUG app-mode metering (stop the wrapper watcher,
+            # terminate the proxy, and restore the original Electron launcher). In
+            # finally so it runs on EVERY exit from the
+            # launch block: normal return, CalledProcessError, generic Exception,
+            # KeyboardInterrupt, AND the disable_monitoring sys.exit() path — whose
+            # SystemExit is not an Exception, so it escapes both handlers above and
+            # would otherwise orphan the proxy child still holding 127.0.0.1:8888,
+            # blocking the next task's proxy bind. No-op when app-mode was off;
+            # teardown() is idempotent and the guard keeps a stray error from
+            # masking an in-flight exception. Not reached on the execv path (which
+            # never returns here); that path never enables app-mode.
+            if app_metering_handle is not None:
+                try:
+                    app_metering_handle.teardown()
+                except Exception:
+                    pass
 
         # if we have an on_abort callback still running, wait for it
         if stop_signal:
             stop_signal.stop_monitor_thread()
+
+        # Release the agent's copy of the SNUG descriptor fd (the task inherited
+        # its own; the shim closes that one at its ctor). Best-effort; unreachable
+        # on the execv path (which never returns here). Reached by the full-
+        # monitoring path, where the long-lived agent would otherwise leak one fd
+        # per task.
+        if snug_cred_fd is not None:
+            try:
+                os.close(snug_cred_fd)
+            except OSError:
+                pass
 
         # kill leftover processes
         kill_all_child_processes()
@@ -3602,7 +3887,117 @@ class Worker(ServiceCommandSection):
 
         return 1 if exit_code is None else exit_code
 
-    def _get_job_os_envs(self, current_task, log_level):
+    # Stable container-side path where the outer agent mounts the host's
+    # .so. The in-container agent's resolve_shim_path() reads
+    # CLEARML_SNUG_SHIM_PATH (also injected here) and returns this exact
+    # path; everything downstream (_get_job_os_envs, the reporter) then
+    # works just like in direct mode.
+    _SNUG_CONTAINER_SHIM_PATH = "/opt/clearml-snug/libclearml_snug.so"
+
+    def _get_snug_docker_args(self, task_id):
+        # type: (str) -> list
+        """Return the docker-run args needed to make SNUG work inside a
+        task container. Empty list when SNUG is disabled or no shim is
+        available on the host - the docker invocation then proceeds
+        normally without any SNUG-specific changes."""
+        if not snug_enabled(self._session):
+            return []
+        # Docker tasks always run in a LINUX container regardless of the agent
+        # host OS, so we mount the LINUX ``.so`` (NOT the host's ``.so``/``.dylib``)
+        # for the container's arch. This is what lets a NATIVE macOS agent run
+        # ``--docker`` tasks with SNUG: the agent is on Darwin but the task is
+        # Linux, so the proven Linux ``.so`` is what belongs in the container.
+        # ``force_system="Linux"`` resolves it (the container arch matches the
+        # host CPU under Docker Desktop's default native-arch containers; force a
+        # matching ``--platform`` if you run a cross-arch image);
+        # CLEARML_SNUG_SHIM_PATH still overrides. On a Linux agent this is
+        # identical to before.
+        #
+        # NOTE: the shipped Linux ``.so`` is glibc-linked (manylinux2014), so it
+        # loads in glibc task images (python:*-slim, ubuntu, most ML images) but
+        # NOT in Alpine / musl images — SNUG is not supported for musl-libc task
+        # containers (the LD_PRELOAD of a glibc .so there is ignored, so the task
+        # simply runs without metering). Shipping a separate musl .so would be
+        # needed for Alpine.
+        host_shim = resolve_shim_path(force_system="Linux")
+        if not host_shim:
+            return []
+        args = [
+            "-v", "{}:{}:ro".format(host_shim, self._SNUG_CONTAINER_SHIM_PATH),
+            "-e", "CLEARML_SNUG_SHIM_PATH={}".format(self._SNUG_CONTAINER_SHIM_PATH),
+            # Propagate the operator opt-in into the spawned task container.
+            # snug_enabled() on the inner agent otherwise falls back to the
+            # config-file value (typically false) and skips LD_PRELOAD even
+            # though we just mounted the .so for it.
+            "-e", "CLEARML_AGENT_SNUG_ENABLED=true",
+        ]
+        # Propagate the usage-events sink flag into the spawned task
+        # container so the inner agent's reporter (not the outer agent) sees it.
+        _usage_from_cfg = bool(self._session.config.get(
+            "agent.snug.report_usage_events", False
+        ))
+        _usage_from_env = os.environ.get(
+            "CLEARML_AGENT_SNUG_REPORT_USAGE_EVENTS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if _usage_from_cfg or _usage_from_env:
+            args.extend([
+                "-e", "CLEARML_AGENT_SNUG_REPORT_USAGE_EVENTS=true",
+            ])
+        # Propagate the task-metrics sink flag + field list into the spawned
+        # task container (the reporter runs in the inner agent's task). The field list
+        # rides along as a comma-separated env so the inner agent uses the same
+        # fields without depending on its own config file.
+        _task_metrics_from_cfg = bool(self._session.config.get(
+            "agent.snug.report_task_metrics", False
+        ))
+        _task_metrics_from_env = os.environ.get(
+            "CLEARML_AGENT_SNUG_REPORT_TASK_METRICS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if _task_metrics_from_cfg or _task_metrics_from_env:
+            args.extend([
+                "-e", "CLEARML_AGENT_SNUG_REPORT_TASK_METRICS=true",
+            ])
+            _task_metrics_fields = self._session.config.get(
+                "agent.snug.task_metrics_fields", None
+            )
+            if _task_metrics_fields:
+                args.extend([
+                    "-e", "CLEARML_AGENT_SNUG_TASK_METRICS_FIELDS={}".format(
+                        ",".join(str(f) for f in _task_metrics_fields)
+                    ),
+                ])
+        # Call-history initial mode: propagate the resolved value so an operator
+        # setting (env override or config) crosses into the container, where the
+        # inner agent's _get_job_os_envs re-derives CLEARML_SNUG_CALL_HISTORY.
+        _call_history = os.environ.get("CLEARML_AGENT_SNUG_CALL_HISTORY", "").strip()
+        if not _call_history:
+            _call_history = str(self._session.config.get("agent.snug.call_history", "off"))
+        args.extend([
+            "-e", "CLEARML_AGENT_SNUG_CALL_HISTORY={}".format(_call_history),
+        ])
+        # The in-process reporter lives in the mounted .so. The descriptor handoff
+        # is built by the in-container agent (which already has the creds from the
+        # mounted clearml.conf) and passed to the shim via memfd, so nothing extra
+        # crosses the host boundary.
+
+        # No whitelist mount: the whitelist is inline config
+        # (agent.snug.whitelist), so the inner agent re-derives
+        # CLEARML_SNUG_WHITELIST from its own inherited config via
+        # _get_job_os_envs - same model as every other agent.snug.* key.
+        #
+        # TODO(app-mode docker-mode): SNUG app-mode (agent.snug.app_mode) is NOT
+        # wired for --docker yet. It only runs on the in-container / native
+        # execute path, where setup_app_metering launches the bundled proxy and
+        # wraps the app SDK on the SAME host the task runs on. For --docker we
+        # would need to (a) mount the Linux proxy binary via resolve_proxy_path(
+        # force_system="Linux") into the container (mirroring the shim mount
+        # above), (b) run the proxy + SDK-wrapper watcher INSIDE the container
+        # (the app SDK lives there, not on the agent host), and (c) hand the b64
+        # cred to the in-container process. Deferred: the primary app-mode target
+        # is a native (macOS) agent running the task in-process, not --docker.
+        return args
+
+    def _get_job_os_envs(self, current_task, log_level, snug_active=None):
         sdk_env = {
             # config_file updated in session.py
             "task_id": current_task.id,
@@ -3615,6 +4010,109 @@ class Worker(ServiceCommandSection):
             for key, value in sdk_env.items()
             for sdk_key in ENVIRONMENT_SDK_PARAMS[key]
         }
+
+        # SNUG: prepend the shim to the dynamic-linker preload var
+        # (LD_PRELOAD on Linux, DYLD_INSERT_LIBRARIES on macOS) when the operator
+        # opted in AND we have a usable shim. snug_enabled() returns False on any
+        # platform/arch where resolve_shim_path() couldn't find a built shim, so
+        # this block is a no-op there. ``snug_active`` lets the caller force-
+        # disable for THIS launch (e.g. macOS SIP would strip the var for the
+        # task interpreter); defaults to the worker-level gate when not passed.
+        _snug_on = snug_active if snug_active is not None else snug_enabled(self._session)
+        if _snug_on:
+            shim_path = resolve_shim_path()
+            if shim_path:
+                inj_var = injection_env_var()
+                existing = os.environ.get(inj_var, "").strip()
+                envs[inj_var] = (
+                    shim_path if not existing else "{}:{}".format(shim_path, existing)
+                )
+                # Hand the shim the whitelist (base64-encoded inline config)
+                # plus the IDs it needs for header injection. project_id may
+                # be empty (older Tasks, or unavailable in some workflows) -
+                # the shim treats empty IDs as "omit that header line".
+                from clearml_agent.snug.whitelist import build_whitelist_env
+                project_id = getattr(current_task, "project", "") or ""
+                envs["CLEARML_SNUG_WHITELIST"] = build_whitelist_env(
+                    self._session
+                )
+                # Per-task predefine: if the task already carries a
+                # "_snug_whitelist" User Property (set before launch), pass its
+                # raw value to the shim so the additions apply from the FIRST
+                # request (before the reporter's first poll). The shim merges it
+                # onto the immutable base exactly like a live edit, so clearing
+                # the property later still reverts to base. Best-effort.
+                from clearml_agent.helper.snug import (
+                    get_task_user_property,
+                    SNUG_USERPROP_WHITELIST,
+                    SNUG_USERPROP_CALL_HISTORY,
+                    SNUG_CALL_HISTORY_MODES,
+                    ENV_NAME_SNUG_WHITELIST_ADDITIONS,
+                )
+                _wl_predefine = get_task_user_property(
+                    self._session, current_task.id, SNUG_USERPROP_WHITELIST
+                )
+                if _wl_predefine:
+                    envs[ENV_NAME_SNUG_WHITELIST_ADDITIONS] = _wl_predefine
+                # Initial call-history capture mode + ring-buffer knobs (these env
+                # vars seed the value at task start; the mode is then switchable at
+                # runtime via the "_snug_call_history" task User Property). A valid
+                # mode PRE-SET on the task before launch wins over the agent config
+                # default and applies from the first request (mirrors the whitelist
+                # predefine above); an absent or invalid value uses the config.
+                _ch_predefine = (
+                    get_task_user_property(
+                        self._session, current_task.id, SNUG_USERPROP_CALL_HISTORY
+                    )
+                    or ""
+                ).strip().lower()
+                if _ch_predefine in SNUG_CALL_HISTORY_MODES:
+                    envs["CLEARML_SNUG_CALL_HISTORY"] = _ch_predefine
+                else:
+                    envs["CLEARML_SNUG_CALL_HISTORY"] = str(
+                        self._session.config.get("agent.snug.call_history", "off")
+                    )
+                envs["CLEARML_SNUG_CALL_HISTORY_BUFFER"] = str(
+                    self._session.config.get("agent.snug.call_history_buffer", 50)
+                )
+                envs["CLEARML_SNUG_CALL_HISTORY_CAP_BYTES"] = str(
+                    self._session.config.get("agent.snug.call_history_cap_bytes", 262144)
+                )
+                envs["CLEARML_PROJECT_ID"] = project_id
+                # Default tokenizer for hosts the whitelist
+                # doesn't recognize. Setting this means EVERY HTTP/1.x
+                # request gets token estimates, not just ones with
+                # explicit rules. Per-rule "tokenizer" in the whitelist
+                # overrides on a per-host basis.
+                envs["CLEARML_SNUG_DEFAULT_TOKENIZER"] = str(
+                    self._session.config.get(
+                        "agent.snug.default_tokenizer", "approx"
+                    )
+                )
+                # Tell the shim to parse provider-reported token usage from
+                # response bodies, but ONLY when a reporting sink will consume
+                # it (task-metrics or usage). With both sinks off, parsing
+                # would be pure overhead, so we leave the var unset and the shim
+                # does no body parsing at all. The shim parses exact usage only
+                # for the known providers (Anthropic/OpenAI/Gemini); any other
+                # host falls back to the byte-ratio estimate.
+                report_metrics = bool(
+                    self._session.config.get("agent.snug.report_task_metrics", False)
+                )
+                report_usage = bool(
+                    self._session.config.get("agent.snug.report_usage_events", False)
+                )
+                if report_metrics or report_usage:
+                    envs["CLEARML_SNUG_PARSE_USAGE"] = "1"
+                # Verbose per-process [snug] shim diagnostics. The shim reads this
+                # at its ctor (before the descriptor handoff), so it must ride the
+                # environment like the other CLEARML_SNUG_* keys. Default off: when
+                # unset the shim logs errors only (and the single init line in a
+                # reporting process); set to "1" it logs every process's routine
+                # diagnostics.
+                if bool(self._session.config.get("agent.snug.debug_log", False)):
+                    envs["CLEARML_SNUG_DEBUG_LOG"] = "1"
+
         return envs
 
     def _get_task_os_env(self, config, current_task):

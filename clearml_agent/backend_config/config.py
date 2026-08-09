@@ -94,6 +94,9 @@ class Config(object):
         self.config_paths = set()
         self.is_server = is_server
         self._overrides_configs = None
+        # Highest-priority overlay (monitoring vault): applied AFTER the env
+        # re-application in _reload so admin-pushed values beat even env vars.
+        self._priority_overrides_configs = None
 
         if self._verbose:
             print("Config env:%s" % str(self._env))
@@ -193,9 +196,66 @@ class Config(object):
             config, self._read_extra_env_config_values(), copy_trees=True
         )
 
+        # Capture the file-layer SNUG whitelist BEFORE the vault overrides below
+        # replace it (the generic list-merge REPLACES ``rules`` wholesale) — ORDER
+        # IS LOAD-BEARING. ``_apply_snug_whitelist`` re-adds it onto the admin base
+        # afterwards. ``as_plain_ordered_dict`` detaches it from later in-tree
+        # merges; a non-ConfigTree passes through for test fakes.
+        _file_wl = config.get("agent.snug.whitelist", None)
+        file_snug_whitelist = (
+            _file_wl.as_plain_ordered_dict()
+            if hasattr(_file_wl, "as_plain_ordered_dict") else _file_wl
+        )
+
         config = self.resolve_override_configs(config)
 
         config["env"] = env
+
+        # Re-apply ENVIRONMENT_CONFIG-registered env-var overrides on top of
+        # everything else so they survive reloads triggered by callers like
+        # ``load_vaults()`` / ``set_overrides()``. Otherwise the file
+        # defaults loaded above would stomp values that ``Session.__init__``
+        # applied to the in-memory tree from env vars.
+        config = self._apply_environment_overrides(config)
+
+        # Highest-priority overlay (monitoring vault): applied AFTER the env
+        # re-application so admin-pushed monitoring values beat env vars too
+        # (inverts the normal env>vault rule, for this tier only). Lives here
+        # in _reload so it survives every reload, just like the env overrides.
+        config = self.resolve_priority_override_configs(config)
+
+        # SNUG whitelist: union the admin (vault) base with the file's additions,
+        # last so a later reload can't re-drop them (same rationale as the env
+        # re-apply above).
+        config = self._apply_snug_whitelist(config, file_snug_whitelist)
+        return config
+
+    @staticmethod
+    def _apply_environment_overrides(config):
+        # type: (ConfigTree) -> ConfigTree
+        """Apply ``ENVIRONMENT_CONFIG``-registered env vars to ``config``.
+
+        Mirrors the scalar-override loop in ``Session.__init__`` so the same
+        values land in ``config`` on every reload, not just at session
+        construction. Append-style ``.0`` list keys are skipped here to
+        avoid accumulating duplicates across repeated reloads; those are
+        handled once by ``Session.__init__``.
+        """
+        try:
+            from ..definitions import ENVIRONMENT_CONFIG
+        except ImportError:
+            # ``backend_config`` is meant to be usable outside of the
+            # clearml-agent package; tolerate the import being unavailable.
+            return config
+
+        for config_key, env_config in ENVIRONMENT_CONFIG.items():
+            if config_key.endswith('.0'):
+                continue
+            value = env_config.get()
+            if value is None or value == '':
+                continue
+            config.put(config_key, value)
+
         return config
 
     def resolve_override_configs(self, initial=None):
@@ -206,6 +266,40 @@ class Config(object):
             self._overrides_configs,
             initial or ConfigTree(),
         )
+
+    def resolve_priority_override_configs(self, initial=None):
+        # Mirror of resolve_override_configs for the highest-priority overlay
+        # (monitoring vault). Merged on top of file + vault + env so an admin
+        # value cannot be overridden by a user (not even via env var).
+        if not self._priority_overrides_configs:
+            return initial
+        return functools.reduce(
+            lambda cfg, override: ConfigTree.merge_configs(cfg, override, copy_trees=True),
+            self._priority_overrides_configs,
+            initial or ConfigTree(),
+        )
+
+    def _apply_snug_whitelist(self, config, file_whitelist):
+        # type: (ConfigTree, object) -> ConfigTree
+        """Write the admin-protected effective SNUG whitelist into the resolved
+        config: the admin (vault) whitelist is a base the user's file whitelist
+        ADDS to. The generic list-merge in ``resolve_*_override_configs`` instead
+        REPLACES the file's rules with the vault's; this re-materializes the union
+        (see ``clearml_agent.snug.whitelist.resolve_effective_whitelist``).
+
+        No-op when no vault defines a whitelist (the resolved config is already
+        the file's), or when ``clearml_agent.snug`` is unavailable (so
+        ``backend_config`` stays usable standalone)."""
+        try:
+            from clearml_agent.snug.whitelist import resolve_effective_whitelist
+        except ImportError:
+            return config
+        effective = resolve_effective_whitelist(
+            file_whitelist, self._overrides_configs, self._priority_overrides_configs
+        )
+        if effective is not None:
+            config.put("agent.snug.whitelist", pyhocon.ConfigFactory.from_dict(effective))
+        return config
 
     def _read_extra_env_config_values(self) -> ConfigTree:
         """ Loads extra configuration from environment-injected values """
@@ -391,6 +485,21 @@ class Config(object):
     def set_overrides(self, *dicts):
         """ Set several override dictionaries or ConfigTree objects which should be merged onto the configuration """
         self._overrides_configs = [
+            d if isinstance(d, ConfigTree) else pyhocon.ConfigFactory.from_dict(d) for d in dicts
+        ]
+        self.reload()
+
+    def set_priority_overrides(self, *dicts):
+        """Set highest-priority override trees, merged ON TOP of file + vault +
+        env. Used by the monitoring vault so an admin value cannot be overridden
+        by a user (not even via env var). Each call replaces the slot.
+
+        Note: ``ConfigTree.merge_configs`` replaces a list value wholesale. For
+        most keys that gives "admin wins". The SNUG ``agent.snug.whitelist`` is
+        the exception: ``_apply_snug_whitelist`` re-materializes it after the
+        merges so the monitoring vault is an admin BASE the user's file extends,
+        not a hard replace."""
+        self._priority_overrides_configs = [
             d if isinstance(d, ConfigTree) else pyhocon.ConfigFactory.from_dict(d) for d in dicts
         ]
         self.reload()
