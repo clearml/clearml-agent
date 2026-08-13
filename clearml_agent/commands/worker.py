@@ -126,6 +126,7 @@ from clearml_agent.helper.snug import (
     resolve_shim_path,
     resolve_proxy_path,
     build_shim_descriptor_fd,
+    build_shim_descriptor_b64,
     injection_env_var,
     macos_dyld_injection_supported,
 )
@@ -186,12 +187,16 @@ DOCKER_DEFAULT_CONF_FILE = "~/default_clearml.conf"
 # shim only once loaded, so deferring them together keeps the contract simple.
 # ``CLEARML_SNUG_CRED_FD`` is set in execute_task (not _get_job_os_envs) since the
 # memfd is created at launch time; it is exported alongside the deferred keys.
+# ``CLEARML_SNUG_CRED`` (base64 descriptor) is the fd's env-delivered twin, set in
+# execute_task only for app-launcher tasks whose real workload runs in a child the
+# single-use fd can't reach (see the CLEARML_SNUG_CRED block there).
 _SNUG_DEFERRED_OS_ENVIRON_KEYS = frozenset((
     "LD_PRELOAD",
     # macOS preload var; deferred exactly like LD_PRELOAD. Only one of the two
     # is ever emitted per OS (see snug.injection_env_var()).
     "DYLD_INSERT_LIBRARIES",
     "CLEARML_SNUG_CRED_FD",
+    "CLEARML_SNUG_CRED",
     "CLEARML_SNUG_WHITELIST",
     "CLEARML_SNUG_WHITELIST_ADDITIONS",
     "CLEARML_SNUG_CALL_HISTORY",
@@ -202,6 +207,16 @@ _SNUG_DEFERRED_OS_ENVIRON_KEYS = frozenset((
     "CLEARML_SNUG_PARSE_USAGE",
     "CLEARML_SNUG_DEBUG_LOG",
 ))
+
+# Entry point of the platform's generic app launcher (apiserver injects it as the
+# task script for launcher-managed apps). Such a task's process is the launcher,
+# which consumes the single-use SNUG cred fd at its own shim ctor and then spawns
+# the real workload as a separate child that inherits neither the fd nor the
+# (already-stripped) CLEARML_SNUG_CRED_FD env — so the workload's shim would fall
+# back to reporter=stderr and drop all metering. For these tasks the descriptor is
+# ALSO delivered via the reusable CLEARML_SNUG_CRED env, which survives the child
+# spawn (see build_shim_descriptor_b64 and the shim's descriptor_from_cred_env).
+_APP_LAUNCHER_ENTRY_POINT = "clearml_app_launcher.py"
 
 
 sys_random = random.SystemRandom()
@@ -3655,6 +3670,26 @@ class Worker(ServiceCommandSection):
                     project=getattr(current_task, "project", "") or "",
                 )
                 _snug_deferred_envs["CLEARML_SNUG_CRED_FD"] = str(snug_cred_fd)
+                # App-launcher tasks: the launcher process (this task's script)
+                # consumes the single-use cred fd at its own shim ctor and then
+                # spawns the real workload as a child that inherits nothing, so the
+                # fd never reaches the process that makes the LLM calls. Deliver the
+                # descriptor via the reusable base64 env too — it survives the
+                # child spawn and the shim's descriptor_from_cred_env fallback picks
+                # it up (reporter=in_process). Gated on the launcher entry point so
+                # ordinary tasks keep the fd-only path (creds stay out of the env).
+                try:
+                    _entry_point = (getattr(execution, "entry_point", "") or "").strip()
+                except Exception:
+                    _entry_point = ""
+                if os.path.basename(_entry_point) == _APP_LAUNCHER_ENTRY_POINT:
+                    _snug_deferred_envs["CLEARML_SNUG_CRED"] = build_shim_descriptor_b64(
+                        session=self._session,
+                        task_id=current_task.id,
+                        worker_id=getattr(self, "worker_id", "") or "",
+                        user=getattr(current_task, "user", "") or "",
+                        project=getattr(current_task, "project", "") or "",
+                    )
                 print("SNUG: in-process reporting (shim links clearml_snug_reporter)")
             except Exception as ex:
                 print("WARNING: could not build SNUG descriptor: {}".format(ex))
