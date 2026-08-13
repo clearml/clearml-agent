@@ -85,6 +85,7 @@ from clearml_agent.definitions import (
     ENV_ABORT_CALLBACK_CMD_TIMEOUT,
     ENV_QUEUE_POLL_FREQ_SEC,
     ENV_STATUS_REPORT_FREQ_SEC,
+    ENV_GPU_FRACTIONS,
 )
 from clearml_agent.definitions import WORKING_REPOSITORY_DIR, PIP_EXTRA_INDICES
 from clearml_agent.errors import (
@@ -1038,6 +1039,9 @@ class Worker(ServiceCommandSection):
         self._impersonate_as_task_owner = None
         self._worker_tags = None
         self._dynamic_gpus = None  # valid options, True/False, "fractional"
+        self._dynamic_gpus_reservations = {}
+        self._dynamic_gpus_reservation_ttl = float(
+            self._session.config.get("agent.dynamic_gpus_reservation_timeout_sec", 600))
         self._force_current_version = None
         self._redirected_stdout_file_no = None
         self._uptime_config = self._session.config.get("agent.uptime", None)
@@ -1754,9 +1758,12 @@ class Worker(ServiceCommandSection):
 
                                 try:
                                     from clearml_agent_fractional_gpu import patch_docker_cmd_gpu_fraction  # noqa
-                                    # new docker image func
-                                    self._patch_docker_cmd_func = lambda docker_cmd: (
-                                        patch_docker_cmd_gpu_fraction(docker_cmd, gpu_fraction=fractions[0]))
+                                    # bind the fraction now (the loop variables are reused across iterations)
+                                    _gpu_fraction = fractions[0]
+                                    self._patch_docker_cmd_func = (
+                                        lambda docker_cmd, _f=_gpu_fraction: self._docker_cmd_set_env(
+                                            patch_docker_cmd_gpu_fraction(docker_cmd, gpu_fraction=_f),
+                                            ENV_GPU_FRACTIONS.vars[0], _f))
                                 except Exception:
                                     print("Error! could not load clearml_agent_fractional_gpu module! "
                                           "failed configuring fractional GPU support")
@@ -1784,11 +1791,25 @@ class Worker(ServiceCommandSection):
                                 dict_task_gpus_ids.update({str(g): task_id for g in gpu_idx_fract})
                                 self.worker_id = ':'.join(
                                     self.worker_id.split(':')[:-1] + ['gpu'+','.join(str(g) for g in gpu_idx_fract)])
+                                # locally reserve the fractional slice(s) until the child container
+                                # registers on the server, so we don't over-pull onto the same GPU
+                                self._reserve_dynamic_gpus(gpu_idx_fract, fractions)
                             else:
                                 # update the task list
                                 dict_task_gpus_ids.update({str(g): task_id for g in gpus})
                                 self.worker_id = ':'.join(
                                     self.worker_id.split(':')[:-1] + ['gpu'+','.join(str(g) for g in gpus)])
+                                self._reserve_dynamic_gpus([str(g) for g in gpus], fractions)
+                                # whole-GPU dynamic slot: report its fraction (1.0 per GPU)
+                                # explicitly so the container's ResourceMonitor does not rely on
+                                # the server's 1.0 default and stays consistent with the daemon's
+                                # 0.0 and the fractional slot's explicit value. Only applied in
+                                # docker-mode (where _patch_docker_cmd_func is consumed).
+                                if fractions and self._patch_docker_cmd_func is None:
+                                    _slot_fractions = ",".join(str(f) for f in fractions)
+                                    self._patch_docker_cmd_func = (
+                                        lambda docker_cmd, _v=_slot_fractions: self._docker_cmd_set_env(
+                                            docker_cmd, ENV_GPU_FRACTIONS.vars[0], _v))
 
                         self.send_logs(
                             task_id=task_id,
@@ -1892,9 +1913,61 @@ class Worker(ServiceCommandSection):
                 except (ValueError, TypeError):
                     print("INFO: failed parsing GPU int('{}') - skipping".format(g))
 
+        # account for tasks we just launched that have not yet registered as workers on the
+        # server (otherwise we would see the GPU as free and over-pull onto it before the
+        # child container comes up). This also drops reservations that already registered or
+        # that exceeded the TTL.
+        self._account_pending_gpu_reservations(gpus, allocated_gpus)
+
         # remove the GPUs we have workers running on
         available_gpus = {g: (v - gpus.get(g, 0)) for g, v in gpu_indexes.items() if (v - gpus.get(g, 0)) > 0}
         return available_gpus, allocated_gpus
+
+    def _reserve_dynamic_gpus(self, gpu_suffixes, fractions):
+        # type: (List[str], List[float]) -> None
+        """
+        Record a local reservation for each just-launched dynamic-GPU allocation, keyed by the
+        GPU suffix that the child container will register with (e.g. "0.5a" for a fractional
+        slice, or "0" for a whole GPU). The reservation is subtracted from the computed
+        availability by _account_pending_gpu_reservations() until the child registers on the
+        server (or the TTL elapses), preventing the daemon from over-pulling tasks onto a GPU.
+        """
+        now = time()
+        for gpu_suffix, fraction in zip(gpu_suffixes, fractions):
+            gpu_suffix = str(gpu_suffix)
+            # the GPU index is the leading integer of the suffix ("0.5a" -> "0", "0" -> "0")
+            gpu_idx = gpu_suffix.split(".")[0]
+            self._dynamic_gpus_reservations[gpu_suffix] = (gpu_idx, float(fraction), now)
+
+    def _account_pending_gpu_reservations(self, gpus, allocated_gpus):
+        # type: (dict, dict) -> None
+        """
+        Fold locally-reserved (just-launched, not-yet-registered) allocations into the
+        server-derived usage maps, and release reservations that are no longer pending.
+
+        :param gpus: {gpu_index: used_fraction} accumulated from registered workers; mutated
+            in place to also include still-pending reservations.
+        :param allocated_gpus: {gpu_suffix: fraction} of registered workers; mutated in place
+            to also include still-pending reservations.
+
+        A reservation is released (dropped) when either:
+          * its suffix already appears in ``allocated_gpus`` (the child registered on the
+            server, so the server accounting now covers it), or
+          * it has been held longer than ``self._dynamic_gpus_reservation_ttl`` (a launch that
+            never registered, e.g. it failed to come up).
+        """
+        if not self._dynamic_gpus_reservations:
+            return
+        now = time()
+        for gpu_suffix in list(self._dynamic_gpus_reservations.keys()):
+            gpu_idx, fraction, reserved_ts = self._dynamic_gpus_reservations[gpu_suffix]
+            if gpu_suffix in allocated_gpus or (now - reserved_ts) >= self._dynamic_gpus_reservation_ttl:
+                # child registered on the server, or reservation expired -> stop tracking locally
+                self._dynamic_gpus_reservations.pop(gpu_suffix, None)
+                continue
+            # still pending: count the reserved fraction as used so we do not over-pull
+            gpus[gpu_idx] = gpus.get(gpu_idx, 0) + fraction
+            allocated_gpus[gpu_suffix] = fraction
 
     def _setup_dynamic_gpus(self, gpu_queues, gpu_indexes):
         available_gpus = self.get_runtime_properties()
@@ -2383,6 +2456,7 @@ class Worker(ServiceCommandSection):
 
     def new_monitor(self, report=None):
         self.stop_monitor()
+        daemon_gpu_fractions = "0" if (self.is_daemon and self._dynamic_gpus) else None
         self.monitor = ResourceMonitor(
             session=self._session,
             worker_id=self.worker_id,
@@ -2390,6 +2464,7 @@ class Worker(ServiceCommandSection):
             report_frequency_sec=self._machine_update_interval,
             worker_tags=None if self._services_mode else self._worker_tags,
             report_daemon=self.is_daemon,
+            gpu_fractions=daemon_gpu_fractions,
         )
         self.monitor.set_report(report)
         self.monitor.start()
@@ -5627,6 +5702,23 @@ class Worker(ServiceCommandSection):
                 continue
             args += ["-e", "{}={}".format(key, "" if value is None else value)]
         return args
+
+    @staticmethod
+    def _docker_cmd_set_env(docker_cmd, name, value):
+        # type: (List[str], str, object) -> List[str]
+        """
+        Return a copy of ``docker_cmd`` with an extra ``-e NAME=VALUE`` inserted right after the
+        docker ``run`` subcommand (i.e. before the image name and the in-container command), so
+        the environment variable is passed into the launched task container.
+        """
+        docker_cmd = list(docker_cmd)
+        try:
+            insert_at = docker_cmd.index("run") + 1
+        except ValueError:
+            # unexpected command shape; fall back to inserting right after the executable
+            insert_at = 1
+        docker_cmd[insert_at:insert_at] = ["-e", "{}={}".format(name, value)]
+        return docker_cmd
 
     def _get_docker_cmd(
             self,

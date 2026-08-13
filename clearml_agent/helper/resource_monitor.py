@@ -77,6 +77,7 @@ class ResourceMonitor(object):
         first_report_sec=None,
         worker_tags=None,
         report_daemon=False,  # type: bool
+        gpu_fractions=None,  # type: Optional[str]
     ):
         self.session = session
         self.queue = deque(maxlen=1)
@@ -101,7 +102,9 @@ class ResourceMonitor(object):
             self._default_gpu_utilization = int(self._default_gpu_utilization)
         self._gpu_utilization_warning_sent = False
         self._disk_use_path = str(session.config.get("agent.resource_monitoring.disk_use_path", None) or Path.home())
-        self._fractions_handler = GpuFractionsHandler() if session.feature_set != "basic" else None
+        self._fractions_handler = (
+            GpuFractionsHandler(gpu_fractions=gpu_fractions) if session.feature_set != "basic" else None
+        )
         if not worker_tags and ENV_WORKER_TAGS.get():
             worker_tags = shlex.split(ENV_WORKER_TAGS.get())
         self._worker_tags = worker_tags
@@ -586,7 +589,14 @@ class GpuFractionsHandler:
         "NVIDIA-L4": 48,
     }
 
-    def __init__(self):
+    def __init__(self, gpu_fractions=None):
+        # type: (Optional[str]) -> None
+        # gpu_fractions: optional explicit fractions string, same format as the
+        # CLEARML_AGENT_GPU_FRACTIONS env var (e.g. "0", "0.5" or "0.5,0.5"). When None the
+        # value is read from ENV_GPU_FRACTIONS. This lets the dynamic-GPU manager daemon force
+        # its OWN monitor to report "0" (it is a manager, not a GPU consumer) WITHOUT mutating
+        # the process environment, which would otherwise leak into launched child agents.
+        self._gpu_fractions_override = gpu_fractions
         self._total_memory_gb = [
             (self._gpu_name_to_memory_gb.get(name.upper().replace(" ", "-")) or
              self._gpu_name_to_memory_gb.get("NVIDIA-"+name.upper().replace(" ", "-"), 0))
@@ -605,7 +615,13 @@ class GpuFractionsHandler:
 
         # With CFGI: the env variable below contains a list of fractions of GPU allocated, where every item maxes to 1.000, this is to avoid reporting squared GPUs
         # With MIG: the env variable below contains a dict of mig topologies
-        fractions = (ENV_GPU_FRACTIONS.get() or "").strip()
+        # An explicit override (e.g. the manager daemon forcing "0") wins over the env var.
+        # Note: "0" is a valid, non-empty value -> parsed to [0.0]; only an empty/missing value
+        # falls back to [1.0].
+        if self._gpu_fractions_override is not None:
+            fractions = self._gpu_fractions_override.strip()
+        else:
+            fractions = (ENV_GPU_FRACTIONS.get() or "").strip()
         if not fractions:
             # No fractions
             return [1.0]
