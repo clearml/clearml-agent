@@ -85,11 +85,14 @@ def _make_launcher(tmp_path, name=_CLAUDE_LAUNCHER_BASENAME,
 
 def test_render_sdk_wrapper_content():
     w = am.render_sdk_wrapper("http://127.0.0.1:8888", "snug_ca.pem", "claude")
-    # Shebang + the three exports + exec of the real binary beside the wrapper.
+    # Shebang + CA/proxy exports + loopback bypass + exec of the real binary.
     assert w.startswith("#!/bin/sh\n")
     assert 'export NODE_EXTRA_CA_CERTS="$DIR/snug_ca.pem"' in w
     assert 'export HTTPS_PROXY="http://127.0.0.1:8888"' in w
     assert 'export HTTP_PROXY="http://127.0.0.1:8888"' in w
+    # Loopback bypass so an app's own 127.0.0.1 proxy isn't double-proxied.
+    assert 'export NO_PROXY="localhost,127.0.0.1,::1"' in w
+    assert 'export no_proxy="localhost,127.0.0.1,::1"' in w
     assert 'exec "$DIR/claude.real" "$@"' in w
     # Must NOT set SSL_CERT_FILE (bun ignores it and it would REPLACE the store).
     assert "SSL_CERT_FILE" not in w
@@ -1558,8 +1561,11 @@ def test_resolve_app_profile_variants():
     # (a) app_mode names the profile to enable.
     p = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "claude_desktop"}))
     assert p is not None and p.app_id == "claude_desktop"
+    # (a2) opencode is a second registered profile.
+    p2 = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"}))
+    assert p2 is not None and p2.app_id == "opencode"
     # (b) an app_mode naming a profile that isn't registered -> None (not an error).
-    assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"})) is None
+    assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "cursor"})) is None
     # (c) empty / unset -> None so a plain agent is unaffected.
     assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": ""})) is None
     assert am.resolve_app_profile(_FakeConfig()) is None
@@ -1725,3 +1731,119 @@ def test_whitelist_union_adds_profile_hosts():
     # config's non-colliding host + its default_action are preserved.
     assert "api.openai.com" in [r["host"] for r in merged["rules"]]
     assert merged["default_action"] == "ignore"
+
+
+# ===========================================================================
+# -- OpenCode: explicit_path discovery + the second (launcher-less) profile --
+# OpenCode is a bun/BoringSSL binary the LD_PRELOAD shim can't hook, so it is
+# metered via the app-mode forward proxy like Claude Desktop — but with no
+# Electron launcher and a fixed-path SDK on PATH (explicit_path discovery).
+# ===========================================================================
+
+_OPENCODE_PROFILE = am.BUILTIN_PROFILES["opencode"]
+_OPENCODE_SDK = _OPENCODE_PROFILE.sdk_binaries[0]
+
+
+def _explicit_sdk(dirs, binary_name="opencode"):
+    return am.SdkBinary(
+        binary_name=binary_name,
+        discovery="explicit_path",
+        explicit_dirs=tuple(dirs),
+        watched=True,
+        wrapper_kind="node_bun",
+    )
+
+
+def test_find_sdk_dirs_explicit_path_matches_elf(tmp_path):
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "opencode").write_bytes(_FAKE_ELF)
+    assert am.find_sdk_dirs(str(tmp_path), _explicit_sdk([str(d)])) == [str(d)]
+
+
+def test_find_sdk_dirs_explicit_path_follows_symlink(tmp_path):
+    # The real binary lives elsewhere; the on-PATH entry is a symlink to it.
+    # find_sdk_dirs must return the SYMLINK's dir (that's where the wrapper +
+    # `.real`/CA go and where $(dirname "$0") lands) — isfile/_is_elf follow it.
+    real = tmp_path / "opt" / "opencode"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(_FAKE_ELF)
+    usrbin = tmp_path / "usr-local-bin"
+    usrbin.mkdir()
+    os.symlink(str(real), str(usrbin / "opencode"))
+    assert am.find_sdk_dirs(str(tmp_path), _explicit_sdk([str(usrbin)])) == [str(usrbin)]
+
+
+def test_find_sdk_dirs_explicit_path_skips_already_wrapped(tmp_path):
+    # A dir whose `opencode` is our #!/bin/sh wrapper (not an ELF) is skipped ->
+    # idempotent, no re-wrap.
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "opencode").write_text("#!/bin/sh\nexec ./opencode.real\n")
+    assert am.find_sdk_dirs(str(tmp_path), _explicit_sdk([str(d)])) == []
+
+
+def test_find_sdk_dirs_explicit_path_missing_dir(tmp_path):
+    assert am.find_sdk_dirs(str(tmp_path), _explicit_sdk([str(tmp_path / "nope")])) == []
+
+
+def test_find_sdk_dirs_explicit_path_ignores_home_arg(tmp_path):
+    # `home` is irrelevant for explicit_path: a bogus home still finds the
+    # absolute dir (the watcher passes each home root; only explicit_dirs matter).
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "opencode").write_bytes(_FAKE_ELF)
+    assert am.find_sdk_dirs("/no/such/home", _explicit_sdk([str(d)])) == [str(d)]
+
+
+def test_install_sdk_wrapper_on_symlinked_binary(tmp_path):
+    # opencode shape: /usr/local/bin/opencode is a symlink to the real ELF.
+    # Wrapping renames the SYMLINK to opencode.real (still -> the ELF) and drops
+    # the wrapper + CA in the on-PATH dir so $(dirname "$0") resolves them.
+    real = tmp_path / "opt" / "opencode"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(_FAKE_ELF)
+    os.chmod(str(real), 0o755)
+    usrbin = tmp_path / "usr-local-bin"
+    usrbin.mkdir()
+    os.symlink(str(real), str(usrbin / "opencode"))
+    ca_src = _write_ca(tmp_path)
+    sdk = _explicit_sdk([str(usrbin)])
+
+    assert am.install_sdk_wrapper(str(usrbin), ca_src, "http://127.0.0.1:8888", sdk) is True
+    body = (usrbin / "opencode").read_text()
+    assert body.startswith("#!/bin/sh\n")
+    assert 'exec "$DIR/opencode.real" "$@"' in body
+    # The preserved `.real` is the renamed symlink and still points at the ELF.
+    assert os.path.islink(str(usrbin / "opencode.real"))
+    assert os.path.realpath(str(usrbin / "opencode.real")) == str(real)
+    assert (usrbin / "snug_ca.pem").exists()
+    # Idempotent: the name is now our wrapper (not an ELF) -> second call no-ops.
+    assert am.install_sdk_wrapper(str(usrbin), ca_src, "http://127.0.0.1:8888", sdk) is False
+
+
+def test_builtin_opencode_profile_golden():
+    # GOLDEN VALUE: lock the OpenCode profile so a refactor can't silently drift
+    # the launcher-less / fixed-path / decrypt-only-providers shape.
+    prof = am.BUILTIN_PROFILES["opencode"]
+    assert prof.app_id == "opencode"
+    assert prof.launchers == ()          # no Electron/Chromium leg
+    (sdk,) = prof.sdk_binaries
+    assert sdk.binary_name == "opencode"
+    assert sdk.discovery == "explicit_path"
+    assert sdk.explicit_dirs == ("/usr/local/bin",)
+    assert sdk.watched is True           # setup wraps SDKs only via the watcher
+    assert sdk.wrapper_kind == "node_bun"
+    assert prof.default_tokenizer == "approx"
+    assert prof.external_oauth_browser is False   # BYO API key, no browser OAuth
+    assert prof.decrypt_all is False              # decrypt only known providers
+    assert prof.h2_assumed_host is None
+    assert prof.whitelist_contribution == ()      # 3 providers are known hosts
+
+
+def test_opencode_profile_starts_watcher_not_launcher():
+    # A launcher-less profile with a WATCHED SDK: setup must start the SDK
+    # watcher (the only thing that wraps SDKs) and not gate on any launcher.
+    prof = am.BUILTIN_PROFILES["opencode"]
+    assert prof.launchers == ()
+    assert any(getattr(s, "watched", False) for s in prof.sdk_binaries)

@@ -72,23 +72,31 @@ from clearml_agent.snug.whitelist import build_whitelist_env
 # with a proxy wrapper.
 #   binary_name           : the on-disk basename to shadow (e.g. "claude").
 #   discovery             : how to find its dir(s):
-#                             "home_glob"   — walk home roots for the app's SDK
-#                                             layout (the re-downloaded-SDK case).
-#                             "path_lookup" / "explicit_path" — reserved; not yet
-#                                             implemented (raise on use).
+#                             "home_glob"     — walk home roots for the app's SDK
+#                                               layout (the re-downloaded-SDK case).
+#                             "explicit_path" — the binary is baked at a fixed
+#                                               path in the image; check the dirs
+#                                               named in `explicit_dirs`.
+#                             "path_lookup"   — reserved; not implemented (raise).
 #   container_substr      : home_glob only — the SDK dir's grandparent must
 #                           contain this substring (e.g. "claude-code").
 #   expects_version_parent: home_glob only — require an intermediate version dir.
-#   watched               : re-install the wrapper on a poll (app re-downloads the
-#                           SDK) vs one-shot.
+#   explicit_dirs         : explicit_path only — absolute dirs to shadow the
+#                           binary in. Wrap the dir the app INVOKES (a PATH entry,
+#                           symlink and all), NOT a symlink's target dir: the
+#                           wrapper finds its `.real`/CA siblings via
+#                           $(dirname "$0"), which is the invoked path's dir.
+#   watched               : re-install the wrapper on a poll — needed both when
+#                           the app re-downloads the SDK and because setup wraps
+#                           SDKs only via the watcher (there is no one-shot wrap).
 #   wrapper_kind          : which wrapper env recipe to inject. Only "node_bun"
 #                           (NODE_EXTRA_CA_CERTS + HTTPS_PROXY) is implemented.
 SdkBinary = namedtuple(
     "SdkBinary",
     ["binary_name", "discovery", "container_substr",
-     "expects_version_parent", "watched", "wrapper_kind"],
+     "expects_version_parent", "watched", "wrapper_kind", "explicit_dirs"],
 )
-SdkBinary.__new__.__defaults__ = ("", False, False, "node_bun")
+SdkBinary.__new__.__defaults__ = ("", False, False, "node_bun", ())
 
 # An Electron/Chromium launcher we shadow to route the renderer through the proxy.
 #   path : absolute path of the launcher to shadow.
@@ -165,6 +173,36 @@ BUILTIN_PROFILES = {
                 "provider": "anthropic",
             },
         ),
+    ),
+    # OpenCode: a single bun-compiled standalone CLI. Bun statically links
+    # BoringSSL, so the LD_PRELOAD shim can't hook it (same reason Claude
+    # Desktop's SDK needs the proxy). No Electron/Chromium leg — the LLM path IS
+    # the CLI. The image bakes the binary at /root/.opencode/bin/opencode and
+    # every session launches it as `opencode`, resolved through the
+    # /usr/local/bin/opencode symlink on PATH; we shadow it in that PATH dir
+    # (where $(dirname "$0") lands), so its provider HTTPS routes through the
+    # proxy. decrypt_all is off: only the three known providers
+    # (api.anthropic.com / api.openai.com / generativelanguage.googleapis.com)
+    # are decrypted + metered; OpenCode's other egress (git, package installs,
+    # MCP) is blind-tunnelled untouched. external_oauth_browser is off — metering
+    # a user-supplied API key needs no system-browser CA trust.
+    "opencode": AppProfile(
+        app_id="opencode",
+        launchers=(),
+        sdk_binaries=(
+            SdkBinary(
+                binary_name="opencode",
+                discovery="explicit_path",
+                explicit_dirs=("/usr/local/bin",),
+                watched=True,
+                wrapper_kind="node_bun",
+            ),
+        ),
+        default_tokenizer="approx",
+        external_oauth_browser=False,
+        decrypt_all=False,
+        h2_assumed_host=None,
+        whitelist_contribution=(),
     ),
 }
 
@@ -276,6 +314,9 @@ def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_b
         existing roots — exactly what we want.
       - ``HTTPS_PROXY`` / ``HTTP_PROXY`` — point outbound requests at the local
         proxy.
+      - ``NO_PROXY`` / ``no_proxy`` — exempt loopback. An app may itself run a
+        local proxy on 127.0.0.1 (OpenCode's session_proxy does); routing that
+        loopback call back through this proxy would double-proxy or dead-loop it.
 
     ``$(dirname "$0")`` resolves paths relative to the wrapper itself so the CA
     and the real binary are found wherever the (possibly re-downloaded, possibly
@@ -295,6 +336,10 @@ def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_b
         'export NODE_EXTRA_CA_CERTS="$DIR/{ca}"\n'
         'export HTTPS_PROXY="{proxy}"\n'
         'export HTTP_PROXY="{proxy}"\n'
+        '# Loopback must bypass the proxy: the app may run its own local proxy on\n'
+        '# 127.0.0.1, so proxying that call would double-proxy or dead-loop it.\n'
+        'export NO_PROXY="localhost,127.0.0.1,::1"\n'
+        'export no_proxy="localhost,127.0.0.1,::1"\n'
         'exec "$DIR/{real}" "$@"\n'
     ).format(ca=ca_filename, proxy=proxy_url, real=_real_name(binary_name))
 
@@ -320,8 +365,9 @@ def candidate_home_roots(home):
 
 def find_sdk_dirs(home, sdk):
     # type: (str, SdkBinary) -> List[str]
-    """Return the SDK dirs under ``home`` that hold a not-yet-wrapped ``sdk``
-    binary and therefore need wrapping.
+    """Return the SDK dirs (under ``home`` for ``home_glob``; absolute for
+    ``explicit_path``) that hold a not-yet-wrapped ``sdk`` binary and therefore
+    need wrapping.
 
     Dispatch on ``sdk.discovery``:
       - ``home_glob`` — the re-downloaded-SDK layout
@@ -330,10 +376,22 @@ def find_sdk_dirs(home, sdk):
         binary) — a dir we already wrapped has a ``#!/bin/sh`` binary there
         instead, so it is skipped (idempotent). Best-effort; missing dirs are
         simply absent from the walk.
-      - ``path_lookup`` / ``explicit_path`` — reserved for apps whose SDK is a
-        single binary on PATH / at a fixed path; not yet implemented (a real
-        second app of that shape adds the mode here).
+      - ``explicit_path`` — the binary is baked at a fixed location, so we check
+        each dir in ``sdk.explicit_dirs`` directly (``home`` is ignored: the
+        paths are absolute). Same ELF-vs-wrapper idempotency as home_glob; a
+        symlinked binary counts (``isfile``/``_is_elf`` follow it), which is the
+        on-PATH case we wrap. The watcher calls this once per home root and
+        dedups, so returning the same absolute dir each call is harmless.
+      - ``path_lookup`` — reserved for a PATH-resolved single binary; not yet
+        implemented (a real app of that shape adds the mode here).
     """
+    if sdk.discovery == "explicit_path":
+        matches = []  # type: List[str]
+        for d in sdk.explicit_dirs:
+            bin_path = os.path.join(d, sdk.binary_name)
+            if os.path.isfile(bin_path) and _is_elf(bin_path):
+                matches.append(d)
+        return matches
     if sdk.discovery != "home_glob":
         _cd_log("SDK discovery mode {!r} not implemented (binary {!r})".format(
             sdk.discovery, sdk.binary_name))

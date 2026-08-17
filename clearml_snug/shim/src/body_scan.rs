@@ -517,21 +517,59 @@ fn extract_usage(provider: Provider, v: &Value) -> Usage {
                 None => Usage::default(),
             }
         }
-        Provider::OpenAi => match v.get("usage") {
-            // Streaming chunks carry `"usage": null` until the final one;
-            // require an object so nulls are skipped.
-            Some(u) if u.is_object() => Usage {
-                input: u.get("prompt_tokens").and_then(Value::as_u64),
-                output: u.get("completion_tokens").and_then(Value::as_u64),
-                ..Usage::default()
-            },
-            _ => Usage::default(),
-        },
+        Provider::OpenAi => {
+            // Two OpenAI wire shapes:
+            //   * Chat Completions: top-level `usage.{prompt_tokens,
+            //     completion_tokens}`.
+            //   * Responses API (the GPT-5 family / reasoning models): usage is
+            //     `input_tokens`/`output_tokens`, sitting top-level on the
+            //     non-streaming response object, or nested under `response.usage`
+            //     on the streaming `response.completed`/`response.incomplete`
+            //     event. Read both so a Responses-API client (e.g. OpenCode) is
+            //     metered, not just Chat Completions.
+            let u = v
+                .get("usage")
+                .or_else(|| v.get("response").and_then(|r| r.get("usage")));
+            match u {
+                // Streaming chunks carry `"usage": null` until the final one;
+                // require an object so nulls are skipped.
+                Some(u) if u.is_object() => Usage {
+                    input: u
+                        .get("prompt_tokens")
+                        .or_else(|| u.get("input_tokens"))
+                        .and_then(Value::as_u64),
+                    output: u
+                        .get("completion_tokens")
+                        .or_else(|| u.get("output_tokens"))
+                        .and_then(Value::as_u64),
+                    // Cached portion of the (cache-inclusive) input: Chat
+                    // Completions `prompt_tokens_details.cached_tokens`, Responses
+                    // API `input_tokens_details.cached_tokens`. The reporter folds
+                    // this into the task-metrics scalars only (fresh = input -
+                    // cache_read); the report_llm_usage billing event carries just
+                    // tokens_in/out. OpenAI auto-caches with no explicit write, so
+                    // cache_write stays None.
+                    cache_read: u
+                        .get("prompt_tokens_details")
+                        .or_else(|| u.get("input_tokens_details"))
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64),
+                    cache_write: None,
+                },
+                _ => Usage::default(),
+            }
+        }
         Provider::Gemini => match v.get("usageMetadata") {
             Some(u) => Usage {
                 input: u.get("promptTokenCount").and_then(Value::as_u64),
                 output: u.get("candidatesTokenCount").and_then(Value::as_u64),
-                ..Usage::default()
+                // `cachedContentTokenCount` is the cached subset of the
+                // (cache-inclusive) `promptTokenCount`, like OpenAI's
+                // `cached_tokens`. Native Gemini has no inline cache-write
+                // (explicit context caching is a separate `cachedContents.create`
+                // call), so cache_write stays None.
+                cache_read: u.get("cachedContentTokenCount").and_then(Value::as_u64),
+                cache_write: None,
             },
             None => Usage::default(),
         },
@@ -1185,8 +1223,10 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 
     #[test]
     fn non_anthropic_has_no_cache_breakdown() {
-        // OpenAI + Gemini report a cache-inclusive prompt total with no breakdown;
-        // their cache fields stay None (never fabricated).
+        // An OpenAI/Gemini response that omits its cache detail
+        // (`prompt_tokens_details` / `cachedContentTokenCount`) yields no
+        // breakdown — the cache fields stay None, never fabricated from the
+        // cache-inclusive prompt total.
         let openai = br#"{"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}}"#;
         let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
         resp.extend_from_slice(openai);
@@ -1267,12 +1307,67 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn openai_responses_api_non_streaming() {
+        // Responses API (`/v1/responses`, the GPT-5 family): usage is top-level
+        // `input_tokens`/`output_tokens`, not `prompt_tokens`/`completion_tokens`;
+        // the cached input rides `input_tokens_details.cached_tokens`.
+        let body = br#"{"id":"resp_1","object":"response","model":"gpt-5.6","usage":{"input_tokens":6707,"output_tokens":5,"total_tokens":6712,"input_tokens_details":{"cached_tokens":6400}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!((f.tokens_in, f.tokens_out), (Some(6707), Some(5)));
+        // cache_read is surfaced (task-metrics scalars only); no explicit write.
+        assert_eq!(f.cache_read_tokens, Some(6400));
+        assert_eq!(f.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn openai_chat_completions_cached_tokens() {
+        // Chat Completions: cached input rides `prompt_tokens_details.cached_tokens`.
+        let body = br#"{"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":13219,"completion_tokens":1,"total_tokens":13220,"prompt_tokens_details":{"cached_tokens":13184}}}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::OpenAi).finalize();
+        assert_eq!((f.tokens_in, f.tokens_out), (Some(13219), Some(1)));
+        assert_eq!(f.cache_read_tokens, Some(13184));
+        assert_eq!(f.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn openai_responses_api_streaming_nested_usage() {
+        // Streaming Responses API: usage rides the `response.completed` event,
+        // nested under `response.usage` (not top-level). Earlier delta events
+        // carry no usage and must not clobber it.
+        let body = b"event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6\",\"usage\":{\"input_tokens\":533,\"output_tokens\":9,\"total_tokens\":542}}}\n\n";
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let p = feed_all(&resp, Provider::OpenAi);
+        assert_eq!(p.measured(), (Some(533), Some(9)));
+    }
+
+    #[test]
     fn gemini_non_streaming_usage_metadata() {
         let body = br#"{"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":4,"totalTokenCount":15}}"#;
         let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
         resp.extend_from_slice(body);
         let p = feed_all(&resp, Provider::Gemini);
         assert_eq!(p.measured(), (Some(11), Some(4)));
+    }
+
+    #[test]
+    fn gemini_cached_content_token_count() {
+        // Native Gemini: `cachedContentTokenCount` is the cached subset of
+        // `promptTokenCount` -> cache_read. No inline cache-write.
+        let body = br#"{"candidates":[],"usageMetadata":{"promptTokenCount":26406,"candidatesTokenCount":1,"totalTokenCount":26439,"cachedContentTokenCount":26401},"modelVersion":"gemini-2.5-flash"}"#;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        resp.extend_from_slice(body);
+        let f = feed_all(&resp, Provider::Gemini).finalize();
+        assert_eq!((f.tokens_in, f.tokens_out), (Some(26406), Some(1)));
+        assert_eq!(f.cache_read_tokens, Some(26401));
+        assert_eq!(f.cache_write_tokens, None);
     }
 
     // --- tool-call counting ---------------------------------------------
