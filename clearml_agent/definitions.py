@@ -87,6 +87,12 @@ ENV_AGENT_SNUG_CALL_HISTORY = EnvironmentConfig("CLEARML_AGENT_SNUG_CALL_HISTORY
 # wrapping stay off. The claude_desktop app image sets this env to turn app-mode
 # metering on without depending on a vault/config-file value.
 ENV_AGENT_SNUG_APP_MODE = EnvironmentConfig("CLEARML_AGENT_SNUG_APP_MODE")
+# Generic "cli" app-mode inputs (see app_metering._synthesize_cli_profile): the
+# app declares which CLI binary(ies) to wrap and the per-runtime CA-trust recipe,
+# so onboarding a terminal AI CLI is image-only (no agent profile). WRAP_BINS is
+# comma/space-separated basenames; WRAP_KIND is node_bun|rust_ssl_cert|go_ssl_cert.
+ENV_AGENT_SNUG_WRAP_BINS = EnvironmentConfig("CLEARML_AGENT_SNUG_WRAP_BINS")
+ENV_AGENT_SNUG_WRAP_KIND = EnvironmentConfig("CLEARML_AGENT_SNUG_WRAP_KIND")
 # CLEARML_AGENT_SNUG_TASK_METRICS_FIELDS (comma-separated) overrides the
 # task_metrics_fields HOCON list. A list value doesn't fit the scalar
 # ENVIRONMENT_CONFIG mapping, so it is read directly from os.environ in
@@ -128,6 +134,8 @@ ENVIRONMENT_CONFIG = {
     "agent.snug.report_task_metrics": ENV_AGENT_SNUG_REPORT_TASK_METRICS,
     "agent.snug.call_history": ENV_AGENT_SNUG_CALL_HISTORY,
     "agent.snug.app_mode": ENV_AGENT_SNUG_APP_MODE,
+    "agent.snug.wrap_bins": ENV_AGENT_SNUG_WRAP_BINS,
+    "agent.snug.wrap_kind": ENV_AGENT_SNUG_WRAP_KIND,
     "sdk.aws.s3.key": EnvironmentConfig("AWS_ACCESS_KEY_ID"),
     "sdk.aws.s3.secret": ENV_AWS_SECRET_KEY,
     "sdk.aws.s3.region": EnvironmentConfig("AWS_DEFAULT_REGION"),

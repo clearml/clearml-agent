@@ -1558,18 +1558,31 @@ def test_app_mode_requested_distinguishes_off_from_unknown():
 
 
 def test_resolve_app_profile_variants():
-    # (a) app_mode names the profile to enable.
+    # (a) app_mode names a literal profile to enable.
     p = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "claude_desktop"}))
     assert p is not None and p.app_id == "claude_desktop"
-    # (a2) opencode is a second registered profile.
-    p2 = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"}))
-    assert p2 is not None and p2.app_id == "opencode"
-    # (b) an app_mode naming a profile that isn't registered -> None (not an error).
+    # (a2) the generic "cli" mode synthesizes a launcher-less profile from the
+    # declared wrap bins + recipe.
+    p2 = am.resolve_app_profile(_FakeConfig({
+        "agent.snug.app_mode": "cli",
+        "agent.snug.wrap_bins": "claude",
+        "agent.snug.wrap_kind": "node_bun",
+    }))
+    assert p2 is not None and p2.app_id == "cli"
+    assert p2.launchers == () and [s.binary_name for s in p2.sdk_binaries] == ["claude"]
+    # (a3) legacy per-app names still resolve (routed through the synthesizer) so
+    # an already-built image that sets app_mode=opencode keeps metering.
+    p3 = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"}))
+    assert p3 is not None and p3.app_id == "opencode"
+    assert [s.binary_name for s in p3.sdk_binaries] == ["opencode"]
+    # (b) "cli" with no wrap bins -> None (nothing to meter; caller fails closed).
+    assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "cli"})) is None
+    # (c) an app_mode that's neither a profile, "cli", nor a legacy name -> None.
     assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "cursor"})) is None
-    # (c) empty / unset -> None so a plain agent is unaffected.
+    # (d) empty / unset -> None so a plain agent is unaffected.
     assert am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": ""})) is None
     assert am.resolve_app_profile(_FakeConfig()) is None
-    # (d) the old claude_desktop:true boolean is NOT a selector — app_mode is the
+    # (e) the old claude_desktop:true boolean is NOT a selector — app_mode is the
     # only gate (the alias was removed on this unreleased branch).
     assert am.resolve_app_profile(_FakeConfig({"agent.snug.claude_desktop": True})) is None
 
@@ -1734,14 +1747,12 @@ def test_whitelist_union_adds_profile_hosts():
 
 
 # ===========================================================================
-# -- OpenCode: explicit_path discovery + the second (launcher-less) profile --
-# OpenCode is a bun/BoringSSL binary the LD_PRELOAD shim can't hook, so it is
-# metered via the app-mode forward proxy like Claude Desktop — but with no
-# Electron launcher and a fixed-path SDK on PATH (explicit_path discovery).
+# -- explicit_path discovery (launcher-less, fixed-path SDK on PATH) ----------
+# A bun/BoringSSL or node CLI the LD_PRELOAD shim can't hook is metered via the
+# app-mode forward proxy like Claude Desktop — but with no Electron launcher and
+# a fixed-path SDK on PATH (explicit_path discovery), the shape the generic "cli"
+# mode synthesizes.
 # ===========================================================================
-
-_OPENCODE_PROFILE = am.BUILTIN_PROFILES["opencode"]
-_OPENCODE_SDK = _OPENCODE_PROFILE.sdk_binaries[0]
 
 
 def _explicit_sdk(dirs, binary_name="opencode"):
@@ -1822,28 +1833,373 @@ def test_install_sdk_wrapper_on_symlinked_binary(tmp_path):
     assert am.install_sdk_wrapper(str(usrbin), ca_src, "http://127.0.0.1:8888", sdk) is False
 
 
-def test_builtin_opencode_profile_golden():
-    # GOLDEN VALUE: lock the OpenCode profile so a refactor can't silently drift
-    # the launcher-less / fixed-path / decrypt-only-providers shape.
-    prof = am.BUILTIN_PROFILES["opencode"]
+def test_legacy_opencode_alias_synthesizes_cli_profile():
+    # OpenCode no longer has a bespoke profile: app_mode=opencode is a legacy
+    # alias routed through the generic synthesizer, so an already-built image keeps
+    # metering. Lock the launcher-less / fixed-path / decrypt-only-providers shape.
+    prof = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"}))
+    assert prof is not None
     assert prof.app_id == "opencode"
     assert prof.launchers == ()          # no Electron/Chromium leg
     (sdk,) = prof.sdk_binaries
     assert sdk.binary_name == "opencode"
     assert sdk.discovery == "explicit_path"
-    assert sdk.explicit_dirs == ("/usr/local/bin",)
+    assert sdk.explicit_dirs == am._CLI_STD_DIRS
     assert sdk.watched is True           # setup wraps SDKs only via the watcher
     assert sdk.wrapper_kind == "node_bun"
-    assert prof.default_tokenizer == "approx"
+    assert sdk.target_kind == "script"   # detector accepts bun ELF or a #! launcher
     assert prof.external_oauth_browser is False   # BYO API key, no browser OAuth
     assert prof.decrypt_all is False              # decrypt only known providers
     assert prof.h2_assumed_host is None
     assert prof.whitelist_contribution == ()      # 3 providers are known hosts
 
 
-def test_opencode_profile_starts_watcher_not_launcher():
-    # A launcher-less profile with a WATCHED SDK: setup must start the SDK
-    # watcher (the only thing that wraps SDKs) and not gate on any launcher.
-    prof = am.BUILTIN_PROFILES["opencode"]
+def test_synthesized_cli_profile_starts_watcher_not_launcher():
+    # A launcher-less synthesized profile with a WATCHED SDK: the only thing that
+    # wraps SDKs is the watcher, and nothing gates on a launcher.
+    prof = am.resolve_app_profile(_FakeConfig({"agent.snug.app_mode": "opencode"}))
     assert prof.launchers == ()
     assert any(getattr(s, "watched", False) for s in prof.sdk_binaries)
+
+
+# -- Claude Code: target_kind="script" (non-ELF, node-cli) SDK ---------------
+#
+# Claude Code's `claude` is an npm symlink to a node cli.js (a #! script), NOT a
+# compiled ELF like opencode's bun binary. These cover the target_kind="script"
+# gate that lets the same explicit_path discovery + wrapper install shadow it,
+# and the marker-based (not ELF-based) idempotency scripts need.
+
+def _script_sdk(dirs, binary_name="claude"):
+    return am.SdkBinary(
+        binary_name=binary_name,
+        discovery="explicit_path",
+        explicit_dirs=tuple(dirs),
+        watched=True,
+        wrapper_kind="node_bun",
+        target_kind="script",
+    )
+
+
+def _write_node_cli(path, body="#!/usr/bin/env node\nconsole.log('hi')\n"):
+    with open(str(path), "w") as fh:
+        fh.write(body)
+    os.chmod(str(path), 0o755)
+
+
+def test_sdk_binary_target_kind_defaults_to_elf():
+    # A SdkBinary constructed without target_kind (as the claude_desktop literal
+    # does) must default to "elf" so its ELF-based behavior is byte-identical.
+    assert am.BUILTIN_PROFILES["claude_desktop"].sdk_binaries[0].target_kind == "elf"
+    assert am.SdkBinary(binary_name="x", discovery="explicit_path").target_kind == "elf"
+
+
+def test_synthesize_cli_profile_shape():
+    # The generic synthesizer builds a launcher-less, decrypt-known-only,
+    # script-target profile for each declared binary.
+    prof = am._synthesize_cli_profile("cli", ["claude"], "node_bun")
+    assert prof is not None
+    assert prof.app_id == "cli"
+    assert prof.launchers == ()                     # no Electron/Chromium leg
+    (sdk,) = prof.sdk_binaries
+    assert sdk.binary_name == "claude"
+    assert sdk.discovery == "explicit_path"
+    assert sdk.target_kind == "script"              # #! launcher / symlink / ELF
+    assert sdk.watched is True                       # re-wrapped after npm update
+    assert sdk.wrapper_kind == "node_bun"           # HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+    # Both the NodeSource prefix and the npm default are covered so a wrong single
+    # dir can't leave the CLI silently un-wrapped.
+    assert sdk.explicit_dirs == ("/usr/local/bin", "/usr/bin")
+    assert prof.external_oauth_browser is False     # no system-browser CA trust
+    assert prof.decrypt_all is False                # decrypt only known providers
+    assert prof.h2_assumed_host is None
+    assert prof.whitelist_contribution == ()        # provider hosts are in the admin whitelist
+
+
+def test_synthesize_cli_profile_multi_bin_and_guards():
+    # Multiple bins -> one watched SDK each, in declared order.
+    prof = am._synthesize_cli_profile("cli", ["claude", "codex"], "node_bun")
+    assert [s.binary_name for s in prof.sdk_binaries] == ["claude", "codex"]
+    # No bins -> None (nothing to wrap; caller fails closed).
+    assert am._synthesize_cli_profile("cli", [], "node_bun") is None
+    # Unsupported recipe -> None (loudly logged), never a broken profile.
+    assert am._synthesize_cli_profile("cli", ["claude"], "bogus_kind") is None
+
+
+def test_parse_wrap_bins():
+    # Comma/space separated, deduped, order-preserving, basenamed.
+    assert am._parse_wrap_bins("claude, codex  pi") == ["claude", "codex", "pi"]
+    assert am._parse_wrap_bins("/usr/bin/claude,claude") == ["claude"]
+    assert am._parse_wrap_bins("") == [] and am._parse_wrap_bins(None) == []
+
+
+def test_rust_wrap_kind_selectable_via_cli_mode():
+    # Codex's runtime recipe is selectable purely from image env, no agent profile.
+    prof = am.resolve_app_profile(_FakeConfig({
+        "agent.snug.app_mode": "cli",
+        "agent.snug.wrap_bins": "codex",
+        "agent.snug.wrap_kind": "rust_ssl_cert",
+    }))
+    assert prof is not None
+    (sdk,) = prof.sdk_binaries
+    assert sdk.binary_name == "codex" and sdk.wrapper_kind == "rust_ssl_cert"
+
+
+def test_is_wrappable_sdk_script_matches_shebang_and_excludes_wrapper(tmp_path):
+    d = tmp_path / "bin"; d.mkdir()
+    claude = d / "claude"
+    _write_node_cli(claude)
+    # A real node launcher (#! script) is wrappable under target_kind="script"...
+    assert am._is_wrappable_sdk(str(claude), "script") is True
+    # ...but the SAME file under the default "elf" kind is NOT (it isn't an ELF),
+    # so the existing profiles' behavior is unchanged.
+    assert am._is_wrappable_sdk(str(claude), "elf") is False
+    # Our generated wrapper carries the marker -> not re-wrappable (idempotent).
+    with open(str(claude), "w") as fh:
+        fh.write(am.render_sdk_wrapper("http://127.0.0.1:8888", "snug_ca.pem", "claude"))
+    assert am._SDK_WRAPPER_MARKER in open(str(claude)).read()
+    assert am._is_wrappable_sdk(str(claude), "script") is False
+
+
+def test_is_wrappable_sdk_script_follows_symlink(tmp_path):
+    # npm installs `claude` as a symlink to the package cli.js; the gate must
+    # follow it (open() reads the target's shebang), matching the real layout.
+    real = tmp_path / "pkg" / "cli.js"
+    real.parent.mkdir(parents=True)
+    _write_node_cli(real)
+    link = tmp_path / "bin" / "claude"
+    link.parent.mkdir()
+    os.symlink(str(real), str(link))
+    assert am._is_wrappable_sdk(str(link), "script") is True
+    # A dangling symlink (npm mid-reinstall) is not wrappable, and doesn't raise.
+    dangling = tmp_path / "bin" / "gone"
+    os.symlink(str(tmp_path / "nope"), str(dangling))
+    assert am._is_wrappable_sdk(str(dangling), "script") is False
+
+
+def test_is_wrappable_sdk_script_accepts_elf_defensively(tmp_path):
+    # If a future `claude` ever ships as a compiled binary, target_kind="script"
+    # must still wrap it (the only thing we must never re-wrap is our own wrapper).
+    d = tmp_path / "bin"; d.mkdir()
+    (d / "claude").write_bytes(_FAKE_ELF)
+    assert am._is_wrappable_sdk(str(d / "claude"), "script") is True
+
+
+def test_find_sdk_dirs_script_matches_and_is_idempotent(tmp_path):
+    d = tmp_path / "usr-bin"; d.mkdir()
+    _write_node_cli(d / "claude")
+    sdk = _script_sdk([str(d)])
+    # explicit_path ignores home; the node-cli dir is found.
+    assert am.find_sdk_dirs("/no/such/home", sdk) == [str(d)]
+    # After wrapping, the dir is skipped (marker-based idempotency for scripts).
+    ca_src = _write_ca(tmp_path)
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is True
+    assert am.find_sdk_dirs("/no/such/home", sdk) == []
+
+
+def test_install_sdk_wrapper_wraps_node_script(tmp_path):
+    # The script entrypoint is renamed to claude.real and shadowed by our wrapper;
+    # the wrapper execs claude.real, and the CA lands beside it.
+    d = tmp_path / "usr-bin"; d.mkdir()
+    _write_node_cli(d / "claude")
+    ca_src = _write_ca(tmp_path)
+    sdk = _script_sdk([str(d)])
+
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is True
+    # `claude` is now our #!/bin/sh wrapper; the real launcher preserved verbatim.
+    body = (d / "claude").read_text()
+    assert body.startswith("#!/bin/sh")
+    assert am._SDK_WRAPPER_MARKER in body
+    assert 'exec "$DIR/claude.real" "$@"' in body
+    assert (d / "claude.real").read_text().startswith("#!/usr/bin/env node")
+    assert (d / "snug_ca.pem").is_file()
+    # Idempotent: second call no-ops and does not clobber claude.real.
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is False
+    assert (d / "claude.real").read_text().startswith("#!/usr/bin/env node")
+
+
+def test_install_sdk_wrapper_wraps_symlinked_node_cli(tmp_path):
+    # Real npm shape: /usr/bin/claude is a symlink to the package cli.js. Wrapping
+    # renames the SYMLINK to claude.real (still -> cli.js) and drops the wrapper.
+    real = tmp_path / "pkg" / "cli.js"
+    real.parent.mkdir(parents=True)
+    _write_node_cli(real)
+    d = tmp_path / "usr-bin"; d.mkdir()
+    os.symlink(str(real), str(d / "claude"))
+    ca_src = _write_ca(tmp_path)
+    sdk = _script_sdk([str(d)])
+
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is True
+    assert (d / "claude").read_text().startswith("#!/bin/sh")
+    # claude.real is the preserved symlink, still resolving to the node cli.js.
+    assert os.path.islink(str(d / "claude.real"))
+    assert os.path.realpath(str(d / "claude.real")) == str(real)
+
+
+def test_run_watcher_wraps_node_script_dir_on_a_tick(tmp_path, monkeypatch):
+    # End-to-end watcher tick over a script SDK: a settled node-cli is wrapped
+    # (executable + stable across the tick since prev==cur sig), then the patched
+    # sleep breaks the loop.
+    d = tmp_path / "usr-bin"; d.mkdir()
+    _write_node_cli(d / "claude")
+    ca_src = _write_ca(tmp_path)
+    sdk = _script_sdk([str(d)])
+    monkeypatch.setattr(am, "candidate_home_roots", lambda home: ["/ignored"])
+    # Two ticks so the (size,mtime) stability check passes on the second.
+    ticks = {"n": 0}
+
+    def _sleep(_secs):
+        ticks["n"] += 1
+        if ticks["n"] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(am.time, "sleep", _sleep)
+    am._run_watcher("/ignored", ca_src, "http://127.0.0.1:8888", [sdk], poll_sec=0.01)
+
+    assert (d / "claude").read_text().startswith("#!/bin/sh")
+    assert am._SDK_WRAPPER_MARKER in (d / "claude").read_text()
+
+
+# -- rust_ssl_cert / go_ssl_cert recipe + combined CA bundle -----------------
+#
+# A Rust (rustls, e.g. Codex) or Go CLI trusts CAs via SSL_CERT_FILE, not
+# NODE_EXTRA_CA_CERTS -- and SSL_CERT_FILE REPLACES the store, so the wrapper
+# points at a COMBINED (system roots + proxy CA) bundle install builds beside it.
+
+def _ssl_cert_sdk(dirs, binary_name="codex", kind="rust_ssl_cert"):
+    return am.SdkBinary(
+        binary_name=binary_name,
+        discovery="explicit_path",
+        explicit_dirs=tuple(dirs),
+        watched=True,
+        wrapper_kind=kind,
+        target_kind="script",
+    )
+
+
+def test_render_sdk_wrapper_rust_ssl_cert():
+    w = am.render_sdk_wrapper("http://127.0.0.1:8888", "snug_ca.pem", "codex",
+                              wrapper_kind="rust_ssl_cert")
+    assert w.startswith("#!/bin/sh\n")
+    # SSL_CERT_FILE points at the combined bundle; SSL_CERT_DIR cleared; NO node env.
+    assert 'export SSL_CERT_FILE="$DIR/{}"'.format(am._CA_BUNDLE_FILENAME) in w
+    assert 'export SSL_CERT_DIR=""' in w
+    assert "NODE_EXTRA_CA_CERTS" not in w
+    # Proxy routing + loopback bypass are common to every recipe.
+    assert 'export HTTPS_PROXY="http://127.0.0.1:8888"' in w
+    assert 'export NO_PROXY="localhost,127.0.0.1,::1"' in w
+    assert 'exec "$DIR/codex.real" "$@"' in w
+
+
+def test_render_sdk_wrapper_go_ssl_cert_uses_same_ssl_cert_recipe():
+    w = am.render_sdk_wrapper("http://127.0.0.1:9", "ca.pem", "x", wrapper_kind="go_ssl_cert")
+    assert 'export SSL_CERT_FILE="$DIR/{}"'.format(am._CA_BUNDLE_FILENAME) in w
+    assert "NODE_EXTRA_CA_CERTS" not in w
+
+
+def test_install_sdk_wrapper_rust_builds_combined_bundle(tmp_path, monkeypatch):
+    # SSL_CERT_FILE recipe: install builds snug_ca_bundle.pem = system roots +
+    # proxy CA, and the wrapper points SSL_CERT_FILE at it.
+    sysca = tmp_path / "system-ca.pem"
+    sysca.write_bytes(b"SYSTEM-ROOTS\n")
+    monkeypatch.setattr(am, "_SYSTEM_CA_BUNDLES", (str(sysca),))
+    d = tmp_path / "usr-bin"; d.mkdir()
+    (d / "codex").write_bytes(_FAKE_ELF); os.chmod(str(d / "codex"), 0o755)  # rust ELF
+    ca_src = _write_ca(tmp_path, body=b"PROXY-CA\n")
+    sdk = _ssl_cert_sdk([str(d)])
+
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is True
+    body = (d / "codex").read_text()
+    assert 'export SSL_CERT_FILE="$DIR/{}"'.format(am._CA_BUNDLE_FILENAME) in body
+    bundle = (d / am._CA_BUNDLE_FILENAME).read_bytes()
+    assert b"SYSTEM-ROOTS" in bundle and b"PROXY-CA" in bundle  # both, in that order
+    assert bundle.index(b"SYSTEM-ROOTS") < bundle.index(b"PROXY-CA")
+    # Real binary preserved as codex.real (still the ELF).
+    with open(str(d / "codex.real"), "rb") as fh:
+        assert fh.read(4) == am._ELF_MAGIC
+
+
+def test_install_sdk_wrapper_rust_bails_without_system_bundle(tmp_path, monkeypatch):
+    # No system root store found -> can't build a store that trusts real upstreams,
+    # so bail with the SDK intact rather than ship a proxy-CA-only store.
+    monkeypatch.setattr(am, "_SYSTEM_CA_BUNDLES", (str(tmp_path / "nope.pem"),))
+    d = tmp_path / "usr-bin"; d.mkdir()
+    (d / "codex").write_bytes(_FAKE_ELF); os.chmod(str(d / "codex"), 0o755)
+    ca_src = _write_ca(tmp_path)
+    sdk = _ssl_cert_sdk([str(d)])
+
+    assert am.install_sdk_wrapper(str(d), ca_src, "http://127.0.0.1:8888", sdk) is False
+    with open(str(d / "codex"), "rb") as fh:
+        assert fh.read(4) == am._ELF_MAGIC, "SDK must stay the real ELF"
+    assert not os.path.exists(str(d / "codex.real"))
+    assert not os.path.exists(str(d / am._CA_BUNDLE_FILENAME))
+
+
+# -- fail-closed presence gate for launcher-less CLI apps --------------------
+
+def _cli_profile_for(dirs, binary_name="claude", kind="node_bun"):
+    """A launcher-less synthesized-shape profile whose SDK is wrapped in ``dirs``
+    (so a test can point it at a tmp dir instead of the real /usr/bin)."""
+    return am.AppProfile(
+        app_id="cli",
+        launchers=(),
+        sdk_binaries=(am.SdkBinary(
+            binary_name=binary_name, discovery="explicit_path",
+            explicit_dirs=tuple(dirs), watched=True,
+            wrapper_kind=kind, target_kind="script"),),
+        default_tokenizer="approx", external_oauth_browser=False,
+        decrypt_all=False, h2_assumed_host=None, whitelist_contribution=(),
+    )
+
+
+def test_setup_fail_closed_when_cli_binary_absent(tmp_path, monkeypatch):
+    # Launcher-less app whose wrap target isn't present at setup (wrong dir / bin)
+    # -> metering_active False, so the caller refuses to run it un-metered, instead
+    # of a live proxy nothing ever routes through.
+    home = tmp_path / "home"
+    (home / ".clearml_snug").mkdir(parents=True)
+    (home / ".clearml_snug" / "snug_proxy_ca.pem").write_bytes(b"ca")
+    _stub_setup_deps(monkeypatch)
+    prof = _cli_profile_for([str(tmp_path / "empty-bin")])  # no `claude` there
+
+    handle = am.setup_app_metering(
+        profile=prof, session=None, task_id="t", project="p", home=str(home),
+        proxy_bin="/proxy", config=_FakeConfig(),
+    )
+    assert handle.metering_active is False
+
+
+def test_setup_active_when_cli_binary_present(tmp_path, monkeypatch):
+    # Same app but the baked CLI IS present in a configured dir -> metering active.
+    home = tmp_path / "home"
+    (home / ".clearml_snug").mkdir(parents=True)
+    (home / ".clearml_snug" / "snug_proxy_ca.pem").write_bytes(b"ca")
+    _stub_setup_deps(monkeypatch)
+    bindir = tmp_path / "bin"; bindir.mkdir()
+    _write_node_cli(bindir / "claude")
+    prof = _cli_profile_for([str(bindir)])
+
+    handle = am.setup_app_metering(
+        profile=prof, session=None, task_id="t", project="p", home=str(home),
+        proxy_bin="/proxy", config=_FakeConfig(),
+    )
+    assert handle.metering_active is True
+
+
+def test_start_sdk_watcher_forwards_wrap_bins_and_kind(monkeypatch):
+    # A synthesized profile isn't in BUILTIN_PROFILES, so the watcher child is told
+    # the bins + recipe to reconstruct it -> they must reach the subprocess argv.
+    created = {}
+
+    def _fake_popen(argv, **kwargs):
+        proc = _FakePopen(argv, **kwargs)
+        created["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(am.subprocess, "Popen", _fake_popen)
+    am.start_sdk_watcher(
+        "/home/x", "/ca.pem", "http://127.0.0.1:8888", "cli", poll_sec=0.5,
+        wrap_bins="claude,codex", wrap_kind="rust_ssl_cert",
+    )
+    argv = created["proc"].argv
+    assert argv[argv.index("--wrap-bins") + 1] == "claude,codex"
+    assert argv[argv.index("--wrap-kind") + 1] == "rust_ssl_cert"

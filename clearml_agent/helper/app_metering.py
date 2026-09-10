@@ -12,10 +12,15 @@ without this module.
 
 The app-specific facts (which launcher(s) to shadow, which SDK binary to wrap and
 how to find it, whether an external OAuth browser needs the CA, the default
-tokenizer, the per-app whitelist rows) live in an :class:`AppProfile` declared in
-``BUILTIN_PROFILES`` and keyed by ``agent.snug.app_mode``. Claude Desktop is the
-first such profile; other desktop coding UIs are added as further profiles rather
-than by editing the mechanism below.
+tokenizer, the per-app whitelist rows) live in an :class:`AppProfile`. A
+genuinely distinct app (Claude Desktop: Electron + decrypt-all + NSS + h2) is a
+literal ``BUILTIN_PROFILES`` entry keyed by ``agent.snug.app_mode``. The terminal
+AI coding CLIs (Claude Code, OpenCode, Codex, ...) share one policy and differ
+only in which binary to wrap + the per-runtime CA-trust recipe, so instead of a
+profile each they use the generic ``cli`` app-mode: the image declares those two
+facts via ``CLEARML_AGENT_SNUG_WRAP_BINS`` / ``CLEARML_AGENT_SNUG_WRAP_KIND`` and
+``_synthesize_cli_profile`` builds the profile (onboarding a new CLI is then
+image-only, no agent change).
 
 WHY a proxy at all (and not just the shim): apps like Claude Desktop / Cowork run
 the ``code`` path through a **bun**-spawned SDK binary that statically-links
@@ -91,12 +96,25 @@ from clearml_agent.snug.whitelist import build_whitelist_env
 #                           SDKs only via the watcher (there is no one-shot wrap).
 #   wrapper_kind          : which wrapper env recipe to inject. Only "node_bun"
 #                           (NODE_EXTRA_CA_CERTS + HTTPS_PROXY) is implemented.
+#   target_kind           : what the on-disk entrypoint at the wrap path IS, which
+#                           decides the "real binary vs already-our-wrapper" test:
+#                             "elf"    — a compiled binary (opencode's bun ELF,
+#                                        Claude Desktop's SDK). Our wrapper is a
+#                                        #!/bin/sh script, so ELF-vs-shell alone
+#                                        tells them apart (see _is_elf).
+#                             "script" — an interpreter launcher (a #! shebang),
+#                                        possibly a symlink to one — Claude Code's
+#                                        `claude` is an npm symlink to a node
+#                                        cli.js. Our wrapper is #!/bin/sh too, so
+#                                        the marker IN the wrapper (not the
+#                                        shebang) is the "already wrapped" test.
 SdkBinary = namedtuple(
     "SdkBinary",
     ["binary_name", "discovery", "container_substr",
-     "expects_version_parent", "watched", "wrapper_kind", "explicit_dirs"],
+     "expects_version_parent", "watched", "wrapper_kind", "explicit_dirs",
+     "target_kind"],
 )
-SdkBinary.__new__.__defaults__ = ("", False, False, "node_bun", ())
+SdkBinary.__new__.__defaults__ = ("", False, False, "node_bun", (), "elf")
 
 # An Electron/Chromium launcher we shadow to route the renderer through the proxy.
 #   path : absolute path of the launcher to shadow.
@@ -174,46 +192,141 @@ BUILTIN_PROFILES = {
             },
         ),
     ),
-    # OpenCode: a single bun-compiled standalone CLI. Bun statically links
-    # BoringSSL, so the LD_PRELOAD shim can't hook it (same reason Claude
-    # Desktop's SDK needs the proxy). No Electron/Chromium leg — the LLM path IS
-    # the CLI. The image bakes the binary at /root/.opencode/bin/opencode and
-    # every session launches it as `opencode`, resolved through the
-    # /usr/local/bin/opencode symlink on PATH; we shadow it in that PATH dir
-    # (where $(dirname "$0") lands), so its provider HTTPS routes through the
-    # proxy. decrypt_all is off: only the three known providers
-    # (api.anthropic.com / api.openai.com / generativelanguage.googleapis.com)
-    # are decrypted + metered; OpenCode's other egress (git, package installs,
-    # MCP) is blind-tunnelled untouched. external_oauth_browser is off — metering
-    # a user-supplied API key needs no system-browser CA trust.
-    "opencode": AppProfile(
-        app_id="opencode",
+    # The terminal AI coding CLIs (Claude Code, OpenCode, Codex, pidev, ...) are
+    # NOT listed here: they all share one metering policy and differ only in which
+    # binary to wrap + the per-runtime CA-trust recipe, so they use the generic
+    # "cli" app-mode (``_synthesize_cli_profile`` below) instead of a bespoke
+    # profile each. Only genuinely distinct apps (Claude Desktop: Electron +
+    # decrypt-all + NSS + h2) get a literal AppProfile here.
+}
+
+
+# ---------------------------------------------------------------------------
+# Generic terminal-CLI app-mode.
+#
+# Every terminal AI coding CLI hits the SAME wall: its LLM runtime (node / bun /
+# rust / go) statically links its TLS stack, so the LD_PRELOAD shim can't hook it
+# and it must be metered via the forward proxy. Their metering POLICY is identical
+# (launcher-less, decrypt only the known providers, no NSS/OAuth-browser, no h2
+# seeding); only two facts vary: WHICH binary to wrap, and the per-runtime
+# CA-trust recipe (``wrapper_kind``). So rather than a bespoke ``AppProfile`` per
+# app, the app declares those two facts in its image and selects the generic
+# ``cli`` mode:
+#
+#   ENV CLEARML_AGENT_SNUG_APP_MODE=cli
+#   ENV CLEARML_AGENT_SNUG_WRAP_BINS=claude          # comma/space-sep for multi-bin
+#   ENV CLEARML_AGENT_SNUG_WRAP_KIND=node_bun        # node_bun|rust_ssl_cert|go_ssl_cert
+#
+# and the agent synthesizes the profile. Onboarding a new CLI app is then
+# image-only — no agent change/redeploy (the coupling that left Codex/pidev
+# un-metered when each would have needed its own hardcoded profile).
+
+# PATH dirs a CLI app's binary is wrapped in. npm's global prefix is /usr
+# (NodeSource) -> /usr/bin; a curl/installer app symlinks onto /usr/local/bin.
+# Listing both means a wrong single dir can't silently leave the CLI un-wrapped.
+_CLI_STD_DIRS = ("/usr/local/bin", "/usr/bin")
+
+# The CA-trust + proxy wrapper recipes render_sdk_wrapper implements, by runtime.
+_SUPPORTED_WRAP_KINDS = ("node_bun", "rust_ssl_cert", "go_ssl_cert")
+
+# Legacy per-app app_mode names, kept working by routing them through the generic
+# synthesizer (bin, kind) so an already-built image that still sets e.g.
+# ``app_mode=opencode`` keeps metering without carrying a bespoke profile. New
+# images use ``app_mode=cli`` + CLEARML_AGENT_SNUG_WRAP_*.
+_CLI_LEGACY_PRESETS = {
+    "opencode": ("opencode", "node_bun"),
+    "claude_code": ("claude", "node_bun"),
+}
+
+
+def _parse_wrap_bins(raw):
+    # type: (Optional[str]) -> List[str]
+    """Parse the comma/space-separated ``CLEARML_AGENT_SNUG_WRAP_BINS`` value into
+    a deduped, order-preserving list of binary basenames (a stray dir component is
+    stripped so a path like ``/usr/bin/claude`` still yields ``claude``)."""
+    out = []  # type: List[str]
+    seen = set()
+    for tok in str(raw or "").replace(",", " ").split():
+        name = os.path.basename(tok.strip())
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _synthesize_cli_profile(app_id, bins, kind):
+    # type: (str, List[str], str) -> Optional[AppProfile]
+    """Build a launcher-less :class:`AppProfile` that wraps each name in ``bins``
+    (in the standard PATH dirs, via the ``kind`` recipe) so its provider HTTPS
+    routes through the proxy — the generic terminal-CLI profile.
+
+    Returns None when ``kind`` is unsupported or ``bins`` is empty (nothing to
+    wrap is not a usable profile; the caller fails closed). ``target_kind`` is
+    ``"script"`` for every binary: its detector accepts a ``#!`` launcher, a
+    symlink to one, OR a compiled ELF (excluding our own wrapper), so one kind
+    covers node-scripts, bun/rust ELFs, and npm symlinks uniformly.
+
+    Policy is fixed (the generic CLI contract): no Electron launcher; decrypt only
+    the whitelisted providers (git / npm / MCP egress is blind-tunnelled); no
+    external OAuth browser; no h2 seeding; no extra whitelist rows — the admin
+    whitelist already carries the provider hosts."""
+    if kind not in _SUPPORTED_WRAP_KINDS:
+        _cd_log("cli app-mode: unsupported wrap_kind {!r} (supported: {})".format(
+            kind, ", ".join(_SUPPORTED_WRAP_KINDS)))
+        return None
+    if not bins:
+        _cd_log("cli app-mode: no wrap bins configured "
+                "(CLEARML_AGENT_SNUG_WRAP_BINS empty); nothing to meter")
+        return None
+    sdk_binaries = tuple(
+        SdkBinary(
+            binary_name=b,
+            discovery="explicit_path",
+            explicit_dirs=_CLI_STD_DIRS,
+            watched=True,
+            wrapper_kind=kind,
+            target_kind="script",
+        )
+        for b in bins
+    )
+    return AppProfile(
+        app_id=app_id,
         launchers=(),
-        sdk_binaries=(
-            SdkBinary(
-                binary_name="opencode",
-                discovery="explicit_path",
-                explicit_dirs=("/usr/local/bin",),
-                watched=True,
-                wrapper_kind="node_bun",
-            ),
-        ),
+        sdk_binaries=sdk_binaries,
         default_tokenizer="approx",
         external_oauth_browser=False,
         decrypt_all=False,
         h2_assumed_host=None,
         whitelist_contribution=(),
-    ),
-}
+    )
 
 
 # The real SDK / launcher entrypoint after we shadow it with a wrapper.
 _REAL_SUFFIX = ".real"
 # The CA file dropped beside a wrapper (see install_sdk_wrapper for why beside).
 _CA_FILENAME = "snug_ca.pem"
+# The COMBINED CA bundle (system roots + proxy CA) dropped beside a wrapper for
+# the SSL_CERT_FILE-based recipes (rust_ssl_cert / go_ssl_cert). Needed because
+# SSL_CERT_FILE REPLACES the trust store (unlike NODE_EXTRA_CA_CERTS' append), so
+# a client pointed at only the proxy CA would distrust every real upstream.
+_CA_BUNDLE_FILENAME = "snug_ca_bundle.pem"
+# Standard system CA bundle locations, in order of preference (Debian/Echo, then
+# RHEL variants), used to seed the combined bundle above.
+_SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+)
 # First 4 bytes of an ELF binary — how we tell "still the real SDK" from
-# "already our #!/bin/sh wrapper".
+# "already our #!/bin/sh wrapper" for a compiled (target_kind="elf") entrypoint.
 _ELF_MAGIC = b"\x7fELF"
+
+# Distinctive header comment embedded in a generated SDK wrapper. For a
+# target_kind="script" entrypoint (a #! launcher, e.g. Claude Code's node cli.js)
+# our wrapper is ALSO a #!/bin/sh script, so the ELF-vs-shell test can't tell
+# "already wrapped" from "the real launcher" — we match THIS marker instead (the
+# role _ELF_MAGIC plays for a compiled SDK binary).
+_SDK_WRAPPER_MARKER = "SNUG SDK metering wrapper"
 
 # Marker the app (its claude-code downloader) writes beside the SDK binary once
 # it has fully downloaded + verified it. When present the install is complete and
@@ -297,43 +410,97 @@ def _is_elf(path):
         return False
 
 
+def _is_wrappable_sdk(path, target_kind="elf"):
+    # type: (str, str) -> bool
+    """True iff ``path`` is a not-yet-wrapped SDK entrypoint of ``target_kind``.
+
+    The "real entrypoint vs our own wrapper" gate that keeps discovery + install
+    idempotent, generalized over how an app ships its entrypoint:
+
+      - ``elf`` (opencode, Claude Desktop): the entrypoint is a compiled binary,
+        so ``_is_elf`` doubles as the test — our ``#!/bin/sh`` wrapper is not an
+        ELF, so a wrapped path reads False and is skipped.
+      - ``script`` (Claude Code): the entrypoint is an interpreter launcher — a
+        ``#!`` shebang script, or a symlink to one (npm installs ``claude`` as a
+        symlink to a node ``cli.js``). ``open`` follows the symlink, so the
+        shebang check sees the target. Our wrapper is a ``#!/bin/sh`` script too,
+        so the shebang can't tell them apart — a path carrying the wrapper marker
+        reads False (already wrapped); any other shebang (or, defensively, an ELF,
+        so a future compiled ``claude`` still wraps) reads True.
+
+    Best-effort: any error -> False."""
+    if target_kind == "script":
+        try:
+            if not os.path.isfile(path):
+                return False
+            with open(path, "rb") as fh:
+                head = fh.read(512)
+            if _SDK_WRAPPER_MARKER.encode("ascii") in head:
+                return False
+            return head[:2] == b"#!" or head[:4] == _ELF_MAGIC
+        except Exception:
+            return False
+    return _is_elf(path)
+
+
 def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_bun"):
     # type: (str, str, str, str) -> str
     """Return the ``#!/bin/sh`` wrapper that routes an app's SDK binary through
     the SNUG proxy.
 
     It exports the proxy env (scoped to this exec only, never the task-wide
-    environment) and then re-execs the real SDK binary sitting beside it. Only the
-    ``node_bun`` recipe is implemented:
+    environment) and then re-execs the real SDK binary sitting beside it. Common
+    to every recipe:
 
-      - ``NODE_EXTRA_CA_CERTS`` — makes a Node/bun HTTPS client trust the proxy's
-        proxy CA. We use this and deliberately NOT ``SSL_CERT_FILE``: bun ignores
-        ``SSL_CERT_FILE`` for its HTTPS client, and even where it were honored it
-        REPLACES the entire root store (so every real upstream cert would then
-        fail to verify), whereas ``NODE_EXTRA_CA_CERTS`` APPENDS our CA to the
-        existing roots — exactly what we want.
       - ``HTTPS_PROXY`` / ``HTTP_PROXY`` — point outbound requests at the local
         proxy.
       - ``NO_PROXY`` / ``no_proxy`` — exempt loopback. An app may itself run a
-        local proxy on 127.0.0.1 (OpenCode's session_proxy does); routing that
+        local proxy on 127.0.0.1 (OpenCode's session_proxy did); routing that
         loopback call back through this proxy would double-proxy or dead-loop it.
+
+    The CA-trust env is per-runtime (``wrapper_kind``), because how a client is
+    told to trust the proxy's MITM CA differs by TLS stack:
+
+      - ``node_bun`` (Node / bun) — ``NODE_EXTRA_CA_CERTS`` pointed at the proxy CA
+        beside the wrapper. We use this and deliberately NOT ``SSL_CERT_FILE``: bun
+        ignores ``SSL_CERT_FILE`` for its HTTPS client, and even where honored it
+        REPLACES the whole root store, whereas ``NODE_EXTRA_CA_CERTS`` APPENDS our
+        CA to the existing roots — exactly what we want.
+      - ``rust_ssl_cert`` / ``go_ssl_cert`` (rustls / OpenSSL / Go, e.g. Codex) —
+        ``SSL_CERT_FILE`` pointed at the COMBINED bundle (system roots + proxy CA)
+        that ``install_sdk_wrapper`` builds beside the wrapper. ``SSL_CERT_FILE``
+        REPLACES the store, so it must carry the system roots too or every
+        blind-tunnelled (non-provider) upstream would fail to verify;
+        ``SSL_CERT_DIR`` is cleared so a hashed system dir can't shadow the file.
 
     ``$(dirname "$0")`` resolves paths relative to the wrapper itself so the CA
     and the real binary are found wherever the (possibly re-downloaded, possibly
     ro-bind-mounted under bwrap) SDK dir lives.
 
-    A ``wrapper_kind`` other than ``node_bun`` (e.g. a non-Node CLI's own CA-env
-    recipe) is not implemented; onboarding such an app adds a recipe here.
+    A ``wrapper_kind`` outside the set above is not implemented; onboarding a CLI
+    on a new TLS stack adds a recipe here.
     """
-    if wrapper_kind != "node_bun":
+    if wrapper_kind == "node_bun":
+        ca_env = (
+            '# NODE_EXTRA_CA_CERTS APPENDS the proxy CA to the existing root store.\n'
+            'export NODE_EXTRA_CA_CERTS="$DIR/{ca}"\n'
+        ).format(ca=ca_filename)
+    elif wrapper_kind in ("rust_ssl_cert", "go_ssl_cert"):
+        ca_env = (
+            '# SSL_CERT_FILE REPLACES the trust store, so it points at the combined\n'
+            '# system+proxy bundle install_sdk_wrapper built beside this wrapper;\n'
+            '# SSL_CERT_DIR is cleared so that file is authoritative.\n'
+            'export SSL_CERT_FILE="$DIR/{bundle}"\n'
+            'export SSL_CERT_DIR=""\n'
+        ).format(bundle=_CA_BUNDLE_FILENAME)
+    else:
         raise ValueError("unsupported sdk wrapper_kind {!r}".format(wrapper_kind))
     return (
         "#!/bin/sh\n"
-        '# SNUG SDK metering wrapper (generated). Routes this SDK binary through\n'
+        '# {marker} (generated). Routes this SDK binary through\n'
         '# the local metering proxy, then execs the real binary.\n'
         'DIR="$(dirname "$0")"\n'
-        '# NODE_EXTRA_CA_CERTS APPENDS the proxy CA to the existing root store.\n'
-        'export NODE_EXTRA_CA_CERTS="$DIR/{ca}"\n'
+        '{ca_env}'
         'export HTTPS_PROXY="{proxy}"\n'
         'export HTTP_PROXY="{proxy}"\n'
         '# Loopback must bypass the proxy: the app may run its own local proxy on\n'
@@ -341,7 +508,8 @@ def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_b
         'export NO_PROXY="localhost,127.0.0.1,::1"\n'
         'export no_proxy="localhost,127.0.0.1,::1"\n'
         'exec "$DIR/{real}" "$@"\n'
-    ).format(ca=ca_filename, proxy=proxy_url, real=_real_name(binary_name))
+    ).format(marker=_SDK_WRAPPER_MARKER, ca_env=ca_env, proxy=proxy_url,
+             real=_real_name(binary_name))
 
 
 def candidate_home_roots(home):
@@ -369,19 +537,21 @@ def find_sdk_dirs(home, sdk):
     ``explicit_path``) that hold a not-yet-wrapped ``sdk`` binary and therefore
     need wrapping.
 
+    "Not-yet-wrapped" is decided by ``_is_wrappable_sdk`` per ``sdk.target_kind``
+    (ELF magic for a compiled ``elf`` binary; the wrapper marker for a ``script``
+    launcher), so a dir we already wrapped is skipped (idempotent).
+
     Dispatch on ``sdk.discovery``:
       - ``home_glob`` — the re-downloaded-SDK layout
         ``<home>/.../<*container_substr*>/<version>/<binary_name>``. We walk for
-        that shape and keep only dirs whose binary is STILL an ELF (the real
-        binary) — a dir we already wrapped has a ``#!/bin/sh`` binary there
-        instead, so it is skipped (idempotent). Best-effort; missing dirs are
-        simply absent from the walk.
+        that shape and keep only dirs whose binary is still the real (unwrapped)
+        entrypoint. Best-effort; missing dirs are simply absent from the walk.
       - ``explicit_path`` — the binary is baked at a fixed location, so we check
         each dir in ``sdk.explicit_dirs`` directly (``home`` is ignored: the
-        paths are absolute). Same ELF-vs-wrapper idempotency as home_glob; a
-        symlinked binary counts (``isfile``/``_is_elf`` follow it), which is the
-        on-PATH case we wrap. The watcher calls this once per home root and
-        dedups, so returning the same absolute dir each call is harmless.
+        paths are absolute). A symlinked binary counts (``_is_wrappable_sdk``
+        follows it), which is the on-PATH case we wrap (opencode's ELF symlink,
+        Claude Code's node-cli symlink). The watcher calls this once per home root
+        and dedups, so returning the same absolute dir each call is harmless.
       - ``path_lookup`` — reserved for a PATH-resolved single binary; not yet
         implemented (a real app of that shape adds the mode here).
     """
@@ -389,7 +559,7 @@ def find_sdk_dirs(home, sdk):
         matches = []  # type: List[str]
         for d in sdk.explicit_dirs:
             bin_path = os.path.join(d, sdk.binary_name)
-            if os.path.isfile(bin_path) and _is_elf(bin_path):
+            if _is_wrappable_sdk(bin_path, sdk.target_kind):
                 matches.append(d)
         return matches
     if sdk.discovery != "home_glob":
@@ -411,7 +581,7 @@ def find_sdk_dirs(home, sdk):
         if sdk.expects_version_parent and not parent:
             continue
         bin_path = os.path.join(root, sdk.binary_name)
-        if _is_elf(bin_path):
+        if _is_wrappable_sdk(bin_path, sdk.target_kind):
             matches.append(root)
     return matches
 
@@ -483,32 +653,64 @@ def _chown_to_owner(ref_path, paths):
             pass
 
 
+def _write_combined_ca_bundle(dst_path, proxy_ca_path):
+    # type: (str, str) -> bool
+    """Write ``dst_path`` = the system root bundle followed by the proxy CA, so a
+    client told to use it as its SOLE trust store (``SSL_CERT_FILE``, which
+    REPLACES rather than appends) still verifies both real upstreams (the
+    blind-tunnelled, non-provider hosts) and the proxy's MITM cert.
+
+    Returns False when no system bundle is found (can't safely build a store that
+    trusts real upstreams) or on any write error — the caller then bails the wrap
+    rather than pointing the client at a proxy-CA-only store."""
+    system = next((p for p in _SYSTEM_CA_BUNDLES if os.path.isfile(p)), None)
+    if system is None:
+        return False
+    try:
+        with open(dst_path, "wb") as out:
+            with open(system, "rb") as fh:
+                out.write(fh.read())
+            out.write(b"\n")
+            with open(proxy_ca_path, "rb") as fh:
+                out.write(fh.read())
+        return True
+    except Exception as ex:
+        _cd_log("combined CA bundle write failed for {}: {}".format(dst_path, ex))
+        return False
+
+
 def install_sdk_wrapper(sdk_dir, ca_src_path, proxy_url, sdk):
     # type: (str, str, str, SdkBinary) -> bool
     """Shadow the app's SDK binary in ``sdk_dir`` with a proxy wrapper.
 
     Steps (idempotent):
-      1. Copy the proxy CA to ``sdk_dir/snug_ca.pem``. It MUST sit beside the
-         wrapper: an app may run the SDK under ``bwrap``, which gives the sandbox
-         a fresh tmpfs ``/tmp`` but ro-binds the SDK dir at its real path — so a
-         CA written to ``/tmp`` would be invisible inside the sandbox, while one
-         beside the wrapper is reachable via ``$(dirname "$0")``. This runs FIRST
-         so that if the proxy hasn't written its CA yet, we bail WITHOUT having
-         disturbed the SDK (the watcher just retries next tick).
-      2. If ``sdk_dir/<binary>`` is still an ELF, rename it to ``<binary>.real``.
-         If it is already our wrapper (not an ELF), do nothing and return False.
+      1. Copy the proxy CA to ``sdk_dir/snug_ca.pem`` (and, for an
+         ``SSL_CERT_FILE``-based recipe, build the combined system+proxy bundle
+         beside it). It MUST sit beside the wrapper: an app may run the SDK under
+         ``bwrap``, which gives the sandbox a fresh tmpfs ``/tmp`` but ro-binds the
+         SDK dir at its real path — so a CA written to ``/tmp`` would be invisible
+         inside the sandbox, while one beside the wrapper is reachable via
+         ``$(dirname "$0")``. This runs FIRST so that if the proxy hasn't written
+         its CA yet, we bail WITHOUT having disturbed the SDK (the watcher just
+         retries next tick).
+      2. If ``sdk_dir/<binary>`` is still the real entrypoint, rename it to
+         ``<binary>.real``. If it is already our wrapper, do nothing, return False.
       3. Write the ``#!/bin/sh`` wrapper to ``sdk_dir/<binary>`` and chmod +x.
 
-    Returns True iff it performed the wrap this call (i.e. found a real ELF and
-    replaced it); False if already wrapped or on any failure.
+    Returns True iff it performed the wrap this call (i.e. found a real entrypoint
+    and replaced it); False if already wrapped or on any failure.
     """
     bin_path = os.path.join(sdk_dir, sdk.binary_name)
     real_path = os.path.join(sdk_dir, _real_name(sdk.binary_name))
 
-    # Already wrapped (binary is our shell script, not an ELF) -> no-op.
-    if not _is_elf(bin_path):
+    # Already wrapped (the path is our shell wrapper, not the real entrypoint)
+    # -> no-op. What "real vs wrapper" means depends on the SDK's target_kind
+    # (ELF magic for a compiled binary; the wrapper marker for a script).
+    if not _is_wrappable_sdk(bin_path, sdk.target_kind):
         return False
 
+    ssl_cert_recipe = sdk.wrapper_kind in ("rust_ssl_cert", "go_ssl_cert")
+    bundle_dst = os.path.join(sdk_dir, _CA_BUNDLE_FILENAME)
     try:
         # 1. Drop the CA beside the wrapper BEFORE we disturb the SDK binary (see
         # docstring: bwrap ro-binds this dir, tmpfs /tmp is not shared). If the
@@ -517,8 +719,17 @@ def install_sdk_wrapper(sdk_dir, ca_src_path, proxy_url, sdk):
         ca_dst = os.path.join(sdk_dir, _CA_FILENAME)
         shutil.copyfile(ca_src_path, ca_dst)
 
+        # 1b. For an SSL_CERT_FILE recipe the wrapper points at a COMBINED bundle
+        # (system roots + proxy CA), since SSL_CERT_FILE replaces the store. Build
+        # it now; if we can't (no system store found), bail with the SDK still
+        # intact rather than shipping a proxy-CA-only store that breaks upstreams.
+        if ssl_cert_recipe and not _write_combined_ca_bundle(bundle_dst, ca_src_path):
+            _cd_log("wrap: no combined CA bundle for {} (no system root store found); "
+                    "leaving {} un-wrapped".format(sdk_dir, sdk.binary_name))
+            return False
+
         # 2. Preserve the real binary. If a stale <binary>.real already exists from
-        # a prior partial wrap, the fresh ELF is the authoritative one -> replace.
+        # a prior partial wrap, the fresh entrypoint is authoritative -> replace.
         if os.path.exists(real_path):
             os.remove(real_path)
         os.rename(bin_path, real_path)
@@ -546,7 +757,10 @@ def install_sdk_wrapper(sdk_dir, ca_src_path, proxy_url, sdk):
         # 4. Hand the files we just created/renamed as root back to the SDK dir's
         # owner (the desktop user), so the app can still chmod/re-download its own
         # binary instead of hitting EPERM/EACCES on a root-owned wrapper/CA.
-        _chown_to_owner(sdk_dir, (bin_path, real_path, ca_dst))
+        created = [bin_path, real_path, ca_dst]
+        if ssl_cert_recipe:
+            created.append(bundle_dst)
+        _chown_to_owner(sdk_dir, tuple(created))
         _cd_log("wrapped SDK dir {}".format(sdk_dir), debug=True)
         return True
     except Exception as ex:
@@ -644,8 +858,9 @@ class _WatcherHandle(object):
             pass
 
 
-def start_sdk_watcher(home, ca_src_path, proxy_url, app_id, poll_sec=0.5):
-    # type: (str, str, str, str, float) -> _WatcherHandle
+def start_sdk_watcher(home, ca_src_path, proxy_url, app_id, poll_sec=0.5,
+                      wrap_bins="", wrap_kind=""):
+    # type: (str, str, str, str, float, str, str) -> _WatcherHandle
     """Start a SUBPROCESS that keeps every watched SDK dir under ``home`` wrapped.
 
     An app may re-download its SDK dir (a fresh, un-wrapped binary appears) on
@@ -661,10 +876,13 @@ def start_sdk_watcher(home, ca_src_path, proxy_url, app_id, poll_sec=0.5):
     down; it outlives the exec, polls across the task's life, and is stopped
     explicitly at teardown (or dies with the container).
 
-    The child re-resolves the app profile from ``--app-id`` so it wraps exactly
-    the watched SDK binaries this app declares. stdout/stderr are inherited (not
-    redirected) so the child's ``[snug-app]`` lines reach the task console.
-    Returns a handle with ``.stop()``.
+    The child reconstructs the watched SDK binaries from ``--app-id``: a literal
+    ``BUILTIN_PROFILES`` entry (e.g. Claude Desktop's home_glob SDK) if the id is
+    one, else the generic CLI profile synthesized from ``--wrap-bins`` /
+    ``--wrap-kind`` (which the parent derives from the profile it is watching, so
+    a synthesized ``cli``/legacy profile survives the process boundary).
+    stdout/stderr are inherited (not redirected) so the child's ``[snug-app]``
+    lines reach the task console. Returns a handle with ``.stop()``.
     """
     proc = subprocess.Popen(
         [
@@ -676,6 +894,8 @@ def start_sdk_watcher(home, ca_src_path, proxy_url, app_id, poll_sec=0.5):
             "--ca", ca_src_path,
             "--proxy-url", proxy_url,
             "--poll-sec", str(poll_sec),
+            "--wrap-bins", wrap_bins or "",
+            "--wrap-kind", wrap_kind or "",
         ],
         start_new_session=True,
     )
@@ -1282,12 +1502,16 @@ def app_mode_requested(config):
 def resolve_app_profile(config):
     # type: (object) -> Optional[AppProfile]
     """Resolve the opted-in app profile for this agent, or None when app-mode is
-    off (so a plain agent is unaffected) OR when the configured name isn't a known
-    profile.
+    off (so a plain agent is unaffected) OR when the configured mode can't be
+    resolved to a usable profile.
 
-    ``agent.snug.app_mode`` names the app profile to enable (e.g.
-    ``"claude_desktop"``); unset or "" means off. An ``app_mode`` naming a profile
-    that isn't registered logs and returns None — the caller uses
+    ``agent.snug.app_mode`` selects the mode; unset or "" means off. Resolution:
+      1. a literal :data:`BUILTIN_PROFILES` entry (e.g. ``claude_desktop``);
+      2. ``"cli"`` — the generic terminal-CLI mode, synthesized from
+         ``agent.snug.wrap_bins`` + ``agent.snug.wrap_kind`` (env-bridged);
+      3. a legacy per-app name in :data:`_CLI_LEGACY_PRESETS` (``opencode`` …),
+         routed through the same synthesizer for back-compat.
+    A mode that resolves to nothing logs and returns None — the caller uses
     ``app_mode_requested`` to distinguish that misconfiguration (fail closed) from
     the off case. Follows the existing ``agent.snug.*`` config-read idiom
     (``config.get(key, default)``); any read error -> None.
@@ -1296,10 +1520,17 @@ def resolve_app_profile(config):
     if not name:
         return None
     profile = BUILTIN_PROFILES.get(name)
-    if profile is None:
-        _cd_log("app-mode {!r} is not a known app profile; metering not started".format(name))
-        return None
-    return profile
+    if profile is not None:
+        return profile
+    if name == "cli":
+        bins = _parse_wrap_bins(config.get("agent.snug.wrap_bins", ""))
+        kind = str(config.get("agent.snug.wrap_kind", "") or "node_bun")
+        return _synthesize_cli_profile("cli", bins, kind)
+    if name in _CLI_LEGACY_PRESETS:
+        bin_name, kind = _CLI_LEGACY_PRESETS[name]
+        return _synthesize_cli_profile(name, [bin_name], kind)
+    _cd_log("app-mode {!r} is not a known app profile; metering not started".format(name))
+    return None
 
 
 class AppMeteringHandle(object):
@@ -1381,6 +1612,26 @@ class AppMeteringHandle(object):
                 self.log_fh.close()
             except Exception:
                 pass
+
+
+def _any_watched_sdk_present(sdks, home):
+    # type: (List[SdkBinary], str) -> bool
+    """True iff at least one of ``sdks`` has its binary present on disk right now
+    (the image bakes the CLI in), counting the path whether or not we've already
+    wrapped it — the launcher-less fail-closed gate. A wrap target that never
+    appears means the app would run un-metered.
+
+    explicit_path: the binary file exists in one of ``explicit_dirs`` (isfile
+    follows a symlink, and matches our wrapper too, so a re-run on a persistent FS
+    isn't a false negative). home_glob: an UNwrapped copy is found under a home
+    root (best effort; the launcher-less consumers today are all explicit_path)."""
+    for sdk in sdks:
+        if sdk.discovery == "explicit_path":
+            if any(os.path.isfile(os.path.join(d, sdk.binary_name)) for d in sdk.explicit_dirs):
+                return True
+        elif any(find_sdk_dirs(root, sdk) for root in candidate_home_roots(home)):
+            return True
+    return False
 
 
 def setup_app_metering(
@@ -1604,6 +1855,25 @@ def setup_app_metering(
         if not launchers_wrapped:
             return handle
 
+        watched_sdks = [s for s in (profile.sdk_binaries or ()) if getattr(s, "watched", False)]
+
+        # Fail-closed for launcher-less CLI apps: with no Electron launcher to gate
+        # on, metering rests entirely on wrapping the SDK binary — but the wrap is
+        # asynchronous (the watcher), so metering_active (True above once the empty
+        # launcher loop passes) would stay True even if the binary lives at a path
+        # we never wrap, silently running the app un-metered. The app bakes its CLI
+        # into the image, so at least one watched binary MUST be present in a
+        # configured location at setup; if none is, the wrap targets are
+        # misconfigured (wrong wrap_bins / dir / recipe) -> fail closed rather than
+        # meter nothing.
+        if not profile.launchers and watched_sdks and not _any_watched_sdk_present(watched_sdks, home):
+            handle.metering_active = False
+            _cd_log(
+                "app-mode '{}' metering NOT active: none of the wrap targets {} are "
+                "present at setup; refusing to run the task un-metered".format(
+                    profile.app_id, [s.binary_name for s in watched_sdks]))
+            return handle
+
         # Bake the proxy CA into the desktop user's NSS trust stores so the
         # EXTERNAL browser the app opens for Google OAuth trusts the proxy CA.
         # Strictly best-effort and NOT a metering gate: wrapped in its own guard
@@ -1620,13 +1890,19 @@ def setup_app_metering(
             except Exception as ex:
                 _cd_log("NSS trust: install step errored (ignored): {}".format(ex))
 
-        # Start the SDK-dir watcher only when the profile has a watched SDK.
-        if any(getattr(s, "watched", False) for s in (profile.sdk_binaries or ())):
+        # Start the SDK-dir watcher only when the profile has a watched SDK. Pass
+        # the watched bins + recipe so a synthesized (cli / legacy) profile — which
+        # isn't in BUILTIN_PROFILES — is reconstructable in the watcher subprocess;
+        # for a literal profile (Claude Desktop) the child re-resolves it by app_id
+        # and ignores these.
+        if watched_sdks:
             handle.watcher = start_sdk_watcher(
                 home=home,
                 ca_src_path=ca_path,
                 proxy_url=handle.proxy_url,
                 app_id=profile.app_id,
+                wrap_bins=",".join(s.binary_name for s in watched_sdks),
+                wrap_kind=(watched_sdks[0].wrapper_kind or "node_bun"),
             )
     except Exception:
         handle.teardown()
@@ -1637,8 +1913,10 @@ def setup_app_metering(
 
 if __name__ == "__main__":
     # CLI entry so the watcher can run as its own process (see start_sdk_watcher
-    # for why it must outlive the agent's os.execv). It re-resolves the app
-    # profile from --app-id and watches that app's watched SDK binaries.
+    # for why it must outlive the agent's os.execv). It reconstructs the app
+    # profile from --app-id (a literal BUILTIN_PROFILES entry) or, failing that,
+    # the generic CLI profile synthesized from --wrap-bins/--wrap-kind, and
+    # watches that profile's watched SDK binaries.
     import argparse
 
     _parser = argparse.ArgumentParser(
@@ -1650,10 +1928,15 @@ if __name__ == "__main__":
     _parser.add_argument("--ca", required=True)
     _parser.add_argument("--proxy-url", required=True)
     _parser.add_argument("--poll-sec", type=float, default=0.5)
+    _parser.add_argument("--wrap-bins", default="")
+    _parser.add_argument("--wrap-kind", default="")
     _args = _parser.parse_args()
     _profile = BUILTIN_PROFILES.get(_args.app_id)
     if _profile is None:
-        _cd_log("watcher: unknown app-id {!r}; nothing to watch".format(_args.app_id))
+        _profile = _synthesize_cli_profile(
+            _args.app_id, _parse_wrap_bins(_args.wrap_bins), _args.wrap_kind or "node_bun")
+    if _profile is None:
+        _cd_log("watcher: unknown app-id {!r} and no wrap bins; nothing to watch".format(_args.app_id))
         sys.exit(0)
     _watched = [s for s in (_profile.sdk_binaries or ()) if getattr(s, "watched", False)]
     _run_watcher(_args.home, _args.ca, _args.proxy_url, _watched, _args.poll_sec)
