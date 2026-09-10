@@ -3887,7 +3887,7 @@ class Worker(ServiceCommandSection):
         # if we are using a Command i.e. not execs update command env vars
         command.update_envs(os.environ)
 
-        print("Starting Task Execution:\n".format(current_task.id))
+        print("Starting Task Execution: {}\n".format(current_task.id))
         exit_code = -1
         try:
             if disable_monitoring:

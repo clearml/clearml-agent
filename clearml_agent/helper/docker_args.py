@@ -318,6 +318,6 @@ class DockerArgsTemplateResolver(TemplateResolver):
                     project_info=self.project_info,
                 )
             except Exception as ex:
-                print("Failed parsing ClearML Template argument [{}] skipped: error ()".format(token, ex))
+                print("Failed parsing ClearML Template argument [{}] skipped: error ({})".format(token, ex))
 
         return full_docker_cmd
