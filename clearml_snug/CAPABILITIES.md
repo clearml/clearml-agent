@@ -58,7 +58,7 @@ attributed to `claude-haiku-4-5` or `gpt-4o`, not just to "Anthropic" or
 
 With `report_task_metrics: true`, SNUG plots the task's LLM usage on its own
 **SCALARS** tab as a **continuous per-second time series**: each wall-second
-reports that second's traffic (tokens / bytes / requests summed, latency
+reports that second's traffic (tokens / bytes summed, latency
 averaged) and a second with no traffic reports **0**, so every line runs
 uninterrupted over time rather than as sparse points at each call. You get one
 chart per signal, with a series per provider/model (and per chat when the request
@@ -70,9 +70,13 @@ identifies its conversation):
 | `LLM Cache Read Tokens` | prompt tokens served from the provider's cache |
 | `LLM Cache Write Tokens` | prompt tokens written into the cache |
 | `LLM Output Tokens` | completion tokens |
-| `LLM Requests` | metered requests completed in the second |
 | `LLM Latency (ms)` | mean request duration over the second |
 | `LLM Bytes Sent` / `LLM Bytes Received` | plaintext bytes per direction |
+
+`LLM Requests (cumulative)` is the exception: it plots a **cumulative** running
+total of metered requests per provider/model (one climbing line), not a
+per-second rate - a request-per-second signal is an uninformative 0/1 line, so
+the count accumulates instead (named like the other cumulative charts).
 
 The three input charts are a **disjoint split** — fresh, cache-read, and
 cache-write never double-count, so they sum to the provider's total prompt

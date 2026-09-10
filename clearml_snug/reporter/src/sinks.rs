@@ -17,9 +17,9 @@
 //!     resolved no model (a non-LLM call).
 //!   * task-metrics — per-SECOND usage scalars to this task's SCALARS tab via
 //!     `events.add_batch` (`training_stats_scalar`). The point series (tokens
-//!     in/out, cache read/write, latency, bytes, requests) are a CONTINUOUS
+//!     in/out, cache read/write, latency, bytes) are a CONTINUOUS
 //!     per-second time series: each second reports that second's accumulated
-//!     traffic (tokens / bytes / request-count summed, latency averaged), and a
+//!     traffic (tokens / bytes summed, latency averaged), and a
 //!     second with NO traffic reports 0 — so every series is an uninterrupted
 //!     rate-over-time line rather than a sparse point-per-call. One series per
 //!     configured field, variant = provider (+ model when known, + chat ordinal
@@ -36,9 +36,11 @@
 //!     (stops emitting and is pruned), so a finished chat can't 0-fill forever
 //!     (chat ids are never reused). It re-appears as a new segment if it resumes.
 //!
-//!     Two families stay PER-REQUEST (not per-second, not 0-filled), each on its
+//!     Three families stay PER-REQUEST (not per-second, not 0-filled), each on its
 //!     own charts against a per-captured-request enumerator (`per_request_events`):
-//!     each token field's "(cumulative)" running total, and tool activity — a
+//!     each token field's "(cumulative)" running total, the cumulative request
+//!     count ("LLM Requests (cumulative)", a running total per provider/model), and tool
+//!     activity - a
 //!     SIGNAL line (0 idle / +1 used / -1 errored, errors dominate; aggregate per
 //!     provider/chat and per tool name, so failures read as downward spikes) plus
 //!     a CUMULATIVE chart (a monotonically-increasing running total of tool calls
@@ -92,13 +94,15 @@ const MAX_RATE_FILL_SECS: u64 = 3600;
 /// again.
 const RATE_IDLE_RETIRE_SECS: u64 = 120;
 
-/// (field key, scalar metric title). Every field here EXCEPT the tool fields is
-/// a per-second POINT series (see `advance_rate_clock`): each second reports that
-/// second's summed count (tokens/bytes/requests) or averaged latency, 0 when
-/// idle. `tool_calls`/`tool_call_errors` stay valid config keys here (either
-/// enables tool metering) but are NOT per-second points — they drive the tool
-/// SIGNAL series instead (see `TOOL_FIELDS` / `per_request_events`), so their
-/// titles below are only documentation.
+/// (field key, scalar metric title). Every field here EXCEPT the tool fields and
+/// `requests` is a per-second POINT series (see `advance_rate_clock`): each
+/// second reports that second's summed count (tokens/bytes) or averaged latency,
+/// 0 when idle. Three keys stay valid config entries here but are NOT per-second
+/// points, so their titles below are only documentation: `tool_calls` /
+/// `tool_call_errors` (either enables tool metering) drive the tool SIGNAL series
+/// instead, and `requests` drives a CUMULATIVE running total per provider/model
+/// (both via `per_request_events`) - a request-per-second rate is an
+/// uninformative 0/1 line, so requests accumulate instead.
 const FIELD_SPECS: &[(&str, &str)] = &[
     ("tokens_in", "LLM Input Tokens"),
     ("tokens_out", "LLM Output Tokens"),
@@ -122,6 +126,19 @@ const FIELD_SPECS: &[(&str, &str)] = &[
 /// feed the tool SIGNAL series rather than the generic per-field loop, so
 /// they're filtered out of it.
 const TOOL_FIELDS: &[&str] = &["tool_calls", "tool_call_errors"];
+
+/// The request-count field. Like the tool fields it is a valid config key but is
+/// filtered out of the per-second loop: it plots as a CUMULATIVE running total
+/// per provider/model (see `per_request_events`), one climbing line, rather than
+/// a per-second rate.
+const REQUESTS_FIELD: &str = "requests";
+
+/// Title of the cumulative request-count chart - a monotonically-increasing line
+/// per provider/model. Carries the "(cumulative)" suffix like the token and tool
+/// cumulative charts (`CUMULATIVE_SPECS`, `TOOL_CUMULATIVE_METRIC`); the
+/// `FIELD_SPECS` "LLM Requests" entry is only the field's doc name (never
+/// emitted), so this is the real chart title.
+const REQUESTS_CUMULATIVE_METRIC: &str = "LLM Requests (cumulative)";
 // Tool activity is shown as a SIGNAL, not a count: a line sits at 0, jumps to
 // +1 when a tool was used in that request, and DIPS to -1 when a tool result
 // errored — errors dominate (-1 wins over +1 in a request with both), so
@@ -208,7 +225,7 @@ struct Completed {
 
 /// One second's accumulated traffic for a single series variant — the raw
 /// material for the per-second point series. Summed for additive fields
-/// (tokens/bytes/requests); latency is kept as sum+count so it can be AVERAGED
+/// (tokens/bytes); latency is kept as sum+count so it can be AVERAGED
 /// (a per-second latency SUM would be meaningless — a mean latency for the
 /// second's requests is the useful signal). A `Default` (all-zero) bucket is the
 /// value a series reports for a second it had no traffic.
@@ -222,14 +239,13 @@ struct RateBucket {
     bytes_rx: f64,
     latency_sum: f64,
     latency_count: u64,
-    requests: u64,
 }
 
 impl RateBucket {
     /// The per-second value for one configured field. Additive fields return the
     /// second's sum; `latency_ms` returns the mean over the second's requests (0
-    /// when none); `requests` the count. Unknown fields (e.g. the tool fields,
-    /// which never reach here) return 0.
+    /// when none). Fields that never reach the per-second loop (the tool fields
+    /// and `requests`, which are filtered out of it) return 0.
     fn value(&self, field: &str) -> f64 {
         match field {
             "tokens_in" => self.fresh_in,
@@ -245,7 +261,6 @@ impl RateBucket {
                     0.0
                 }
             }
-            "requests" => self.requests as f64,
             _ => 0.0,
         }
     }
@@ -307,6 +322,11 @@ pub struct Sinks {
     /// field without colliding across them, and every chat of a model feeds one
     /// total.
     token_cum: HashMap<String, f64>,
+    /// Running request count - the value of the "LLM Requests (cumulative)" chart.
+    /// Keyed on the chat-less `base` so a model's chats merge into one climbing
+    /// line, matching the token cumulative charts. Incremented once per captured
+    /// request.
+    requests_cum: HashMap<String, u64>,
     /// Pending `report_llm_usage` events, flushed in one POST. `usage_bytes`
     /// tracks their serialized size (the flush/cap trigger), mirroring the
     /// agent's `count_bytes`.
@@ -355,6 +375,7 @@ impl Sinks {
             tool_calls_cum: HashMap::new(),
             tool_call_errors_cum: HashMap::new(),
             token_cum: HashMap::new(),
+            requests_cum: HashMap::new(),
             usage_buf: Vec::new(),
             usage_bytes: 0,
             metrics_buf: Vec::new(),
@@ -744,13 +765,14 @@ impl Sinks {
     }
 
     /// The configured point fields — everything except the tool fields (which ride
-    /// the signal series, not a per-second point). These are the series that emit
-    /// once per second and 0-fill idle seconds.
+    /// the signal series) and `requests` (which rides the cumulative running
+    /// total), neither a per-second point. These are the series that emit once per
+    /// second and 0-fill idle seconds.
     fn rate_generic_fields(&self) -> Vec<&'static str> {
         self.metric_fields
             .iter()
             .copied()
-            .filter(|f| !TOOL_FIELDS.contains(f))
+            .filter(|f| !TOOL_FIELDS.contains(f) && *f != REQUESTS_FIELD)
             .collect()
     }
 
@@ -808,7 +830,6 @@ impl Sinks {
         b.bytes_rx += c.bytes_rx as f64;
         b.latency_sum += c.latency_ms as f64;
         b.latency_count += 1;
-        b.requests += 1;
     }
 
     /// Advance the per-second point-series clock to `target_sec`: emit the
@@ -982,8 +1003,9 @@ impl Sinks {
 
     /// Build the PER-REQUEST `training_stats_scalar` events for one completed
     /// request: each configured token field's cumulative running total (keyed on
-    /// the chat-less `base`, so a model's chats merge into one climbing line) plus
-    /// the tool signal / cumulative / per-tool series. The point series are NOT
+    /// the chat-less `base`, so a model's chats merge into one climbing line), the
+    /// cumulative request count ("LLM Requests (cumulative)", also keyed on `base`), plus the
+    /// tool signal / cumulative / per-tool series. The point series are NOT
     /// here — they are per-second (see `accumulate_rate`). The x-axis (`iter`) is a
     /// per-captured-request enumerator shared by these charts; `timestamp`
     /// (`ts_ms`) carries the capture wall-time. Mutates the running totals; no I/O.
@@ -1028,6 +1050,28 @@ impl Sinks {
                 *n
             };
             events.push(scalar_event(&self.task_id, title, &base, total, iter, ts_ms));
+        }
+
+        // Cumulative request count: one climbing line per provider/model (keyed on
+        // the chat-less `base`, so a model's chats merge into a single running
+        // total, matching the token cumulative charts). Requests plot ONLY as this
+        // cumulative - a per-second request rate is an uninformative 0/1 signal, so
+        // unlike the token fields there is no per-second twin. Emitted once per
+        // captured request (+1).
+        if self.metric_fields.contains(&REQUESTS_FIELD) {
+            let total = {
+                let n = self.requests_cum.entry(base.clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            events.push(scalar_event(
+                &self.task_id,
+                REQUESTS_CUMULATIVE_METRIC,
+                &base,
+                total as f64,
+                iter,
+                ts_ms,
+            ));
         }
 
         // Tool activity as a SIGNAL (0 idle / +1 used / -1 errored; errors win).
@@ -1148,9 +1192,12 @@ fn metric_title(field: &str) -> &'static str {
         .unwrap_or("LLM Metric")
 }
 
-/// Running-total chart title for a field, or `None` for fields with no cumulative
-/// twin (latency/bytes/requests are per-second rate signals that don't accumulate
-/// into a meaningful running total).
+/// Running-total chart title for a field, or `None` for fields with no
+/// `CUMULATIVE_SPECS` twin. Latency and bytes are per-second rate signals that
+/// don't accumulate into a meaningful running total; `requests` DOES plot a
+/// running total but via its own dedicated series (`per_request_events` /
+/// `requests_cum`, titled "LLM Requests (cumulative)"), not a `CUMULATIVE_SPECS` twin, so it
+/// returns `None` here too.
 fn cumulative_title(field: &str) -> Option<&'static str> {
     CUMULATIVE_SPECS
         .iter()
@@ -1697,9 +1744,9 @@ mod tests {
     #[test]
     fn rate_sums_within_second_latency_averaged() {
         // Two requests in the same wall-second: additive fields sum, latency is
-        // averaged, requests counts them.
+        // averaged over them.
         let mut fwd = LogForwarder::new("t".into(), "w".into());
-        let mut s = sinks(&["tokens_in", "tokens_out", "bytes_tx", "bytes_rx", "latency_ms", "requests"]);
+        let mut s = sinks(&["tokens_in", "tokens_out", "bytes_tx", "bytes_rx", "latency_ms"]);
         let mk = |tin, tout, tx, rx, lat| {
             let mut c = completed();
             c.tokens_in = tin;
@@ -1719,7 +1766,6 @@ mod tests {
         assert_eq!(v("LLM Output Tokens"), 30.0);
         assert_eq!(v("LLM Bytes Sent"), 10.0, "bytes summed");
         assert_eq!(v("LLM Bytes Received"), 10.0);
-        assert_eq!(v("LLM Requests"), 2.0, "count in the second");
         assert_eq!(v("LLM Latency (ms)"), 200.0, "averaged: (100 + 300) / 2");
     }
 
@@ -1728,7 +1774,7 @@ mod tests {
         // THE core behavior: after a request in second 1, idle seconds report 0
         // for every configured series so each line is continuous over time.
         let mut fwd = LogForwarder::new("t".into(), "w".into());
-        let mut s = sinks(&["tokens_in", "requests"]);
+        let mut s = sinks(&["tokens_in"]);
         let mut c = completed();
         c.tokens_in = 100;
         c.model = Some("m".into());
@@ -1739,7 +1785,6 @@ mod tests {
         s.on_tick(2000, &mut fwd);
         let e1 = take_metrics(&mut s);
         assert_eq!(scalar_value(&e1, "LLM Input Tokens", "Anthropic / m"), 100.0);
-        assert_eq!(scalar_value(&e1, "LLM Requests", "Anthropic / m"), 1.0);
         let p1 = e1
             .iter()
             .find(|x| x["metric"] == "LLM Input Tokens" && x["iter"] == 1)
@@ -1763,9 +1808,6 @@ mod tests {
         assert_eq!(zeros[0]["timestamp"], 2000);
         assert_eq!(zeros[1]["iter"], 3);
         assert_eq!(zeros[1]["timestamp"], 3000);
-        let rzeros: Vec<&Value> = e2.iter().filter(|x| x["metric"] == "LLM Requests").collect();
-        assert_eq!(rzeros.len(), 2, "requests 0-filled too");
-        assert!(rzeros.iter().all(|z| z["value"] == 0.0));
     }
 
     #[test]
@@ -1793,9 +1835,12 @@ mod tests {
     }
 
     #[test]
-    fn rate_requests_counted_per_second_per_chat() {
-        // "requests" is a per-second COUNT (not a running total) split per chat.
-        let mut fwd = LogForwarder::new("t".into(), "w".into());
+    fn requests_cumulative_per_base() {
+        // "requests" plots a CUMULATIVE running total per provider/model, not a
+        // per-second count: every captured request adds 1 to the base line, and a
+        // model's separate chats feed the SAME total (the chat dimension is
+        // dropped from the key, like the token cumulative charts). It rides
+        // per_request_events, not the per-second rate path.
         let mut s = sinks(&["requests"]);
         let mk = |chat: &str| {
             let mut c = completed();
@@ -1804,14 +1849,36 @@ mod tests {
             c.model = Some("m".into());
             c
         };
-        // Second 1: chat 1 twice, chat 2 once.
-        s.accumulate_rate("Anthropic", &mk("1"), 1000, &mut fwd);
-        s.accumulate_rate("Anthropic", &mk("2"), 1200, &mut fwd);
-        s.accumulate_rate("Anthropic", &mk("1"), 1500, &mut fwd);
-        s.on_tick(2000, &mut fwd);
-        let e = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e, "LLM Requests", "Anthropic / m / chat 1"), 2.0);
-        assert_eq!(scalar_value(&e, "LLM Requests", "Anthropic / m / chat 2"), 1.0);
+        // First request on chat 1: the base line reads 1, keyed on the chat-less
+        // base (never on a per-chat variant).
+        let e1 = s.per_request_events("Anthropic", &mk("1"), 1000);
+        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "Anthropic / m"), 1.0);
+        assert!(
+            !e1.iter().any(|x| x["variant"] == "Anthropic / m / chat 1"),
+            "requests cumulative is keyed on base, not per chat"
+        );
+        // A second request on the same chat climbs the total to 2.
+        let e2 = s.per_request_events("Anthropic", &mk("1"), 2000);
+        assert_eq!(scalar_value(&e2, "LLM Requests (cumulative)", "Anthropic / m"), 2.0);
+        // A different chat of the same model feeds the SAME running total.
+        let e3 = s.per_request_events("Anthropic", &mk("2"), 3000);
+        assert_eq!(scalar_value(&e3, "LLM Requests (cumulative)", "Anthropic / m"), 3.0, "chats share one total");
+        // A different model is its own climbing line, starting at 1.
+        let mut c = mk("1");
+        c.model = Some("m2".into());
+        let e4 = s.per_request_events("Anthropic", &c, 4000);
+        assert_eq!(scalar_value(&e4, "LLM Requests (cumulative)", "Anthropic / m2"), 1.0, "per-model total");
+
+        // And it is NOT on the per-second rate path: the rate loop emits no
+        // "LLM Requests (cumulative)" point series.
+        let mut fwd = LogForwarder::new("t".into(), "w".into());
+        s.accumulate_rate("Anthropic", &mk("1"), 5000, &mut fwd);
+        s.on_tick(6000, &mut fwd);
+        let rate = take_metrics(&mut s);
+        assert!(
+            !rate.iter().any(|x| x["metric"] == "LLM Requests (cumulative)"),
+            "requests does not emit a per-second point series"
+        );
     }
 
     #[test]
@@ -1914,7 +1981,7 @@ mod tests {
             "task-1".into(),
             false,
             true,
-            &["tokens_in".to_string(), "requests".to_string()],
+            &["tokens_in".to_string()],
             None,
             String::new(),
             String::new(),
@@ -1924,7 +1991,35 @@ mod tests {
         s.on_tick(2000, &mut fwd);
         let e = take_metrics(&mut s);
         assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / claude-haiku-4-5"), 100.0);
-        assert_eq!(scalar_value(&e, "LLM Requests", "Anthropic / claude-haiku-4-5"), 1.0);
+    }
+
+    #[test]
+    fn requests_cumulative_reported_via_on_event() {
+        // Full path: successive whitelisted completions through on_event climb the
+        // "LLM Requests (cumulative)" line (keyed on provider/model). Unlike the
+        // per-second points it needs no tick - it emits per request.
+        let mut fwd = LogForwarder::new("t".into(), "w".into());
+        let mut s = Sinks::new(
+            "task-1".into(),
+            false,
+            true,
+            &["requests".to_string()],
+            None,
+            String::new(),
+            String::new(),
+        );
+        s.on_event(&started(1, "api.anthropic.com"), &mut fwd);
+        s.on_event(&rc(1, Some("claude-haiku-4-5"), 100, 20), &mut fwd);
+        let e1 = take_metrics(&mut s);
+        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "Anthropic / claude-haiku-4-5"), 1.0);
+        s.on_event(&started(2, "api.anthropic.com"), &mut fwd);
+        s.on_event(&rc(2, Some("claude-haiku-4-5"), 50, 10), &mut fwd);
+        let e2 = take_metrics(&mut s);
+        assert_eq!(
+            scalar_value(&e2, "LLM Requests (cumulative)", "Anthropic / claude-haiku-4-5"),
+            2.0,
+            "climbs across requests"
+        );
     }
 
     #[test]
@@ -2030,10 +2125,10 @@ mod tests {
 
     #[test]
     fn per_request_empty_for_non_token_non_tool_fields() {
-        // Latency/bytes/requests have no cumulative twin and aren't tool fields, so
-        // per_request_events emits nothing for them — they live only on the
+        // Latency and bytes have no cumulative twin and aren't tool/request fields,
+        // so per_request_events emits nothing for them - they live only on the
         // per-second point charts.
-        let mut s = sinks(&["latency_ms", "bytes_tx", "bytes_rx", "requests"]);
+        let mut s = sinks(&["latency_ms", "bytes_tx", "bytes_rx"]);
         let mut c = completed();
         c.tokens_in = 10;
         c.tokens_out = 1;
