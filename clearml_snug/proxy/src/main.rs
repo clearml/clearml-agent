@@ -509,7 +509,11 @@ fn handle_conn(mut client: TcpStream, shared: Arc<Shared>) -> std::io::Result<()
         dlog(&format!("decrypt {}:{} (provider {:?})", host, port, provider));
         intercept(client, shared, host, port, provider)
     } else {
-        // Not decrypted: blind-tunnel, decrypt nothing.
+        // Not decrypted: blind-tunnel, decrypt nothing. Logged under debug so a
+        // provider miss - a metered CLI dialing a host we don't decrypt (a
+        // ChatGPT-auth Codex hitting chatgpt.com, or a gateway URL) - is visible
+        // rather than invisible, since the raw tunnel itself never reports.
+        dlog(&format!("blind-tunnel {}:{} (provider {:?})", host, port, provider));
         blind_tunnel(client, &host, port)
     }
 }
@@ -1070,7 +1074,7 @@ fn tls_emit(leg: &Leg, plain: &[u8]) -> std::io::Result<()> {
 }
 
 /// Send TLS `close_notify` and shut the leg's socket down, best-effort.
-fn tls_shutdown(leg: &Leg) {
+fn tls_shutdown(leg: &Leg, how: std::net::Shutdown) {
     let Ok(mut sock) = leg.wsock.lock() else { return };
     let out = leg
         .conn
@@ -1083,7 +1087,7 @@ fn tls_shutdown(leg: &Leg) {
         .unwrap_or_default();
     let _ = sock.write_all(&out);
     let _ = sock.flush();
-    let _ = sock.shutdown(std::net::Shutdown::Both);
+    let _ = sock.shutdown(how);
 }
 
 /// HTTP/2 path: full-duplex decrypted-byte relay in both directions, teeing a
@@ -1120,7 +1124,7 @@ fn relay_h2(
     // Read fds are cloned so the blocking reads run outside the connection locks;
     // the originals move into the `Leg`s and are used only for writes.
     let mut client_rd = client_tcp.try_clone()?;
-    let up_shut = up_tcp.try_clone()?; // A closes upstream (unblocks B) on exit
+    let up_shut = up_tcp.try_clone()?; // A half-closes upstream write + bounds B's read on exit
     let mut up_rd = up_tcp.try_clone()?;
     let client_shut = client_tcp.try_clone()?; // B closes client (unblocks A) on exit
 
@@ -1235,9 +1239,18 @@ fn relay_h2(
                 }
             }
         }
-        // Client done sending: close the upstream write side and unblock B.
-        tls_shutdown(&cconn_a);
-        let _ = up_shut.shutdown(std::net::Shutdown::Both);
+        // Client done sending. A one-shot client (e.g. `codex exec`) closes the
+        // instant it prints its answer, which can be BEFORE the upstream's
+        // terminating END_STREAM frame has been read+parsed by t2. Shutting the
+        // upstream READ side here makes t2's next read return 0 (and on some
+        // platforms flushes the socket receive buffer), dropping that final frame
+        // and its usage report. So half-close only the WRITE side (close_notify +
+        // FIN): upstream is told we're done sending, but t2's read side stays open
+        // to drain the in-flight response to END_STREAM. Arm a read timeout first
+        // so t2 can't block forever if a kept-alive upstream never EOFs once the
+        // client is gone.
+        let _ = up_shut.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        tls_shutdown(&cconn_a, std::net::Shutdown::Write);
     });
 
     // upstream -> client (responses)
@@ -1256,35 +1269,79 @@ fn relay_h2(
                 first = false;
                 match tls_ingest(&cconn_b, &[]) {
                     Ok(p) => p,
-                    Err(_) => break,
+                    Err(e) => {
+                        dlog(&format!("conn {} t2 exit: first tls_ingest err ({})", conn_id, e));
+                        break;
+                    }
                 }
             } else {
                 let n = match up_rd.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        dlog(&format!("conn {} t2 exit: upstream EOF (read 0)", conn_id));
+                        break;
+                    }
+                    Err(e) => {
+                        dlog(&format!("conn {} t2 exit: upstream read err ({})", conn_id, e));
+                        break;
+                    }
                     Ok(n) => n,
                 };
                 match tls_ingest(&cconn_b, &buf[..n]) {
                     Ok(p) => p,
-                    Err(_) => break,
+                    Err(e) => {
+                        dlog(&format!("conn {} t2 exit: tls_ingest err ({})", conn_id, e));
+                        break;
+                    }
                 }
             };
             if plain.is_empty() {
                 continue;
             }
-            if tls_emit(&sconn_b, &plain).is_err() {
-                break;
-            }
-            for f in fp.feed(&plain) {
-                if f.ftype != h2::FRAME_DATA {
+            // Parse (and meter on END_STREAM) BEFORE relaying to the client. A
+            // one-shot client can already be gone, so relaying first would fail and
+            // break the loop before the in-flight stream's END_STREAM frame is
+            // parsed, dropping its usage report. The relay is best-effort after the
+            // parse; once the client is gone we keep draining upstream only far
+            // enough to reach END_STREAM (t1 has armed a read timeout to bound it).
+            let frames = fp.feed(&plain);
+            // For deeper h2 debugging a per-read "t2 rx <n> bytes -> <m> frame(s)"
+            // line and a per-frame "type/stream/end_stream/len" line can be logged
+            // here; they flood a long DATA stream, so they are left out. The
+            // stream-level traces below (END_STREAM vs connection-close) plus the
+            // loop-exit reason are the low-volume signal kept for normal debug.
+            let _ = tls_emit(&sconn_b, &plain);
+            for f in frames {
+                // A response stream ends on END_STREAM, which rides EITHER a DATA
+                // frame (the common case: a body chunk or a trailing empty DATA)
+                // OR a HEADERS frame (a headers-only/no-body response, or trailers
+                // after the body). The shim completes on both (state.rs); mirror it
+                // here, else a HEADERS-borne END_STREAM is dropped and the request
+                // is never emitted (no `conn N DONE`, no usage).
+                let is_data = f.ftype == h2::FRAME_DATA;
+                let ends = f.end_stream();
+                if !is_data && !(f.ftype == h2::FRAME_HEADERS && ends) {
                     continue;
+                }
+                // One line per stream end (debug only): shows whether OpenAI/etc.
+                // terminate the stream on a DATA or a HEADERS frame, so a "no DONE"
+                // report can be told apart from an in-flight stream at a glance.
+                if ends {
+                    dlog(&format!(
+                        "conn {} resp stream {} END_STREAM on {}",
+                        conn_id,
+                        f.stream_id,
+                        if is_data { "DATA" } else { "HEADERS" },
+                    ));
                 }
                 let st = resp.entry(f.stream_id).or_insert_with(|| match provider {
                     Some(p) => RespState::new(p),
                     None => RespState::new_capture(),
                 });
-                st.feed(&f.payload);
-                st.bytes_rx += f.payload.len() as u64;
-                if f.end_stream() {
+                if is_data {
+                    st.feed(&f.payload);
+                    st.bytes_rx += f.payload.len() as u64;
+                }
+                if ends {
                     let fin = st.finish();
                     // The provider path keeps `new_h2_body`'s 200 default (the
                     // usage sink's contract); capture-only reports `None`, since
@@ -1318,8 +1375,36 @@ fn relay_h2(
                 }
             }
         }
+        // Exit-drain: some upstreams (a gateway fronting the provider here) end a
+        // response by CLOSING the connection instead of setting the h2 END_STREAM
+        // flag, so the per-END_STREAM emit above never fires for that stream even
+        // though t2 read the whole body. On loop exit, finalize + emit every stream
+        // still pending in `resp`; streams completed via END_STREAM were already
+        // removed, so this cannot double-emit. Mirrors the shim's close/exit drain.
+        for (stream_id, mut st) in resp.drain() {
+            let fin = st.finish();
+            let status = if provider.is_some() { st.parser.status } else { None };
+            let bytes_rx = st.bytes_rx;
+            let resp_text_bytes = st.resp_text_bytes();
+            let (req_body, bytes_tx, req_method, req_path) = {
+                let map = streams_b.lock().unwrap();
+                map.get(&stream_id)
+                    .map(|r| (r.body.clone(), r.bytes_tx, r.method.clone(), r.path.clone()))
+                    .unwrap_or_default()
+            };
+            let req_model = provider.and_then(|p| model_from_request(p, &req_body, None));
+            dlog(&format!(
+                "conn {} resp stream {} finalized on connection close (no END_STREAM)",
+                conn_id, stream_id
+            ));
+            emit(
+                &shared_b, conn_id, provider, &host_b, started, status, bytes_tx, bytes_rx,
+                resp_text_bytes, &fin, req_model, &req_body,
+                req_method.as_deref(), req_path.as_deref(),
+            );
+        }
         // Upstream done: close the client write side and unblock A.
-        tls_shutdown(&sconn_b);
+        tls_shutdown(&sconn_b, std::net::Shutdown::Both);
         let _ = client_shut.shutdown(std::net::Shutdown::Both);
     });
 
@@ -3133,6 +3218,151 @@ mod tests {
 
         // Clean shutdown: joining the upstream drops its socket, unblocking the
         // proxy's wedged upstream write so the relay threads exit.
+        let _ = upstream.join();
+        let _ = relay.join();
+    }
+
+    #[test]
+    fn relay_h2_emits_usage_when_upstream_closes_without_end_stream() {
+        // A gateway fronting the provider can end a streaming response by CLOSING
+        // the connection rather than setting the h2 END_STREAM flag (observed with
+        // codex -> a ClearML gateway behind api.openai.com). The per-END_STREAM emit
+        // never fires for that stream, so the usage must be recovered by t2's
+        // exit-drain when its read loop ends on upstream EOF. Drives the full relay
+        // and asserts a RequestCompleted with the parsed usage is still emitted.
+        use std::time::{Duration, Instant};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = ca::Ca::generate();
+        let leaf = ca.leaf_for("localhost");
+        let ca_der = leaf.cert_chain[1].clone();
+
+        let server_cfg = {
+            let mut c = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(leaf.cert_chain.clone(), leaf.key.clone_key())
+                .unwrap();
+            c.alpn_protocols = vec![b"h2".to_vec()];
+            Arc::new(c)
+        };
+        let client_cfg = {
+            let mut roots = RootCertStore::empty();
+            roots.add(ca_der).unwrap();
+            let mut c = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            c.alpn_protocols = vec![b"h2".to_vec()];
+            Arc::new(c)
+        };
+        let sni = || ServerName::try_from("localhost".to_string()).unwrap();
+
+        // Client leg: real client <-> proxy's ServerConnection.
+        let (mut rc_tcp, ps_tcp) = tcp_pair();
+        let scfg = server_cfg.clone();
+        let hs_server = std::thread::spawn(move || {
+            let mut ps_tcp = ps_tcp;
+            let mut sconn = ServerConnection::new(scfg).unwrap();
+            while sconn.is_handshaking() {
+                sconn.complete_io(&mut ps_tcp).unwrap();
+            }
+            (sconn, ps_tcp)
+        });
+        let mut real_client = ClientConnection::new(client_cfg.clone(), sni()).unwrap();
+        while real_client.is_handshaking() {
+            real_client.complete_io(&mut rc_tcp).unwrap();
+        }
+        let (sconn, ps_tcp) = hs_server.join().unwrap();
+
+        // Upstream leg: proxy's ClientConnection <-> fake upstream.
+        let (pc_tcp, fu_tcp) = tcp_pair();
+        let scfg2 = server_cfg.clone();
+        let hs_up = std::thread::spawn(move || {
+            let mut fu_tcp = fu_tcp;
+            let mut fu = ServerConnection::new(scfg2).unwrap();
+            while fu.is_handshaking() {
+                fu.complete_io(&mut fu_tcp).unwrap();
+            }
+            (fu, fu_tcp)
+        });
+        let mut cconn = ClientConnection::new(client_cfg.clone(), sni()).unwrap();
+        let mut pc_tcp = pc_tcp;
+        while cconn.is_handshaking() {
+            cconn.complete_io(&mut pc_tcp).unwrap();
+        }
+        let (mut fu, mut fu_tcp) = hs_up.join().unwrap();
+
+        // Shared on the OpenAI provider path, with a reporter channel to observe emit.
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let roots = Arc::new(RootCertStore::empty());
+        let shared = Arc::new(Shared {
+            ca,
+            upstream_h2: build_upstream_config(roots.clone(), &[b"h2"]),
+            upstream_h1: build_upstream_config(roots, &[b"http/1.1"]),
+            policy: DecryptPolicy { decrypt_all: false },
+            traffic: TrafficLog { file: None },
+            tx: Some(tx),
+            conn_seq: std::sync::atomic::AtomicU64::new(1),
+            whitelist: whitelist::Whitelist::empty(),
+        });
+
+        let relay = std::thread::spawn(move || {
+            let _ = relay_h2(
+                1, Some(Provider::OpenAi), "localhost".to_string(),
+                sconn, ps_tcp, cconn, pc_tcp, shared,
+            );
+        });
+
+        // Fake upstream: send a complete OpenAI Responses-API SSE body as one h2
+        // DATA frame on stream 1 with NO END_STREAM, then close (close_notify + FIN).
+        let upstream = std::thread::spawn(move || {
+            let sse = b"event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-6-astra\",\"usage\":{\"input_tokens\":100,\"output_tokens\":7,\"total_tokens\":107}}}\n\n";
+            let data_frame = h2_frame_bytes(h2::FRAME_DATA, 0, 1, sse); // flags=0 -> no END_STREAM
+            fu.writer().write_all(&data_frame).unwrap();
+            fu.send_close_notify();
+            while fu.wants_write() {
+                if fu.write_tls(&mut fu_tcp).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+            fu_tcp.flush().ok();
+            drop(fu);
+            drop(fu_tcp);
+        });
+
+        // Main: drain the client leg (so the proxy's relay never backpressures) and
+        // wait for the exit-drain's RequestCompleted.
+        rc_tcp.set_nonblocking(true).unwrap();
+        let mut completed = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && completed.is_none() {
+            let _ = real_client.read_tls(&mut rc_tcp);
+            let _ = real_client.process_new_packets();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = real_client.reader().read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::RequestCompleted { tokens_in, tokens_out, tokens_measured, .. } = ev {
+                    completed = Some((tokens_in, tokens_out, tokens_measured));
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let (tin, tout, measured) =
+            completed.expect("exit-drain emitted RequestCompleted for a stream closed without END_STREAM");
+        assert!(measured, "usage measured from the SSE body");
+        assert_eq!(tin, 100, "input_tokens parsed from response.completed");
+        assert_eq!(tout, 7, "output_tokens parsed from response.completed");
+
+        drop(rc_tcp);
         let _ = upstream.join();
         let _ = relay.join();
     }

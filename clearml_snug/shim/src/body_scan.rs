@@ -594,8 +594,10 @@ fn extract_usage(provider: Provider, v: &Value) -> Usage {
 /// the usage is read:
 ///   * Anthropic — top-level `model` (non-streaming / `message_delta`) or
 ///     `message.model` (the SSE `message_start` event).
-///   * OpenAI — top-level `model` (present on every streaming chunk and the
-///     non-streaming body).
+///   * OpenAI - top-level `model` (Chat Completions chunks and non-streaming
+///     bodies, including the non-streaming Responses object) or `response.model`
+///     on the streaming Responses API `response.completed`/`.incomplete` event,
+///     which nests the served model under `response` (mirrors `response.usage`).
 ///   * Gemini — top-level `modelVersion` (the resolved model id; Gemini doesn't
 ///     use a `model` field in the response).
 /// `None` when the value carries no model (so the caller keeps looking / falls
@@ -605,7 +607,9 @@ fn extract_model(provider: Provider, v: &Value) -> Option<String> {
         Provider::Anthropic => v
             .get("model")
             .or_else(|| v.get("message").and_then(|m| m.get("model"))),
-        Provider::OpenAi => v.get("model"),
+        Provider::OpenAi => v
+            .get("model")
+            .or_else(|| v.get("response").and_then(|r| r.get("model"))),
         Provider::Gemini => v.get("modelVersion"),
     };
     let m = raw.and_then(Value::as_str)?.trim();
@@ -1655,6 +1659,17 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\"
         assert_eq!(
             feed_all(&sse, Provider::OpenAi).finalize().model.as_deref(),
             Some("gpt-4o-2024-08-06")
+        );
+        // Streaming Responses API (Codex): the served model rides
+        // `response.model` on the `response.completed` event, nested under
+        // `response` like `response.usage` - not top-level.
+        let responses = b"event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5-codex\",\"usage\":{\"input_tokens\":533,\"output_tokens\":9,\"total_tokens\":542}}}\n\n";
+        let mut rsse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".to_vec();
+        rsse.extend_from_slice(responses);
+        assert_eq!(
+            feed_all(&rsse, Provider::OpenAi).finalize().model.as_deref(),
+            Some("gpt-5-codex")
         );
     }
 
