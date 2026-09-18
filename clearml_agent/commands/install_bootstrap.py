@@ -12,16 +12,14 @@ Usage:
     clearml-agent install-bootstrap --force         # force reinstall
 """
 
-from __future__ import annotations
-
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from typing import List, Optional, Tuple
 import urllib.error
 import urllib.request
-
 
 BOOTSTRAP_REPO = "clearml/clearml-agent-bootstrap"
 GITHUB_API_VERSION = "2022-11-28"
@@ -56,7 +54,7 @@ def _fetch_json(url: str, timeout: float = 30) -> object:
         return json.loads(resp.read().decode())
 
 
-def _get_installed_version() -> str | None:
+def _get_installed_version() -> Optional[str]:
     """Get the currently installed version of clearml-agent-bootstrap, or None."""
     try:
         from clearml_agent_bootstrap.version import __version__
@@ -68,7 +66,9 @@ def _get_installed_version() -> str | None:
         return None
 
 
-def _find_whl(version: str | None = None, timeout: float = 30) -> tuple[str, int, str]:
+def _find_whl(
+    version: Optional[str] = None, timeout: float = 30
+) -> Tuple[str, int, str]:
     """Return ``(tag, asset_id, filename)`` for a release with a .whl asset.
 
     When *version* is None the ``/releases/latest`` endpoint is used (returns
@@ -164,7 +164,7 @@ def _download(asset_id: int, filename: str, dest: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _find_installer() -> tuple[list[str], str]:
+def _find_installer() -> Tuple[List[str], str]:
     """
     Return ``(command_prefix, force_flag)`` for installing a wheel,
     probing in priority order:
@@ -209,7 +209,7 @@ def _find_installer() -> tuple[list[str], str]:
 
 
 def _install_and_verify(
-    wheel_path: str, current_version: str | None, force: bool = False
+    wheel_path: str, current_version: Optional[str], force: bool = False
 ) -> None:
     """
     Install the wheel, flush the import cache, and print whether the
@@ -253,7 +253,7 @@ def _install_and_verify(
 # ---------------------------------------------------------------------------
 
 
-def get_latest_bootstrap_version(timeout: float = 30) -> str | None:
+def get_latest_bootstrap_version(timeout: float = 30) -> Optional[str]:
     """Return the latest released bootstrap tag (without leading 'v'), or None on error."""
     try:
         tag, _, _ = _find_whl(version=None, timeout=timeout)
@@ -262,7 +262,7 @@ def get_latest_bootstrap_version(timeout: float = 30) -> str | None:
     return tag.lstrip("v") if tag else None
 
 
-def get_installed_bootstrap_version() -> str | None:
+def get_installed_bootstrap_version() -> Optional[str]:
     """Return the currently installed bootstrap version (without leading 'v'), or None."""
     current = _get_installed_version()
     return current.lstrip("v") if current else None
@@ -276,8 +276,8 @@ def get_installed_bootstrap_version() -> str | None:
 def install_bootstrap(
     check: bool = False,
     force: bool = False,
-    version: str | None = None,
-    from_file: str | None = None,
+    version: Optional[str] = None,
+    from_file: Optional[str] = None,
     **kwargs,
 ) -> None:
     """
