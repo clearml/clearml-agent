@@ -360,6 +360,13 @@ class CommandSequence(Executable):
 
         return tuple(map(safe_get_argv, self.commands))
 
+    def update_envs(self, envs):
+        if not envs:
+            return
+        for command in self.commands:
+            if isinstance(command, Argv):
+                command.update_envs(envs)
+
     def serialize(self):
         def intersperse(delimiter, seq):
             return islice(chain.from_iterable(zip(repeat(delimiter), seq)), 1, None)
