@@ -5,7 +5,7 @@ from clearml_agent.backend_api.session import Request
 from clearml_agent.glue.utilities import get_bash_output
 
 from .daemon import K8sDaemon
-from .utilities import get_path
+from .utilities import get_path, get_task_id_from_resource_name
 from .errors import GetPodsError
 from .definitions import ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION, ENV_POD_MONITOR_EVICTION_REASONS
 
@@ -36,11 +36,7 @@ class PendingPodsDaemon(K8sDaemon):
         return get_path(pod, "metadata", "name")
 
     def _get_task_id(self, pod: dict):
-        prefix, _, value = self._get_k8s_resource_name(pod).rpartition('-')
-        if len(value) > 4:
-            return value
-        # we assume this is a multi-node rank x (>0) pod
-        return prefix.rpartition('-')[-1] or value
+        return get_task_id_from_resource_name(self._get_k8s_resource_name(pod))
 
     @staticmethod
     def _get_k8s_resource_namespace(pod: dict) -> Optional[str]:
