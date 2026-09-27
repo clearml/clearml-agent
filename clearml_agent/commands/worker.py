@@ -1974,8 +1974,11 @@ class Worker(ServiceCommandSection):
         if available_gpus is None:
             raise ValueError("Dynamic GPU allocation is not supported by your ClearML-server")
         available_gpus = [prop["value"] for prop in available_gpus if prop["key"] == 'available_gpus']
+        # available_gpus must be a {gpu_id: fraction} dict for the .items() call below; when the
+        # worker has no 'available_gpus' runtime property stored yet the filter yields an empty
+        # list, so start from an empty dict instead of leaving it as a list.
+        gpus = {}
         if available_gpus:
-            gpus = {}
             for g_v in available_gpus[-1].split(','):
                 g, v = g_v.split("_")
                 try:
@@ -1984,7 +1987,7 @@ class Worker(ServiceCommandSection):
                         gpus[g.strip()] = float("0."+v)
                 except (ValueError, TypeError):
                     print("INFO: failed parsing GPU int('{}') - skipping".format(g))
-            available_gpus = gpus
+        available_gpus = gpus
 
         if not isinstance(gpu_queues, dict):
             gpu_queues = dict(gpu_queues)
