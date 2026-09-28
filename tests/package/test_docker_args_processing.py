@@ -161,6 +161,56 @@ def test_merge_docker_args_forbidden_list_multiple_switches_each_with_value():
     assert "--ipc=host" in merged
 
 
+def test_merge_docker_args_empty_entrypoint_space_form_kept():
+    # --entrypoint "" clears the image's built-in ENTRYPOINT without overriding the agent's own
+    # startup command, so it's harmless and must not be stripped even though "entrypoint" is
+    # forbidden.
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=[],
+        extra_docker_arguments=["--entrypoint", "", "--ipc=host"],
+    )
+    assert stripped_switches == []
+    assert merged == ["--entrypoint", "", "--ipc=host"]
+
+
+def test_merge_docker_args_empty_entrypoint_equals_form_kept():
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=["--entrypoint=", "-v", "/x:/y"],
+        extra_docker_arguments=[],
+    )
+    assert stripped_switches == []
+    assert merged == ["--entrypoint=", "-v", "/x:/y"]
+
+
+def test_merge_docker_args_dangling_entrypoint_stripped():
+    # --entrypoint as the very last token has no value at all (not even an empty one) — this is
+    # conservatively treated as non-empty and still stripped, since we can't confirm it's harmless.
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=[],
+        extra_docker_arguments=["-v", "/x:/y", "--entrypoint"],
+    )
+    assert stripped_switches == ["entrypoint"]
+    assert "--entrypoint" not in merged
+    assert "-v" in merged and "/x:/y" in merged
+
+
+def test_merge_docker_args_non_empty_entrypoint_still_stripped_alongside_empty_one():
+    # one source has a real override, the other an empty one — the real one still wins and
+    # causes stripping from both sources (current all-or-nothing per-switch-name contract).
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=["--entrypoint", "", "-v", "/x:/y"],
+        extra_docker_arguments=["--entrypoint=/bin/echo", "--ipc=host"],
+    )
+    assert stripped_switches == ["entrypoint"]
+    assert not any(a.startswith("--entrypoint") for a in merged)
+    assert "-v" in merged and "/x:/y" in merged
+    assert "--ipc=host" in merged
+
+
 def test_merge_docker_args_entrypoint_followed_by_extra_tokens():
     # docker's --entrypoint consumes exactly one value; args for the entrypoint
     # program itself belong AFTER the image, not after --entrypoint. If a user
@@ -178,3 +228,74 @@ def test_merge_docker_args_entrypoint_followed_by_extra_tokens():
     assert "/bin/bash" not in merged
     assert "-c" in merged
     assert "echo hello" in merged
+
+
+def test_merge_docker_args_empty_value_exemption_is_entrypoint_only():
+    # The empty-value carve-out is entrypoint-specific. A different block-listed switch
+    # (here 'user') must still be stripped even when its value is empty, so an admin's
+    # block-list keeps enforcing and cannot be bypassed with a bare `--user ""`.
+    for extra in (["--user", "", "--ipc=host"], ["--user=", "--ipc=host"]):
+        merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+            config=_DummyConfig({"agent.forbidden_docker_args": ["entrypoint", "user"]}),
+            task_docker_arguments=[],
+            extra_docker_arguments=extra,
+        )
+        assert stripped_switches == ["user"]
+        assert not any(a.startswith("--user") for a in merged)
+        assert "" not in merged
+        assert "--ipc=host" in merged
+
+
+def test_merge_docker_args_stray_empty_token_is_dropped():
+    # A stray "" token that is not an --entrypoint value would become a bare positional at
+    # `docker run` (docker reads it as an empty image reference -> "invalid reference format").
+    # It must be dropped, matching the long-standing behavior for such junk tokens.
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=["-v", "/x:/y", "", "--rm"],
+        extra_docker_arguments=["--privileged", "", "--ipc=host"],
+    )
+    assert stripped_switches == []
+    assert "" not in merged
+    assert merged.count("") == 0
+    for expected in ("-v", "/x:/y", "--rm", "--privileged", "--ipc=host"):
+        assert expected in merged
+
+
+def test_merge_docker_args_double_empty_entrypoint_keeps_single_value():
+    # Only the first "" is --entrypoint's value; a second trailing "" is a stray token that
+    # would orphan into a bare positional at docker run. Keep the entrypoint's empty value and
+    # drop the orphan so the command stays well-formed.
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=[],
+        extra_docker_arguments=["--entrypoint", "", ""],
+    )
+    assert stripped_switches == []
+    assert merged == ["--entrypoint", ""]
+
+
+def test_merge_docker_args_whitespace_entrypoint_is_a_real_override_and_stripped():
+    # A whitespace-only value is a real (broken) entrypoint override, not a request to clear the
+    # image default, so both forms are stripped - the empty-value exemption applies to "" only.
+    for task in (["--entrypoint=   ", "-v", "/x:/y"], ["--entrypoint", "   ", "-v", "/x:/y"]):
+        merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+            config=_DummyConfig(_SHIPPED_CONF),
+            task_docker_arguments=task,
+            extra_docker_arguments=[],
+        )
+        assert stripped_switches == ["entrypoint"]
+        assert not any(a.strip().startswith("--entrypoint") for a in merged)
+        assert "-v" in merged and "/x:/y" in merged
+
+
+def test_merge_docker_args_empty_value_of_non_forbidden_switch_is_dropped():
+    # --label is not block-listed, so it is not exempted; its stray space-form "" is dropped like
+    # any other empty token (only a kept --entrypoint's empty value is preserved).
+    merged, stripped_switches = DockerArgsSanitizer.merge_docker_args(
+        config=_DummyConfig(_SHIPPED_CONF),
+        task_docker_arguments=[],
+        extra_docker_arguments=["--label", "", "--rm"],
+    )
+    assert stripped_switches == []
+    assert merged == ["--label", "--rm"]

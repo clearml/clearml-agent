@@ -157,14 +157,79 @@ class DockerArgsSanitizer:
         return args
 
     @staticmethod
+    def _switch_values(docker_args: List[str], switch: str) -> List[str]:
+        """
+        Return every value passed to `switch` in docker_args.
+
+        The value is taken verbatim (never stripped), so a whitespace-only value such as
+        `--entrypoint=" "` is reported as " " rather than "" - a whitespace entrypoint is a real
+        (if broken) override, not a request to clear the image default, so callers must not treat
+        it as empty.
+        """
+        values = []
+        for i, token in enumerate(docker_args):
+            if token is None:
+                continue
+            stripped = token.strip()
+            if not stripped.startswith("-") or stripped.lstrip("-").split("=")[0] != switch:
+                continue
+            if "=" in token:
+                values.append(token.split("=", 1)[1])
+            elif i + 1 < len(docker_args):
+                values.append(docker_args[i + 1])
+        return values
+
+    @staticmethod
+    def _drop_stray_empty_tokens(docker_args: List[str]) -> List[str]:
+        """
+        Drop empty-string tokens, keeping the empty value that belongs to a space-form
+        --entrypoint.
+
+        docker treats a bare "" as a positional argument (an empty image reference), so forwarding a
+        stray "" makes `docker run` fail with "invalid reference format". The single exception is the
+        "" that follows a space-form `--entrypoint`: `--entrypoint ""` clears the image's built-in
+        ENTRYPOINT, so that value must survive - dropping it would shift the following token into
+        becoming --entrypoint's value.
+        """
+        result = []
+        for i, token in enumerate(docker_args):
+            if token is None:
+                continue
+            if token != "":
+                result.append(token)
+                continue
+            prev = docker_args[i - 1] if i > 0 else None
+            prev_stripped = prev.strip() if isinstance(prev, str) else ""
+            is_entrypoint_value = (
+                prev_stripped.startswith("-")
+                and "=" not in prev_stripped
+                and prev_stripped.lstrip("-") == "entrypoint"
+            )
+            if is_entrypoint_value:
+                result.append(token)
+        return result
+
+    @staticmethod
     def merge_docker_args(
             config, task_docker_arguments: List[str], extra_docker_arguments: List[str]
     ) -> Tuple[List[str], List[str]]:
         forbidden_switches = config.get("agent.forbidden_docker_args", [])
         present = set()
         for args in (task_docker_arguments, extra_docker_arguments):
-            if args:
-                present |= set(DockerArgsSanitizer.get_list_of_switches(args)) & set(forbidden_switches)
+            if not args:
+                continue
+            switches = set(DockerArgsSanitizer.get_list_of_switches(args)) & set(forbidden_switches)
+            for switch in switches:
+                # an explicit empty --entrypoint (--entrypoint "" / --entrypoint=) doesn't override
+                # the agent's own startup command, it only clears the image's built-in ENTRYPOINT, so
+                # it's harmless and is kept rather than stripped. This carve-out is entrypoint-specific
+                # on purpose: an empty value of any other forbidden switch is not inherently harmless,
+                # so those are still stripped and the block-list keeps enforcing them.
+                if switch == "entrypoint":
+                    values = DockerArgsSanitizer._switch_values(args, switch)
+                    if values and all(v == "" for v in values):
+                        continue
+                present.add(switch)
         stripped_switches = sorted(present)
         if stripped_switches:
             if task_docker_arguments:
@@ -181,24 +246,30 @@ class DockerArgsSanitizer:
             ["privileged", "security-opt", "network", "ipc"]
         )
 
+        # _drop_stray_empty_tokens removes empty-string tokens (which docker would reject as a bare
+        # positional) while preserving the "" that is the value of a kept --entrypoint
         if config.get("agent.docker_args_extra_precedes_task", True):
             switches = []
             if extra_docker_arguments:
                 switches = DockerArgsSanitizer.get_list_of_switches(extra_docker_arguments)
                 switches = list(set(switches) & set(override_switches))
-                base_cmd += [str(a) for a in extra_docker_arguments if a]
+                base_cmd += DockerArgsSanitizer._drop_stray_empty_tokens(
+                    [str(a) for a in extra_docker_arguments if a is not None])
             if task_docker_arguments:
                 docker_arguments = DockerArgsSanitizer.filter_switches(task_docker_arguments, switches)
-                base_cmd += [a for a in docker_arguments if a]
+                base_cmd += DockerArgsSanitizer._drop_stray_empty_tokens(
+                    [a for a in docker_arguments if a is not None])
         else:
             switches = []
             if task_docker_arguments:
                 switches = DockerArgsSanitizer.get_list_of_switches(task_docker_arguments)
                 switches = list(set(switches) & set(override_switches))
-                base_cmd += [a for a in task_docker_arguments if a]
+                base_cmd += DockerArgsSanitizer._drop_stray_empty_tokens(
+                    [a for a in task_docker_arguments if a is not None])
             if extra_docker_arguments:
                 extra_docker_arguments = DockerArgsSanitizer.filter_switches(extra_docker_arguments, switches)
-                base_cmd += [a for a in extra_docker_arguments if a]
+                base_cmd += DockerArgsSanitizer._drop_stray_empty_tokens(
+                    [a for a in extra_docker_arguments if a is not None])
         return base_cmd, stripped_switches
 
     @staticmethod
