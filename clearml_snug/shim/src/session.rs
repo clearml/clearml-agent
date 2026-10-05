@@ -21,7 +21,7 @@
 //! The `chat_id` is a per-task running ordinal ("1", "2", …) assigned when a
 //! session is first opened and then inherited by every continuation, so it is
 //! stable for the chat's lifetime and reads as a human-friendly counter on the
-//! scalar series ("Anthropic / chat 1") rather than an opaque content hash.
+//! scalar series ("anthropic / chat 1") rather than an opaque content hash.
 //! Distinct chats get distinct ordinals; the matching itself still keys on the
 //! `system_hash` + turn hashes (below), independent of how the id is rendered.
 //!

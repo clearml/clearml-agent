@@ -751,7 +751,7 @@ impl Sinks {
     /// cumulative token totals; `variant` keys the per-second point series and the
     /// tool series. The model segment is omitted when unknown or equal to the
     /// provider label (so an unparsed model keeps the provider-only series, not
-    /// "Anthropic / Anthropic").
+    /// "anthropic / anthropic").
     fn series_keys(provider: &str, c: &Completed) -> (String, String) {
         let base = match c.model.as_deref() {
             Some(m) if !m.is_empty() && m != provider => format!("{} / {}", provider, m),
@@ -1150,15 +1150,19 @@ impl Sinks {
     }
 }
 
-/// Coarse host -> friendly provider label for the usage event + scalar series.
-/// An unrecognized host reports under its own hostname (the catch-all).
+/// Coarse host -> lowercase provider id for the usage event + scalar series.
+/// Lowercase so it matches the ids the other ClearML components (the LLM
+/// gateway, the apps session proxy) send to report_llm_usage - otherwise the
+/// backend splits a capitalized "Anthropic" from their "anthropic". An
+/// unrecognized host reports under its own hostname (the catch-all, already
+/// lowercase).
 fn host_to_model_name(host: &str) -> String {
     match host {
-        "" => "Unknown Model".to_string(),
-        "api.openai.com" => "OpenAI".to_string(),
-        "api.anthropic.com" => "Anthropic".to_string(),
-        "claude.ai" => "Anthropic".to_string(),
-        "generativelanguage.googleapis.com" => "Gemini".to_string(),
+        "" => "unknown".to_string(),
+        "api.openai.com" => "openai".to_string(),
+        "api.anthropic.com" => "anthropic".to_string(),
+        "claude.ai" => "anthropic".to_string(),
+        "generativelanguage.googleapis.com" => "gemini".to_string(),
         other => other.to_string(),
     }
 }
@@ -1360,13 +1364,13 @@ mod tests {
 
     #[test]
     fn host_mapping() {
-        assert_eq!(host_to_model_name("api.anthropic.com"), "Anthropic");
-        assert_eq!(host_to_model_name("api.openai.com"), "OpenAI");
-        assert_eq!(host_to_model_name("generativelanguage.googleapis.com"), "Gemini");
+        assert_eq!(host_to_model_name("api.anthropic.com"), "anthropic");
+        assert_eq!(host_to_model_name("api.openai.com"), "openai");
+        assert_eq!(host_to_model_name("generativelanguage.googleapis.com"), "gemini");
         // The consumer chat wire rolls up under the same provider as the API path.
-        assert_eq!(host_to_model_name("claude.ai"), "Anthropic");
+        assert_eq!(host_to_model_name("claude.ai"), "anthropic");
         assert_eq!(host_to_model_name("unknown.example.com"), "unknown.example.com");
-        assert_eq!(host_to_model_name(""), "Unknown Model");
+        assert_eq!(host_to_model_name(""), "unknown");
     }
 
     #[test]
@@ -1383,10 +1387,10 @@ mod tests {
     fn usage_event_combines_in_and_out_with_source() {
         let s = sinks(&["tokens_in"]);
         // No cache -> fresh == tokens_in, both cache buckets 0.
-        let e = s.usage_event("Anthropic", "claude-haiku-4-5", 19, 42, 0, 0, 1000);
+        let e = s.usage_event("anthropic", "claude-haiku-4-5", 19, 42, 0, 0, 1000);
         assert_eq!(e["timestamp"], 1000);
         assert_eq!(e["source"], "external");
-        assert_eq!(e["provider"], "Anthropic");
+        assert_eq!(e["provider"], "anthropic");
         assert_eq!(e["model"], "claude-haiku-4-5");
         // Disjoint input split + output in one event, renamed per the schema.
         assert_eq!(e["prompt_tokens"], 19);
@@ -1411,7 +1415,7 @@ mod tests {
             "user-9".into(),
             "proj-7".into(),
         );
-        let e = s.usage_event("OpenAI", "gpt-4o", 1, 2, 0, 0, 1000);
+        let e = s.usage_event("openai", "gpt-4o", 1, 2, 0, 0, 1000);
         assert_eq!(e["user"], "user-9");
         assert_eq!(e["project"], "proj-7");
     }
@@ -1422,7 +1426,7 @@ mod tests {
         // FRESH remainder and the two cache buckets ride their own fields, so
         // prompt + read + write == tokens_in (the disjoint contract).
         let s = sinks(&["tokens_in"]);
-        let e = s.usage_event("Anthropic", "claude-sonnet-4-5", 45305, 13, 45000, 300, 1000);
+        let e = s.usage_event("anthropic", "claude-sonnet-4-5", 45305, 13, 45000, 300, 1000);
         assert_eq!(e["prompt_tokens"], 5, "fresh = 45305 - 45000 - 300");
         assert_eq!(e["cache_read_tokens"], 45000);
         assert_eq!(e["cache_write_tokens"], 300);
@@ -1438,7 +1442,7 @@ mod tests {
         // OpenAI: cached_tokens is a subset of prompt_tokens, so tokens_in (=
         // prompt_tokens, cache-inclusive) minus cache_read gives fresh.
         let s = sinks(&["tokens_in"]);
-        let e = s.usage_event("OpenAI", "gpt-4o-mini", 13219, 1, 13184, 0, 1000);
+        let e = s.usage_event("openai", "gpt-4o-mini", 13219, 1, 13184, 0, 1000);
         assert_eq!(e["prompt_tokens"], 35, "fresh = 13219 - 13184");
         assert_eq!(e["cache_read_tokens"], 13184);
         assert_eq!(e["cache_write_tokens"], 0);
@@ -1449,7 +1453,7 @@ mod tests {
         // Defensive: an impossible read + write > tokens_in must not underflow;
         // prompt_tokens clamps to 0.
         let s = sinks(&["tokens_in"]);
-        let e = s.usage_event("OpenAI", "gpt-4o", 10, 2, 8, 5, 1000);
+        let e = s.usage_event("openai", "gpt-4o", 10, 2, 8, 5, 1000);
         assert_eq!(e["prompt_tokens"], 0);
         assert_eq!(e["cache_read_tokens"], 8);
         assert_eq!(e["cache_write_tokens"], 5);
@@ -1574,13 +1578,13 @@ mod tests {
         // Usage only (no metrics noise), no network (no client passed).
         let mut s = Sinks::new("task-1".into(), true, false, &[], None, String::new(), String::new());
 
-        // model present -> billed; used verbatim, provider stays the host label.
+        // model present -> billed; used verbatim, provider is the host label.
         s.on_event(&started(1, "api.anthropic.com"), &mut fwd);
         s.on_event(&rc(1, Some("claude-opus-4-20250514"), 10, 0), &mut fwd);
         assert_eq!(s.usage_buf.len(), 1, "a request with a model is billed");
         let e = s.usage_buf.last().expect("usage event buffered");
         assert_eq!(e["model"], "claude-opus-4-20250514");
-        assert_eq!(e["provider"], "Anthropic");
+        assert_eq!(e["provider"], "anthropic");
         assert_eq!(e["prompt_tokens"], 10);
         assert_eq!(e["completion_tokens"], 0);
         assert_eq!(e["source"], "external");
@@ -1649,7 +1653,7 @@ mod tests {
 
         let u = s.usage_buf.last().expect("usage event buffered");
         assert_eq!(u["model"], "claude-haiku-4-5", "usage carries the model");
-        assert_eq!(u["provider"], "Anthropic");
+        assert_eq!(u["provider"], "anthropic");
 
         // The cumulative token scalar buffers immediately (per-request).
         let cum = s
@@ -1657,7 +1661,7 @@ mod tests {
             .iter()
             .find(|e| e["metric"] == "LLM Input Tokens (cumulative)")
             .expect("cumulative token scalar buffered");
-        assert_eq!(cum["variant"], "Anthropic / claude-haiku-4-5");
+        assert_eq!(cum["variant"], "anthropic / claude-haiku-4-5");
 
         // The per-second point series flushes once the clock advances past its
         // second; its variant carries the model dimension too.
@@ -1668,7 +1672,7 @@ mod tests {
             .find(|e| e["metric"] == "LLM Input Tokens")
             .expect("per-second point scalar buffered after the tick");
         assert_eq!(
-            point["variant"], "Anthropic / claude-haiku-4-5",
+            point["variant"], "anthropic / claude-haiku-4-5",
             "point series variant carries the model dimension"
         );
     }
@@ -1684,21 +1688,21 @@ mod tests {
             c.chat_id = chat.map(|c| c.to_string());
             c
         };
-        let (base, variant) = Sinks::series_keys("Anthropic", &mk(Some("claude-haiku-4-5"), None));
-        assert_eq!(base, "Anthropic / claude-haiku-4-5");
-        assert_eq!(variant, "Anthropic / claude-haiku-4-5");
+        let (base, variant) = Sinks::series_keys("anthropic", &mk(Some("claude-haiku-4-5"), None));
+        assert_eq!(base, "anthropic / claude-haiku-4-5");
+        assert_eq!(variant, "anthropic / claude-haiku-4-5");
         // Model + chat -> chat only in the variant.
-        let (base, variant) = Sinks::series_keys("Anthropic", &mk(Some("claude-haiku-4-5"), Some("3")));
-        assert_eq!(base, "Anthropic / claude-haiku-4-5");
-        assert_eq!(variant, "Anthropic / claude-haiku-4-5 / chat 3");
+        let (base, variant) = Sinks::series_keys("anthropic", &mk(Some("claude-haiku-4-5"), Some("3")));
+        assert_eq!(base, "anthropic / claude-haiku-4-5");
+        assert_eq!(variant, "anthropic / claude-haiku-4-5 / chat 3");
         // Model unknown -> provider only; chat still applies to the variant.
-        let (base, variant) = Sinks::series_keys("OpenAI", &mk(None, Some("2")));
-        assert_eq!(base, "OpenAI");
-        assert_eq!(variant, "OpenAI / chat 2");
+        let (base, variant) = Sinks::series_keys("openai", &mk(None, Some("2")));
+        assert_eq!(base, "openai");
+        assert_eq!(variant, "openai / chat 2");
         // Model equal to the provider label -> not duplicated.
-        let (base, variant) = Sinks::series_keys("Anthropic", &mk(Some("Anthropic"), None));
-        assert_eq!(base, "Anthropic");
-        assert_eq!(variant, "Anthropic");
+        let (base, variant) = Sinks::series_keys("anthropic", &mk(Some("anthropic"), None));
+        assert_eq!(base, "anthropic");
+        assert_eq!(variant, "anthropic");
     }
 
     #[test]
@@ -1715,10 +1719,10 @@ mod tests {
         c.cache_read_tokens = 45000;
         c.cache_write_tokens = 300;
         c.model = Some("claude-sonnet-4-5".into());
-        s.accumulate_rate("Anthropic", &c, 1000, &mut fwd);
+        s.accumulate_rate("anthropic", &c, 1000, &mut fwd);
         s.on_tick(2000, &mut fwd);
         let e = take_metrics(&mut s);
-        let v = |m: &str| scalar_value(&e, m, "Anthropic / claude-sonnet-4-5");
+        let v = |m: &str| scalar_value(&e, m, "anthropic / claude-sonnet-4-5");
         assert_eq!(v("LLM Input Tokens"), 2.0, "fresh only: 45302 - 45000 - 300");
         assert_eq!(v("LLM Cache Read Tokens"), 45000.0);
         assert_eq!(v("LLM Cache Write Tokens"), 300.0);
@@ -1757,11 +1761,11 @@ mod tests {
             c.model = Some("m".into());
             c
         };
-        s.accumulate_rate("Anthropic", &mk(100, 10, 5, 7, 100), 1000, &mut fwd);
-        s.accumulate_rate("Anthropic", &mk(50, 20, 5, 3, 300), 1500, &mut fwd);
+        s.accumulate_rate("anthropic", &mk(100, 10, 5, 7, 100), 1000, &mut fwd);
+        s.accumulate_rate("anthropic", &mk(50, 20, 5, 3, 300), 1500, &mut fwd);
         s.on_tick(2000, &mut fwd);
         let e = take_metrics(&mut s);
-        let v = |m: &str| scalar_value(&e, m, "Anthropic / m");
+        let v = |m: &str| scalar_value(&e, m, "anthropic / m");
         assert_eq!(v("LLM Input Tokens"), 150.0, "tokens summed");
         assert_eq!(v("LLM Output Tokens"), 30.0);
         assert_eq!(v("LLM Bytes Sent"), 10.0, "bytes summed");
@@ -1778,13 +1782,13 @@ mod tests {
         let mut c = completed();
         c.tokens_in = 100;
         c.model = Some("m".into());
-        s.accumulate_rate("Anthropic", &c, 1000, &mut fwd); // second 1, clock starts
+        s.accumulate_rate("anthropic", &c, 1000, &mut fwd); // second 1, clock starts
 
         // Tick to second 2: emits the lead-in 0 (iter 0) + second 1's real data
         // (iter 1); the axis origin sits one second before the first request.
         s.on_tick(2000, &mut fwd);
         let e1 = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e1, "LLM Input Tokens", "Anthropic / m"), 100.0);
+        assert_eq!(scalar_value(&e1, "LLM Input Tokens", "anthropic / m"), 100.0);
         let p1 = e1
             .iter()
             .find(|x| x["metric"] == "LLM Input Tokens" && x["iter"] == 1)
@@ -1823,15 +1827,15 @@ mod tests {
             c.model = Some("m".into());
             c
         };
-        s.accumulate_rate("Anthropic", &mk("1", 10), 1000, &mut fwd);
-        s.accumulate_rate("Anthropic", &mk("2", 20), 1500, &mut fwd);
+        s.accumulate_rate("anthropic", &mk("1", 10), 1000, &mut fwd);
+        s.accumulate_rate("anthropic", &mk("2", 20), 1500, &mut fwd);
         s.on_tick(2000, &mut fwd); // flush second 1 (both chats)
         let _ = take_metrics(&mut s);
         // Second 2 is idle: both chat series must emit a 0.
         s.on_tick(3000, &mut fwd);
         let e = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / m / chat 1"), 0.0);
-        assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / m / chat 2"), 0.0);
+        assert_eq!(scalar_value(&e, "LLM Input Tokens", "anthropic / m / chat 1"), 0.0);
+        assert_eq!(scalar_value(&e, "LLM Input Tokens", "anthropic / m / chat 2"), 0.0);
     }
 
     #[test]
@@ -1851,28 +1855,28 @@ mod tests {
         };
         // First request on chat 1: the base line reads 1, keyed on the chat-less
         // base (never on a per-chat variant).
-        let e1 = s.per_request_events("Anthropic", &mk("1"), 1000);
-        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "Anthropic / m"), 1.0);
+        let e1 = s.per_request_events("anthropic", &mk("1"), 1000);
+        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "anthropic / m"), 1.0);
         assert!(
-            !e1.iter().any(|x| x["variant"] == "Anthropic / m / chat 1"),
+            !e1.iter().any(|x| x["variant"] == "anthropic / m / chat 1"),
             "requests cumulative is keyed on base, not per chat"
         );
         // A second request on the same chat climbs the total to 2.
-        let e2 = s.per_request_events("Anthropic", &mk("1"), 2000);
-        assert_eq!(scalar_value(&e2, "LLM Requests (cumulative)", "Anthropic / m"), 2.0);
+        let e2 = s.per_request_events("anthropic", &mk("1"), 2000);
+        assert_eq!(scalar_value(&e2, "LLM Requests (cumulative)", "anthropic / m"), 2.0);
         // A different chat of the same model feeds the SAME running total.
-        let e3 = s.per_request_events("Anthropic", &mk("2"), 3000);
-        assert_eq!(scalar_value(&e3, "LLM Requests (cumulative)", "Anthropic / m"), 3.0, "chats share one total");
+        let e3 = s.per_request_events("anthropic", &mk("2"), 3000);
+        assert_eq!(scalar_value(&e3, "LLM Requests (cumulative)", "anthropic / m"), 3.0, "chats share one total");
         // A different model is its own climbing line, starting at 1.
         let mut c = mk("1");
         c.model = Some("m2".into());
-        let e4 = s.per_request_events("Anthropic", &c, 4000);
-        assert_eq!(scalar_value(&e4, "LLM Requests (cumulative)", "Anthropic / m2"), 1.0, "per-model total");
+        let e4 = s.per_request_events("anthropic", &c, 4000);
+        assert_eq!(scalar_value(&e4, "LLM Requests (cumulative)", "anthropic / m2"), 1.0, "per-model total");
 
         // And it is NOT on the per-second rate path: the rate loop emits no
         // "LLM Requests (cumulative)" point series.
         let mut fwd = LogForwarder::new("t".into(), "w".into());
-        s.accumulate_rate("Anthropic", &mk("1"), 5000, &mut fwd);
+        s.accumulate_rate("anthropic", &mk("1"), 5000, &mut fwd);
         s.on_tick(6000, &mut fwd);
         let rate = take_metrics(&mut s);
         assert!(
@@ -1891,7 +1895,7 @@ mod tests {
         let mut c = completed();
         c.tokens_in = 5;
         c.model = Some("m".into());
-        s.accumulate_rate("Anthropic", &c, 1000, &mut fwd); // second 1, last_active=1
+        s.accumulate_rate("anthropic", &c, 1000, &mut fwd); // second 1, last_active=1
         // Jump well past the grace window (but within the loop backstop so the cap
         // isn't what bounds it — the grace window is).
         let jump_sec = 1 + RATE_IDLE_RETIRE_SECS + 50;
@@ -1908,8 +1912,8 @@ mod tests {
             "the lead-in 0 plus exactly the grace window of 0-fills, then it stops"
         );
         // The idle series is retired from the active set.
-        assert!(!s.rate_series.contains("Anthropic / m"), "idle series pruned");
-        assert!(!s.rate_last_active.contains_key("Anthropic / m"));
+        assert!(!s.rate_series.contains("anthropic / m"), "idle series pruned");
+        assert!(!s.rate_last_active.contains_key("anthropic / m"));
     }
 
     #[test]
@@ -1925,19 +1929,19 @@ mod tests {
             c.chat_id = Some("1".into());
             c
         };
-        s.accumulate_rate("Anthropic", &mk(10), 1000, &mut fwd); // second 1
+        s.accumulate_rate("anthropic", &mk(10), 1000, &mut fwd); // second 1
         let far = 1 + RATE_IDLE_RETIRE_SECS + 50;
         s.on_tick(far * 1000, &mut fwd); // retires chat 1
-        assert!(!s.rate_series.contains("Anthropic / m / chat 1"), "chat retired");
+        assert!(!s.rate_series.contains("anthropic / m / chat 1"), "chat retired");
         let _ = take_metrics(&mut s);
 
         // The chat resumes much later: it is registered again and its bucket flushes.
         let resume = far + 100;
-        s.accumulate_rate("Anthropic", &mk(7), resume * 1000, &mut fwd);
-        assert!(s.rate_series.contains("Anthropic / m / chat 1"), "resumed chat re-registered");
+        s.accumulate_rate("anthropic", &mk(7), resume * 1000, &mut fwd);
+        assert!(s.rate_series.contains("anthropic / m / chat 1"), "resumed chat re-registered");
         s.on_tick((resume + 1) * 1000, &mut fwd);
         let e = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / m / chat 1"), 7.0);
+        assert_eq!(scalar_value(&e, "LLM Input Tokens", "anthropic / m / chat 1"), 7.0);
     }
 
     #[test]
@@ -1953,11 +1957,11 @@ mod tests {
             c.chat_id = Some("1".into());
             c
         };
-        s.accumulate_rate("Anthropic", &mk(10), 1000, &mut fwd); // second 1
+        s.accumulate_rate("anthropic", &mk(10), 1000, &mut fwd); // second 1
         // Idle for less than the grace window, then advance.
         let gap = 1 + RATE_IDLE_RETIRE_SECS / 2;
         s.on_tick(gap * 1000, &mut fwd);
-        assert!(s.rate_series.contains("Anthropic / m / chat 1"), "still active within grace");
+        assert!(s.rate_series.contains("anthropic / m / chat 1"), "still active within grace");
         let e = take_metrics(&mut s);
         // The lead-in 0 + the real second (1, value 10) + a continuous 0-fill of
         // seconds 2..gap.
@@ -1967,8 +1971,8 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), (gap - 1) as usize, "lead-in 0 + continuous 0-fill through the short gap");
         // The chat can still resume seamlessly.
-        s.accumulate_rate("Anthropic", &mk(3), gap * 1000, &mut fwd);
-        assert_eq!(*s.rate_last_active.get("Anthropic / m / chat 1").unwrap(), gap);
+        s.accumulate_rate("anthropic", &mk(3), gap * 1000, &mut fwd);
+        assert_eq!(*s.rate_last_active.get("anthropic / m / chat 1").unwrap(), gap);
     }
 
     #[test]
@@ -1990,7 +1994,7 @@ mod tests {
         s.on_event(&rc(1, Some("claude-haiku-4-5"), 100, 20), &mut fwd); // ts_ms=1000 -> second 1
         s.on_tick(2000, &mut fwd);
         let e = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / claude-haiku-4-5"), 100.0);
+        assert_eq!(scalar_value(&e, "LLM Input Tokens", "anthropic / claude-haiku-4-5"), 100.0);
     }
 
     #[test]
@@ -2011,12 +2015,12 @@ mod tests {
         s.on_event(&started(1, "api.anthropic.com"), &mut fwd);
         s.on_event(&rc(1, Some("claude-haiku-4-5"), 100, 20), &mut fwd);
         let e1 = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "Anthropic / claude-haiku-4-5"), 1.0);
+        assert_eq!(scalar_value(&e1, "LLM Requests (cumulative)", "anthropic / claude-haiku-4-5"), 1.0);
         s.on_event(&started(2, "api.anthropic.com"), &mut fwd);
         s.on_event(&rc(2, Some("claude-haiku-4-5"), 50, 10), &mut fwd);
         let e2 = take_metrics(&mut s);
         assert_eq!(
-            scalar_value(&e2, "LLM Requests (cumulative)", "Anthropic / claude-haiku-4-5"),
+            scalar_value(&e2, "LLM Requests (cumulative)", "anthropic / claude-haiku-4-5"),
             2.0,
             "climbs across requests"
         );
@@ -2037,41 +2041,41 @@ mod tests {
             c
         };
         // Chat 1's first request is at second 1; the axis origin is second 0.
-        s.accumulate_rate("Anthropic", &mk("1", 100), 1000, &mut fwd);
+        s.accumulate_rate("anthropic", &mk("1", 100), 1000, &mut fwd);
         s.on_tick(2000, &mut fwd);
         let e1 = take_metrics(&mut s);
         let lead1 = e1
             .iter()
             .find(|x| {
                 x["metric"] == "LLM Input Tokens"
-                    && x["variant"] == "Anthropic / m / chat 1"
+                    && x["variant"] == "anthropic / m / chat 1"
                     && x["iter"] == 0
             })
             .expect("chat 1 lead-in at iter 0");
         assert_eq!(lead1["value"], 0.0);
         assert_eq!(lead1["timestamp"], 0, "one second before the first request");
-        assert_eq!(scalar_value(&e1, "LLM Input Tokens", "Anthropic / m / chat 1"), 100.0);
+        assert_eq!(scalar_value(&e1, "LLM Input Tokens", "anthropic / m / chat 1"), 100.0);
 
         // A different chat begins at second 5: it leads in from second 4, not the
         // run origin, so only its own line dips to 0 there.
-        s.accumulate_rate("Anthropic", &mk("2", 50), 5000, &mut fwd);
+        s.accumulate_rate("anthropic", &mk("2", 50), 5000, &mut fwd);
         s.on_tick(6000, &mut fwd);
         let e2 = take_metrics(&mut s);
         let lead2 = e2
             .iter()
             .find(|x| {
                 x["metric"] == "LLM Input Tokens"
-                    && x["variant"] == "Anthropic / m / chat 2"
+                    && x["variant"] == "anthropic / m / chat 2"
                     && x["value"] == 0.0
             })
             .expect("chat 2 lead-in");
         assert_eq!(lead2["iter"], 4, "chat 2 leads in one second before its first (second 5)");
         assert_eq!(lead2["timestamp"], 4000);
-        assert_eq!(scalar_value(&e2, "LLM Input Tokens", "Anthropic / m / chat 2"), 50.0);
+        assert_eq!(scalar_value(&e2, "LLM Input Tokens", "anthropic / m / chat 2"), 50.0);
         // The lead-in is once-per-segment: chat 1 does not lead in again.
         assert!(
             !e2.iter()
-                .any(|x| x["variant"] == "Anthropic / m / chat 1" && x["iter"] == 0),
+                .any(|x| x["variant"] == "anthropic / m / chat 1" && x["iter"] == 0),
             "chat 1 does not repeat its lead-in"
         );
     }
@@ -2092,32 +2096,32 @@ mod tests {
             c.chat_id = Some(chat.into());
             c
         };
-        let e1 = s.per_request_events("Anthropic", &mk(110, 30, 60, 40, "1"), 1000);
-        assert_eq!(scalar_value(&e1, "LLM Input Tokens (cumulative)", "Anthropic"), 10.0); // 110-60-40
-        assert_eq!(scalar_value(&e1, "LLM Output Tokens (cumulative)", "Anthropic"), 30.0);
-        assert_eq!(scalar_value(&e1, "LLM Cache Read Tokens (cumulative)", "Anthropic"), 60.0);
-        assert_eq!(scalar_value(&e1, "LLM Cache Write Tokens (cumulative)", "Anthropic"), 40.0);
+        let e1 = s.per_request_events("anthropic", &mk(110, 30, 60, 40, "1"), 1000);
+        assert_eq!(scalar_value(&e1, "LLM Input Tokens (cumulative)", "anthropic"), 10.0); // 110-60-40
+        assert_eq!(scalar_value(&e1, "LLM Output Tokens (cumulative)", "anthropic"), 30.0);
+        assert_eq!(scalar_value(&e1, "LLM Cache Read Tokens (cumulative)", "anthropic"), 60.0);
+        assert_eq!(scalar_value(&e1, "LLM Cache Write Tokens (cumulative)", "anthropic"), 40.0);
         assert!(
             !e1.iter().any(|x| x["metric"] == "LLM Input Tokens"),
             "per_request_events emits no point series"
         );
 
         // Second call adds on top; cache buckets hold flat when unused.
-        let e2 = s.per_request_events("Anthropic", &mk(30, 5, 0, 0, "1"), 2000);
-        assert_eq!(scalar_value(&e2, "LLM Input Tokens (cumulative)", "Anthropic"), 40.0);
-        assert_eq!(scalar_value(&e2, "LLM Output Tokens (cumulative)", "Anthropic"), 35.0);
-        assert_eq!(scalar_value(&e2, "LLM Cache Read Tokens (cumulative)", "Anthropic"), 60.0);
+        let e2 = s.per_request_events("anthropic", &mk(30, 5, 0, 0, "1"), 2000);
+        assert_eq!(scalar_value(&e2, "LLM Input Tokens (cumulative)", "anthropic"), 40.0);
+        assert_eq!(scalar_value(&e2, "LLM Output Tokens (cumulative)", "anthropic"), 35.0);
+        assert_eq!(scalar_value(&e2, "LLM Cache Read Tokens (cumulative)", "anthropic"), 60.0);
 
         // A different chat of the same model feeds the SAME total (chat-less base).
-        let e3 = s.per_request_events("Anthropic", &mk(7, 3, 0, 0, "2"), 3000);
-        assert_eq!(scalar_value(&e3, "LLM Input Tokens (cumulative)", "Anthropic"), 47.0);
+        let e3 = s.per_request_events("anthropic", &mk(7, 3, 0, 0, "2"), 3000);
+        assert_eq!(scalar_value(&e3, "LLM Input Tokens (cumulative)", "anthropic"), 47.0);
 
         // A different model is its own line.
         let mut c = mk(5, 2, 0, 0, "1");
         c.model = Some("claude-opus-4-5".into());
-        let e4 = s.per_request_events("Anthropic", &c, 4000);
+        let e4 = s.per_request_events("anthropic", &c, 4000);
         assert_eq!(
-            scalar_value(&e4, "LLM Input Tokens (cumulative)", "Anthropic / claude-opus-4-5"),
+            scalar_value(&e4, "LLM Input Tokens (cumulative)", "anthropic / claude-opus-4-5"),
             5.0,
             "per-model total, not folded into the model-less line"
         );
@@ -2135,7 +2139,7 @@ mod tests {
         c.latency_ms = 42;
         c.bytes_tx = 7;
         c.bytes_rx = 9;
-        let e = s.per_request_events("Anthropic", &c, 1000);
+        let e = s.per_request_events("anthropic", &c, 1000);
         assert!(e.is_empty(), "no cumulative or tool events for these fields");
     }
 
@@ -2146,14 +2150,14 @@ mod tests {
         let mut s = sinks(&["tokens_in"]);
         let mut c = completed();
         c.tokens_in = 100;
-        let e1 = s.per_request_events("Anthropic", &c, 1000);
+        let e1 = s.per_request_events("anthropic", &c, 1000);
         let cum1 = e1.iter().find(|x| x["metric"] == "LLM Input Tokens (cumulative)").unwrap();
         assert_eq!(cum1["iter"], 0);
         assert_eq!(s.metrics_seq, 1);
-        let e2 = s.per_request_events("Anthropic", &c, 2000);
+        let e2 = s.per_request_events("anthropic", &c, 2000);
         let cum2 = e2.iter().find(|x| x["metric"] == "LLM Input Tokens (cumulative)").unwrap();
         assert_eq!(cum2["iter"], 1, "enumerator advances per request");
-        let e3 = s.per_request_events("OpenAI", &c, 3000);
+        let e3 = s.per_request_events("openai", &c, 3000);
         let cum3 = e3.iter().find(|x| x["metric"] == "LLM Input Tokens (cumulative)").unwrap();
         assert_eq!(cum3["iter"], 2, "enumerator shared across providers");
     }
@@ -2179,7 +2183,7 @@ mod tests {
         };
 
         // get_weather used cleanly, search's result errored.
-        let e1 = s.per_request_events("Anthropic", &mk(vec!["get_weather", "search"], vec!["search"]), 1000);
+        let e1 = s.per_request_events("anthropic", &mk(vec!["get_weather", "search"], vec!["search"]), 1000);
         assert_eq!(per_tool(&e1, "get_weather"), 1.0, "used tool -> +1");
         assert_eq!(per_tool(&e1, "search"), -1.0, "errored tool -> -1 (dominates)");
         assert!(
@@ -2190,7 +2194,7 @@ mod tests {
 
         // A later request with no tool activity: both already-seen tools sit at
         // the continuous 0 baseline.
-        let e2 = s.per_request_events("Anthropic", &mk(vec![], vec![]), 2000);
+        let e2 = s.per_request_events("anthropic", &mk(vec![], vec![]), 2000);
         assert_eq!(per_tool(&e2, "get_weather"), 0.0, "baseline 0 when unused");
         assert_eq!(per_tool(&e2, "search"), 0.0, "baseline 0 when unused");
     }
@@ -2213,9 +2217,9 @@ mod tests {
                 .and_then(|e| e["value"].as_f64())
                 .expect("signal series present")
         };
-        assert_eq!(signal(&s.per_request_events("Anthropic", &mk(2, 0), 1000)), 1.0, "clean -> +1");
-        assert_eq!(signal(&s.per_request_events("Anthropic", &mk(2, 1), 2000)), -1.0, "error -> -1");
-        assert_eq!(signal(&s.per_request_events("Anthropic", &mk(0, 0), 3000)), 0.0, "idle -> 0");
+        assert_eq!(signal(&s.per_request_events("anthropic", &mk(2, 0), 1000)), 1.0, "clean -> +1");
+        assert_eq!(signal(&s.per_request_events("anthropic", &mk(2, 1), 2000)), -1.0, "error -> -1");
+        assert_eq!(signal(&s.per_request_events("anthropic", &mk(0, 0), 3000)), 0.0, "idle -> 0");
     }
 
     #[test]
@@ -2239,21 +2243,21 @@ mod tests {
                 .unwrap_or(f64::NAN)
         };
 
-        let e1 = s.per_request_events("Anthropic", &mk(2, 1, "1"), 1000);
-        assert_eq!(cum(&e1, "Anthropic / chat 1 / calls"), 2.0);
-        assert_eq!(cum(&e1, "Anthropic / chat 1 / errors"), 1.0);
+        let e1 = s.per_request_events("anthropic", &mk(2, 1, "1"), 1000);
+        assert_eq!(cum(&e1, "anthropic / chat 1 / calls"), 2.0);
+        assert_eq!(cum(&e1, "anthropic / chat 1 / errors"), 1.0);
 
-        let e2 = s.per_request_events("Anthropic", &mk(2, 0, "1"), 2000);
-        assert_eq!(cum(&e2, "Anthropic / chat 1 / calls"), 4.0, "calls accumulate");
-        assert_eq!(cum(&e2, "Anthropic / chat 1 / errors"), 1.0, "errors hold flat");
+        let e2 = s.per_request_events("anthropic", &mk(2, 0, "1"), 2000);
+        assert_eq!(cum(&e2, "anthropic / chat 1 / calls"), 4.0, "calls accumulate");
+        assert_eq!(cum(&e2, "anthropic / chat 1 / errors"), 1.0, "errors hold flat");
 
-        let e3 = s.per_request_events("Anthropic", &mk(0, 0, "1"), 3000);
-        assert_eq!(cum(&e3, "Anthropic / chat 1 / calls"), 4.0, "flat through idle");
-        assert_eq!(cum(&e3, "Anthropic / chat 1 / errors"), 1.0, "flat through idle");
+        let e3 = s.per_request_events("anthropic", &mk(0, 0, "1"), 3000);
+        assert_eq!(cum(&e3, "anthropic / chat 1 / calls"), 4.0, "flat through idle");
+        assert_eq!(cum(&e3, "anthropic / chat 1 / errors"), 1.0, "flat through idle");
 
-        let e4 = s.per_request_events("Anthropic", &mk(1, 0, "2"), 4000);
-        assert_eq!(cum(&e4, "Anthropic / chat 2 / calls"), 1.0, "per-chat total");
-        assert_eq!(cum(&e4, "Anthropic / chat 2 / errors"), 0.0);
+        let e4 = s.per_request_events("anthropic", &mk(1, 0, "2"), 4000);
+        assert_eq!(cum(&e4, "anthropic / chat 2 / calls"), 1.0, "per-chat total");
+        assert_eq!(cum(&e4, "anthropic / chat 2 / errors"), 0.0);
     }
 
     #[test]
@@ -2264,11 +2268,11 @@ mod tests {
         let mut c = completed();
         c.tokens_in = 42;
         c.model = Some("m".into());
-        s.accumulate_rate("Anthropic", &c, 1000, &mut fwd); // second 1, open bucket has data
+        s.accumulate_rate("anthropic", &c, 1000, &mut fwd); // second 1, open bucket has data
         assert!(s.metrics_buf.is_empty(), "nothing flushed yet (open second)");
         s.flush_final_rate(&mut fwd);
         let e = take_metrics(&mut s);
-        assert_eq!(scalar_value(&e, "LLM Input Tokens", "Anthropic / m"), 42.0, "open second emitted");
+        assert_eq!(scalar_value(&e, "LLM Input Tokens", "anthropic / m"), 42.0, "open second emitted");
         // Idempotent: the bucket is cleared, so a second call emits nothing.
         s.flush_final_rate(&mut fwd);
         assert!(s.metrics_buf.is_empty(), "no double-emit");
@@ -2282,7 +2286,7 @@ mod tests {
         let mut c = completed();
         c.tokens_in = 10;
         c.model = Some("m".into());
-        s.accumulate_rate("Anthropic", &c, 1000, &mut fwd);
+        s.accumulate_rate("anthropic", &c, 1000, &mut fwd);
         s.on_tick(3000, &mut fwd); // advance past second 1; open bucket now empty
         let _ = take_metrics(&mut s);
         s.flush_final_rate(&mut fwd);
