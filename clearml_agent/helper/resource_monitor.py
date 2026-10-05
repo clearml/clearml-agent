@@ -687,21 +687,26 @@ class GpuFractionsHandler:
         return 0
 
     @classmethod
-    def encode_fractions(cls, limits: dict, labels: dict, annotations: dict) -> str:
+    def encode_fractions(cls, limits: dict, labels: dict = None, annotations: dict = None) -> str:
+        # Each source falls through when it yields nothing: regular cpu/memory limits must not
+        # hide fractions declared in labels or annotations
         if limits:
-            if any(cls._number_re.match(x) for x in (limits or {})):
+            if any(cls._number_re.match(x) for x in limits):
                 return ",".join(str(v) for k, v in sorted(limits.items()) if cls._number_re.match(k))
-            return ",".join(("{}:{}".format(k, v) for k, v in (limits or {}).items() if cls._mig_re.match(k)))
-        elif labels:
-            if any(cls._frac_gpu_injector_re.match(x) for x in (labels or {})):
+            mig_fractions = ",".join(("{}:{}".format(k, v) for k, v in limits.items() if cls._mig_re.match(k)))
+            if mig_fractions:
+                return mig_fractions
+        if labels:
+            if any(cls._frac_gpu_injector_re.match(x) for x in labels):
                 # The value below is MAX 1.000 to avoid the issue of GPUs being reported N*N times, it makes sense because it represents the fraction of 1 GPU used
                 # So if the pod uses 3 GPUs, it means it's using 3 times a 1.000 fraction of a GPU.
                 # If the pod is using 0.5 GPUs, it means it's using 1 time a 0.5 fraction of a GPU.
                 # CFGI supports fractions only BELOW 1, so this logic holds.
                 return ",".join(("%.03f" % min(float(v), 1.000)) for k, v in sorted(labels.items()) if cls._frac_gpu_injector_re.match(k))
-        elif annotations:
-            if any(cls._custom_gpu_fraction_re.match(x) for x in (annotations or {})):
+        if annotations:
+            if any(cls._custom_gpu_fraction_re.match(x) for x in annotations):
                 return ",".join(str(v) for k, v in sorted(annotations.items()) if cls._custom_gpu_fraction_re.match(k))
+        return ""
 
     @staticmethod
     def decode_fractions(fractions: str) -> Union[List[float], Dict[str, int]]:
