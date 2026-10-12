@@ -2954,7 +2954,7 @@ mod tests {
     #[test]
     fn emit_uses_per_host_tokenizer_from_matched_rule() {
         // A matched rule's tokenizer overrides the provider default for the
-        // byte-ratio estimate. claude.ai's provider default is "claude" (2.7
+        // byte-ratio estimate. claude.ai's provider default is "claude" (3.0
         // bytes/token for opus-4-8); a rule pinning "cl100k" (4.0) must make BOTH
         // the input and output estimates use cl100k instead.
         let (tx, rx) = std::sync::mpsc::sync_channel(16);

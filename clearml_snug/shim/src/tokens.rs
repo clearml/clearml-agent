@@ -28,9 +28,11 @@
 //! into `tokenx-rs` or `tiktoken-rs` without changing any caller;
 //! the function signature is the source of truth.
 
-/// Bytes-per-token for the current-generation Claude tokenizer (Opus 4.7+,
-/// Sonnet 5+, Fable 5+, Haiku 4.5+). APPROXIMATE — needs calibration.
-const CLAUDE_NEW_BYTES_PER_TOKEN: f64 = 2.7;
+/// Bytes-per-token of English prose for the current-generation Claude tokenizer
+/// (Opus 4.7+, Sonnet 5+, Fable 5+, Haiku 4.5+). Measured with Anthropic's
+/// `count_tokens` on technical prose: 2.9 to 3.1 (Opus, Sonnet and Haiku 5.5 count
+/// identically). JSON schemas and code run denser, near 2.5.
+pub const CLAUDE_NEW_BYTES_PER_TOKEN: f64 = 3.0;
 /// Bytes-per-token for the legacy Claude tokenizer (Claude 3.x and the older
 /// 4.x models). Anthropic's long-documented approximation. APPROXIMATE.
 const CLAUDE_LEGACY_BYTES_PER_TOKEN: f64 = 3.5;
@@ -174,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_new_gen_ratio_2_7() {
+    fn claude_new_gen_ratio_3_0() {
         // A current-gen model tokenizes into more tokens for the same bytes.
-        // 27 bytes / 2.7 = 10 tokens.
-        assert_eq!(estimate_tokens(27, "claude", Some("claude-opus-4-8")), 10);
+        // 30 bytes / 3.0 = 10 tokens.
+        assert_eq!(estimate_tokens(30, "claude", Some("claude-opus-4-8")), 10);
         // Same bytes: new-gen yields strictly more tokens than legacy.
         let n = 100_000;
         let new = estimate_tokens(n, "claude", Some("claude-sonnet-5"));

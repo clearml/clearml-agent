@@ -12,15 +12,24 @@
 //! the cache; later requests within the cache lifetime (five minutes by default)
 //! read it. This module models exactly that, in two parts:
 //!
-//! * the `tools` + `system` bytes of the request are the cacheable prefix, a cache
-//!   write on first sight and a cache read afterwards;
+//! * the `tools` + `system` of the request are the cacheable prefix, a cache write
+//!   on first sight and a cache read afterwards;
 //! * the conversation history, which the request does not carry, is rebuilt from
 //!   the turns seen on the wire (each turn's prompt, attachments and reply text,
 //!   per conversation id) and counted as cache read, or as a cache write when the
 //!   conversation has been idle past the cache lifetime.
 //!
-//! The rest of the body (the new prompt, attachments, parameters) is fresh input.
-//! Only byte counts are kept per conversation, never text.
+//! The new prompt and its attachments are fresh input. The rest of the body is the
+//! app's own envelope (timezone, locale, ids, rendering options) and is not model
+//! input, so it is not counted. A cache belongs to one model: the prefix and the
+//! history are written again when the model changes. Only byte counts are kept per
+//! conversation, never text.
+//!
+//! The byte counts of a `Split` are prose-equivalent: the caller turns them into
+//! tokens at the prose ratio, so the tool schemas, which tokenize denser, are
+//! weighted up front (`TOOL_WEIGHT`). What the server adds that the request does not
+//! carry (claude.ai's own system prompt, the expansion of its built-in tools) is not
+//! counted.
 //!
 //! The app loads a chat whole (`GET` of the conversation) when it is opened and
 //! again after each completion, so the history is taken from that response
@@ -40,6 +49,8 @@ use std::sync::{Mutex, OnceLock};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::tokens;
+
 /// How long a seen prefix or conversation is assumed to still be served from the
 /// provider's prompt cache: Anthropic's default lifetime of five minutes (the
 /// one-hour lifetime is opt-in, and the claude.ai wire does not show it being
@@ -48,8 +59,23 @@ use serde_json::value::RawValue;
 const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Below this the prefix is not cacheable (Anthropic requires at least ~1024
-/// tokens; at the ~2.7 bytes/token estimate that is ~2.8 KB), so it stays fresh.
+/// tokens, ~3 KB of prose), so it stays fresh.
 const MIN_CACHEABLE_BYTES: u64 = 3072;
+
+/// Bytes per token of tool schemas, and the tokens a tool list adds on its own (the
+/// tool-use instructions), measured with Anthropic's `count_tokens` on a real
+/// claude.ai request: a fit over five connectors' tools (name, description and
+/// input schema plus `TOOL_FRAME` bytes of framing each) gives tokens = 277 +
+/// bytes / 2.56, and all 94 tools together count 60,858.
+const TOOL_BYTES_PER_TOKEN: f64 = 2.56;
+const TOOL_OVERHEAD_TOKENS: f64 = 280.0;
+
+/// How many bytes of prose one byte of tool schema is worth in tokens.
+const TOOL_WEIGHT: f64 = tokens::CLAUDE_NEW_BYTES_PER_TOKEN / TOOL_BYTES_PER_TOKEN;
+
+/// Bytes of the API tool object around its three values:
+/// `{"name":,"description":,"input_schema":}`.
+const TOOL_FRAME: u64 = 40;
 
 /// Bound on remembered prefixes; the oldest is dropped past it.
 const MAX_PREFIXES: usize = 64;
@@ -70,6 +96,8 @@ pub struct Split {
 #[derive(Deserialize)]
 struct Request<'a> {
     #[serde(borrow, default)]
+    model: Option<&'a str>,
+    #[serde(borrow, default)]
     tools: Option<&'a RawValue>,
     #[serde(borrow, default)]
     system: Option<&'a RawValue>,
@@ -79,6 +107,37 @@ struct Request<'a> {
     attachments: Option<&'a RawValue>,
 }
 
+/// The parts of a tool that the model reads.
+#[derive(Deserialize)]
+struct Tool<'a> {
+    #[serde(borrow, default)]
+    name: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    description: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    input_schema: Option<&'a RawValue>,
+}
+
+/// Bytes of a `tools` array that the model reads. claude.ai's tool objects carry
+/// metadata the model never sees (server urls and uuids, approval and read-only
+/// hints), so a tool with a schema counts as its name, description and input
+/// schema plus the framing of the API tool they form. Any other entry (a built-in
+/// tool listed by name only) counts whole.
+fn tool_bytes(tools: &str) -> u64 {
+    let Ok(list) = serde_json::from_str::<Vec<&RawValue>>(tools) else {
+        return tools.len() as u64;
+    };
+    let len = |v: Option<&RawValue>| v.map(|v| v.get().len() as u64).unwrap_or(0);
+    list.iter()
+        .map(|raw| match serde_json::from_str::<Tool>(raw.get()) {
+            Ok(t) if t.input_schema.is_some() => {
+                len(t.name) + len(t.description) + len(t.input_schema) + TOOL_FRAME
+            }
+            _ => raw.get().len() as u64,
+        })
+        .sum()
+}
+
 /// What is remembered about one conversation.
 struct History {
     /// Prompt, attachment and reply bytes of the turns seen so far.
@@ -86,6 +145,8 @@ struct History {
     last_ms: u64,
     /// Seeded from a loaded chat and not yet sent from: not in the provider's cache.
     cold: bool,
+    /// Hash of the model the cached history was written under.
+    model: u64,
 }
 
 /// The conversation id in a claude.ai chat path
@@ -215,22 +276,33 @@ impl ChatCache {
         let req: Request = serde_json::from_slice(plain).ok()?;
         let tools = req.tools.map(|v| v.get()).unwrap_or("");
         let system = req.system.map(|v| v.get()).unwrap_or("");
-        let prefix_bytes = (tools.len() + system.len()) as u64;
+        let tool_bytes = tool_bytes(tools);
+        let overhead = if tool_bytes > 0 {
+            (TOOL_OVERHEAD_TOKENS * tokens::CLAUDE_NEW_BYTES_PER_TOKEN) as u64
+        } else {
+            0
+        };
+        let prefix_bytes =
+            (tool_bytes as f64 * TOOL_WEIGHT).round() as u64 + overhead + system.len() as u64;
         if prefix_bytes < MIN_CACHEABLE_BYTES {
             return None;
         }
-        let total = plain.len() as u64;
-        let fresh_bytes = total.saturating_sub(prefix_bytes);
+        let turn_bytes = (req.prompt.map(|v| v.get().len()).unwrap_or(0)
+            + req.attachments.map(|v| v.get().len()).unwrap_or(0)) as u64;
+        let fresh_bytes = if req.prompt.is_some() {
+            turn_bytes
+        } else {
+            (plain.len() as u64).saturating_sub((tools.len() + system.len()) as u64)
+        };
 
-        let prefix_cached = self.touch_prefix(hash_of(&(system, tools)), now_ms);
+        let model = hash_of(&req.model);
+        let prefix_cached = self.touch_prefix(hash_of(&(model, system, tools)), now_ms);
         let (mut cache_read_bytes, mut cache_write_bytes) =
             if prefix_cached { (prefix_bytes, 0) } else { (0, prefix_bytes) };
 
         if let Some(conv) = conversation {
-            let turn_bytes = req.prompt.map(|v| v.get().len()).unwrap_or(0)
-                + req.attachments.map(|v| v.get().len()).unwrap_or(0);
             let (history, history_cached) =
-                self.record_turn(hash_of(conv), turn_bytes as u64 + reply_bytes, now_ms);
+                self.record_turn(hash_of(conv), model, turn_bytes + reply_bytes, now_ms);
             if history_cached {
                 cache_read_bytes += history;
             } else {
@@ -249,7 +321,10 @@ impl ChatCache {
         match convs.get_mut(&hash_of(conversation)) {
             Some(h) => h.bytes = history_bytes,
             None => {
-                convs.insert(hash_of(conversation), History { bytes: history_bytes, last_ms: 0, cold: true });
+                convs.insert(
+                    hash_of(conversation),
+                    History { bytes: history_bytes, last_ms: 0, cold: true, model: 0 },
+                );
                 Self::evict_oldest(&mut convs);
             }
         }
@@ -278,16 +353,17 @@ impl ChatCache {
         cached
     }
 
-    /// Return the history before this turn and whether it is still cached, then add
-    /// the turn's bytes to it.
-    fn record_turn(&self, key: u64, turn_bytes: u64, now_ms: u64) -> (u64, bool) {
+    /// Return the history before this turn and whether it is still cached under
+    /// `model`, then add the turn's bytes to it.
+    fn record_turn(&self, key: u64, model: u64, turn_bytes: u64, now_ms: u64) -> (u64, bool) {
         let Ok(mut convs) = self.conversations.lock() else { return (0, false) };
-        let h = convs.entry(key).or_insert(History { bytes: 0, last_ms: now_ms, cold: false });
+        let h = convs.entry(key).or_insert(History { bytes: 0, last_ms: now_ms, cold: false, model });
         let before = h.bytes;
-        let cached = !h.cold && now_ms.saturating_sub(h.last_ms) <= CACHE_TTL_MS;
+        let cached = !h.cold && h.model == model && now_ms.saturating_sub(h.last_ms) <= CACHE_TTL_MS;
         h.bytes += turn_bytes;
         h.last_ms = now_ms;
         h.cold = false;
+        h.model = model;
         Self::evict_oldest(&mut convs);
         (before, cached)
     }
@@ -304,10 +380,14 @@ mod tests {
     use super::*;
 
     fn body(prompt: &str, tool_pad: usize) -> Vec<u8> {
+        body_for("m", prompt, tool_pad)
+    }
+
+    fn body_for(model: &str, prompt: &str, tool_pad: usize) -> Vec<u8> {
         let tools = format!("[{{\"name\":\"t\",\"description\":\"{}\"}}]", "x".repeat(tool_pad));
         format!(
-            "{{\"prompt\":{:?},\"timezone\":\"UTC\",\"model\":\"m\",\"tools\":{},\"files\":[]}}",
-            prompt, tools
+            "{{\"prompt\":{:?},\"timezone\":\"UTC\",\"model\":{:?},\"tools\":{},\"files\":[]}}",
+            prompt, model, tools
         )
         .into_bytes()
     }
@@ -319,13 +399,57 @@ mod tests {
         let first = c.split(&b, None, 0, 1_000).unwrap();
         assert!(first.cache_write_bytes > 10_000);
         assert_eq!(first.cache_read_bytes, 0);
-        // Everything outside the tools array stays fresh and the buckets cover the body.
-        assert!(first.fresh_bytes < 200);
-        assert_eq!(first.fresh_bytes + first.cache_write_bytes, b.len() as u64);
+        // Only the prompt is fresh: the rest of the body is the app's envelope.
+        assert_eq!(first.fresh_bytes, "\"hello\"".len() as u64);
 
         let second = c.split(&body("a different prompt", 10_000), None, 0, 2_000).unwrap();
         assert_eq!(second.cache_write_bytes, 0);
         assert_eq!(second.cache_read_bytes, first.cache_write_bytes);
+    }
+
+    #[test]
+    fn only_what_the_model_reads_of_a_tool_is_counted() {
+        let schema = r#"{"type":"object","properties":{"q":{"type":"string"}}}"#;
+        let with_meta = format!(
+            r#"[{{"name":"find","description":"Find things.","input_schema":{schema},"mcp_server_url":"https://example.com/mcp","mcp_server_uuid":"0b9c4a7e-0000-0000-0000-000000000000","needs_approval":true,"read_only_hint":false}},{{"name":"web_search","type":"web_search_v0"}}]"#
+        );
+        let expected = r#""find""#.len() + r#""Find things.""#.len() + schema.len();
+        let builtin = r#"{"name":"web_search","type":"web_search_v0"}"#.len();
+        assert_eq!(tool_bytes(&with_meta), expected as u64 + TOOL_FRAME + builtin as u64);
+        // Not an array: the raw bytes stand.
+        assert_eq!(tool_bytes(r#"{"a":1}"#), 7);
+    }
+
+    #[test]
+    fn tool_schemas_are_weighted_denser_than_prose() {
+        let c = ChatCache::default();
+        let desc = "x".repeat(10_000);
+        let tools = format!(
+            r#"[{{"name":"t","description":"{desc}","input_schema":{{"type":"object"}}}}]"#
+        );
+        let b = format!(r#"{{"prompt":"hi","model":"m","tools":{tools}}}"#);
+        let s = c.split(b.as_bytes(), None, 0, 1_000).unwrap();
+        let counted = tool_bytes(&tools);
+        let overhead = (TOOL_OVERHEAD_TOKENS * tokens::CLAUDE_NEW_BYTES_PER_TOKEN) as u64;
+        assert_eq!(s.cache_write_bytes, (counted as f64 * TOOL_WEIGHT).round() as u64 + overhead);
+        assert!(s.cache_write_bytes > counted, "a schema byte is worth more than a prose byte");
+    }
+
+    #[test]
+    fn a_new_model_writes_the_prefix_and_the_history_again() {
+        let c = ChatCache::default();
+        let conv = Some("c1");
+        c.split(&body_for("opus", "hello", 10_000), conv, 0, 1_000).unwrap();
+        let again = c.split(&body_for("opus", "and again", 10_000), conv, 50, 2_000).unwrap();
+        assert!(again.cache_read_bytes > 10_000 && again.cache_write_bytes == 0);
+        // The same prefix and conversation under another model is not in that model's cache.
+        let other = c.split(&body_for("sonnet", "and again", 10_000), conv, 50, 3_000).unwrap();
+        assert_eq!(other.cache_read_bytes, 0);
+        assert!(other.cache_write_bytes > 10_000);
+        // And switching back finds the opus prefix still cached, but the history now sits under sonnet.
+        let back = c.split(&body_for("opus", "and again", 10_000), conv, 50, 4_000).unwrap();
+        assert!(back.cache_read_bytes > 10_000);
+        assert!(back.cache_write_bytes > 0 && back.cache_write_bytes < 10_000);
     }
 
     #[test]
