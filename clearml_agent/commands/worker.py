@@ -166,7 +166,7 @@ from clearml_agent.helper.process import (
     terminate_all_child_processes, find_executable,
 )
 from clearml_agent.helper.repo import clone_repository_cached, RepoInfo, VCS, fix_package_import_diff_patch, \
-    patch_add_task_init_call
+    patch_add_task_init_call, cleanup_vcs_cache_orphans
 from clearml_agent.helper.resource_monitor import ResourceMonitor
 from clearml_agent.helper.runtime_verification import check_runtime, print_uptime_properties
 from clearml_agent.helper.singleton import Singleton
@@ -2232,6 +2232,13 @@ class Worker(ServiceCommandSection):
         # make sure we only have a single instance,
         # also make sure we set worker_id properly and cache folders
         self._singleton(dynamic_gpus=bool(dynamic_gpus))
+
+        # remove leftover vcs cache folders (created by older agent versions when the repo lock timed out)
+        # noinspection PyBroadException
+        try:
+            cleanup_vcs_cache_orphans(self._session)
+        except Exception as ex:
+            self.log.warning("Failed cleaning up orphaned vcs cache folders: {}".format(ex))
 
         if dynamic_gpus:
             self._register_dynamic_gpus(gpu_indexes)

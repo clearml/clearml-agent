@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from base64 import b64encode
 from os import environ
 from random import random
@@ -841,6 +842,63 @@ class Hg(VCS):
     )
 
 
+# default number of seconds to wait for the vcs cache lock of a repository
+DEFAULT_VCS_CACHE_LOCK_TIMEOUT_SEC = 300
+
+# vcs cache folders created by older agent versions when the repository lock could not be acquired
+# ("<name>.<md5>_<random digits>"). These are never reused, so they are safe to delete.
+VCS_CACHE_ORPHAN_FOLDER_RE = re.compile(r"^.+\.[0-9a-f]{32}_[0-9e\-]+$")
+
+# default minimum age of orphaned folders to delete (newer ones might still be in use by an older agent running alongside)
+DEFAULT_VCS_CACHE_ORPHAN_MIN_AGE_SEC = 5 * 24 * 60 * 60
+
+
+def cleanup_vcs_cache_orphans(session, min_age_sec=None):
+    # type: (Session, Optional[float]) -> int
+    """
+    Remove orphaned vcs cache folders (see VCS_CACHE_ORPHAN_FOLDER_RE) older than min_age_sec
+    Disabled by setting "agent.vcs_cache.cleanup_orphans" to false
+    :param min_age_sec: if not provided, use "agent.vcs_cache.orphan_min_age_sec"
+    :return: number of folders removed
+    """
+    if not session.config.get("agent.vcs_cache.cleanup_orphans", True):
+        return 0
+
+    if min_age_sec is None:
+        min_age_sec = float(session.config.get(
+            "agent.vcs_cache.orphan_min_age_sec", DEFAULT_VCS_CACHE_ORPHAN_MIN_AGE_SEC))
+
+    vcs_cache_path = session.config.get("agent.vcs_cache.path", None)
+    if not vcs_cache_path:
+        return 0
+    vcs_cache_path = Path(os.path.expandvars(vcs_cache_path)).expanduser()
+
+    try:
+        entries = list(vcs_cache_path.iterdir())
+    except OSError:
+        return 0
+
+    now = time.time()
+    removed = 0
+    for entry in entries:
+        if not VCS_CACHE_ORPHAN_FOLDER_RE.match(entry.name):
+            continue
+        try:
+            age_sec = now - entry.stat().st_mtime
+            if not entry.is_dir() or age_sec < min_age_sec:
+                continue
+        except OSError:
+            continue
+        print('Removing orphaned vcs cache folder "{}" (age {:.1f} days)'.format(entry, age_sec / (24 * 60 * 60)))
+        # noinspection PyBroadException
+        try:
+            rm_tree(entry)
+            removed += 1
+        except Exception as ex:
+            print('WARNING: failed removing orphaned vcs cache folder "{}": {}'.format(entry, ex))
+    return removed
+
+
 def clone_repository_cached(session, execution, destination):
     # type: (Session, ExecutionInfo, Path) -> Tuple[VCS, RepoInfo]
     """
@@ -853,7 +911,8 @@ def clone_repository_cached(session, execution, destination):
     """
     # mock lock
     repo_lock = Lock()
-    repo_lock_timeout_sec = 300
+    repo_lock_timeout_sec = float(session.config.get(
+        "agent.vcs_cache.lock_timeout_sec", DEFAULT_VCS_CACHE_LOCK_TIMEOUT_SEC))
     repo_url = execution.repository or ''  # type: str
     parsed_url = furl(repo_url)
     no_password_url = parsed_url.copy().remove(password=True).url
@@ -862,6 +921,10 @@ def clone_repository_cached(session, execution, destination):
     clone_folder = Path(destination) / clone_folder_name
 
     standalone_mode = session.config.get("agent.standalone_mode", False)
+    # when false, clone directly into the destination folder (bypassing the vcs cache)
+    use_cache = not standalone_mode
+    # temporary vcs cache folder (legacy lock timeout behavior), deleted when we are done with it
+    temp_cache_folder = None
     if standalone_mode:
         cached_repo_path = clone_folder
     else:
@@ -874,61 +937,86 @@ def clone_repository_cached(session, execution, destination):
             print("INFO: acquiring [timeout={}s] lock for repo cache folder".format(repo_lock_timeout_sec))
             repo_lock.acquire(timeout=repo_lock_timeout_sec)
         except BaseException:
-            print('Could not lock cache folder "{}" (timeout {} sec), using temp vcs cache.'.format(
-                clone_folder_name, repo_lock_timeout_sec))
-            repo_hash = '{}_{}'.format(repo_hash, str(random()).replace('.', ''))
+            if session.config.get("agent.vcs_cache.temp_cache_on_lock_timeout", False):
+                # legacy behavior, clone into a new temporary vcs cache folder
+                print('Could not lock cache folder "{}" (timeout {} sec), using temp vcs cache.'.format(
+                    clone_folder_name, repo_lock_timeout_sec))
+                repo_hash = '{}_{}'.format(repo_hash, str(random()).replace('.', ''))
+                temp_cache_folder = vcs_cache_path / "{}.{}".format(clone_folder_name, repo_hash)
+            else:
+                print('Could not lock cache folder "{}" (timeout {} sec), cloning directly without vcs cache.'.format(
+                    clone_folder_name, repo_lock_timeout_sec))
+                use_cache = False
             # use mock lock for the context
             repo_lock = Lock()
         # select vcs cache folder
-        cached_repo_path = vcs_cache_path / "{}.{}".format(clone_folder_name, repo_hash) / clone_folder_name
-
-    with repo_lock:
-        vcs = VcsFactory.create(
-            session, execution_info=execution, location=cached_repo_path
+        cached_repo_path = (
+            vcs_cache_path / "{}.{}".format(clone_folder_name, repo_hash) / clone_folder_name
+            if use_cache else clone_folder
         )
-        if not find_executable(vcs.executable_name):
-            raise CommandFailedError(vcs.executable_not_found_error_help())
 
-        if not standalone_mode:
-            if session.config["agent.vcs_cache.enabled"] and cached_repo_path.exists():
-                print('Using cached repository in "{}"'.format(cached_repo_path))
+    try:
+        with repo_lock:
+            vcs = VcsFactory.create(
+                session, execution_info=execution, location=cached_repo_path
+            )
+            if not find_executable(vcs.executable_name):
+                raise CommandFailedError(vcs.executable_not_found_error_help())
 
-            else:
+            if not standalone_mode and not use_cache:
                 print("cloning: {}".format(no_password_url))
-                rm_tree(cached_repo_path)
-                # We clone the entire repository, not a specific branch
-                vcs.clone()  # branch=execution.branch)
-
-            print("pulling git")
-            try:
-                vcs.pull()
-            except Exception as ex:
-                print("git pull failed: {}".format(ex))
-                if (
-                        session.config.get("agent.vcs_cache.enabled", False) and
-                        session.config.get("agent.vcs_cache.clone_on_pull_fail", False)
-                ):
-                    print("pulling git failed, re-cloning: {}".format(no_password_url))
-                    rm_tree(cached_repo_path)
-                    vcs.clone()
-                else:
-                    raise ex
-            print("pulling git completed")
-
-            rm_tree(destination)
-            shutil.copytree(Text(cached_repo_path), Text(clone_folder),
-                            symlinks=select_for_platform(linux=True, windows=False),
-                            ignore_dangling_symlinks=True)
-            if not clone_folder.is_dir():
-                raise CommandFailedError(
-                    "copying of repository failed: from {} to {}".format(
-                        cached_repo_path, clone_folder
+                rm_tree(destination)
+                vcs.clone()
+                if not clone_folder.is_dir():
+                    raise CommandFailedError(
+                        "cloning of repository failed: {} into {}".format(no_password_url, clone_folder)
                     )
-                )
+                vcs.checkout()
 
-            # checkout in the newly copy destination
-            vcs.location = Text(clone_folder)
-            vcs.checkout()
+            elif not standalone_mode:
+                if session.config["agent.vcs_cache.enabled"] and cached_repo_path.exists():
+                    print('Using cached repository in "{}"'.format(cached_repo_path))
+
+                else:
+                    print("cloning: {}".format(no_password_url))
+                    rm_tree(cached_repo_path)
+                    # We clone the entire repository, not a specific branch
+                    vcs.clone()  # branch=execution.branch)
+
+                print("pulling git")
+                try:
+                    vcs.pull()
+                except Exception as ex:
+                    print("git pull failed: {}".format(ex))
+                    if (
+                            session.config.get("agent.vcs_cache.enabled", False) and
+                            session.config.get("agent.vcs_cache.clone_on_pull_fail", False)
+                    ):
+                        print("pulling git failed, re-cloning: {}".format(no_password_url))
+                        rm_tree(cached_repo_path)
+                        vcs.clone()
+                    else:
+                        raise ex
+                print("pulling git completed")
+
+                rm_tree(destination)
+                shutil.copytree(Text(cached_repo_path), Text(clone_folder),
+                                symlinks=select_for_platform(linux=True, windows=False),
+                                ignore_dangling_symlinks=True)
+                if not clone_folder.is_dir():
+                    raise CommandFailedError(
+                        "copying of repository failed: from {} to {}".format(
+                            cached_repo_path, clone_folder
+                        )
+                    )
+
+                # checkout in the newly copy destination
+                vcs.location = Text(clone_folder)
+                vcs.checkout()
+    finally:
+        if temp_cache_folder:
+            print('Removing temp vcs cache folder "{}"'.format(temp_cache_folder))
+            rm_tree(temp_cache_folder)
 
     repo_info = vcs.get_repository_copy_info(clone_folder)
 
