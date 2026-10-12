@@ -1148,6 +1148,16 @@ class K8sIntegration(Worker):
                 continue
         return max(finished_times) if finished_times else None
 
+    @staticmethod
+    def _is_disrupted_pod(pod) -> bool:
+        """True if the pod was deleted or evicted (e.g. its node was reclaimed) rather than failing on its own"""
+        if get_path(pod, "metadata", "deletionTimestamp"):
+            return True
+        return any(
+            c.get("type") == "DisruptionTarget" and c.get("status") == "True"
+            for c in get_path(pod, "status", "conditions") or []
+        )
+
     def _delete_pods_by_names(self, names: List[str], namespace: str, msg: str = None) -> List[str]:
         if not names:
             return []
@@ -1225,6 +1235,10 @@ class K8sIntegration(Worker):
         for pod in failed_pods:
             job_name = get_path(pod, "metadata", "labels", "job-name")
             if not job_name:
+                continue
+            if self._is_disrupted_pod(pod):
+                # The job replaces a disrupted pod, and the pending pods daemon reports the task as pending
+                # until the replacement runs. Deleting the job here would leave the task queued with no pod.
                 continue
             if cutoff is not None:
                 completion = self._pod_completion_time(pod)

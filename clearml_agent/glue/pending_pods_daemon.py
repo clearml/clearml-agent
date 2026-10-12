@@ -190,6 +190,31 @@ class PendingPodsDaemon(K8sDaemon):
                 'K8S Glue pending monitor: failed checking aborted tasks for pending resources: {}'.format(ex)
             )
 
+    def _enqueue_to_pending_queue(self, task_id: str, status_reason: str, status_message: str = None):
+        """ Force enqueue a running task whose pod is pending (e.g. preempted) into the k8s pending queue """
+        # The task is usually still listed in the pending queue from when it was launched: starting it only
+        # dequeues it from its execution queue, which is not the pending queue unless the server feature set
+        # is basic (see K8sIntegration.run_one_task). Enqueueing a task that is already in the queue fails.
+        self._session.send_request(
+            service='queues',
+            action='remove_task',
+            json={"task": task_id, "queue": self._agent.k8s_pending_queue_id},
+            method=Request.def_method,
+            async_enable=False,
+        )
+        payload = {
+            "task": task_id, "force": True, "queue": self._agent.k8s_pending_queue_id, "status_reason": status_reason
+        }
+        if status_message is not None:
+            payload["status_message"] = status_message
+        return self._session.send_request(
+            service='tasks',
+            action='enqueue',
+            json=payload,
+            method=Request.def_method,
+            async_enable=False,
+        )
+
     def _update_pending_task_msg(self, task_id: str, msg: str, tags: List[str] = None):
         if not msg or self._last_tasks_msgs.get(task_id, None) == (msg, tags):
             return
@@ -213,17 +238,10 @@ class PendingPodsDaemon(K8sDaemon):
                     status = get_path(result.json(), 'data', 'tasks', 0, 'status')
                     # if task is in progress, change its status to enqueued
                     if status == "in_progress":
-                        result = self._session.send_request(
-                            service='tasks', action='enqueue',
-                            json={
-                                "task": task_id, "force": True, "queue": self._agent.k8s_pending_queue_id
-                            },
-                            method=Request.def_method,
-                            async_enable=False,
-                        )
+                        result = self._enqueue_to_pending_queue(task_id, status_reason="k8s pending scheduler")
                         if not result.ok:
                             result_msg = get_path(result.json(), 'meta', 'result_msg')
-                            self.log.debug(
+                            self.log.warning(
                                 "K8S Glue pods monitor: failed forcing task status change"
                                 " for pending task {}: {}".format(task_id, result_msg)
                             )
