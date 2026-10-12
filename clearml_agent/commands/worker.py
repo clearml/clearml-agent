@@ -4150,8 +4150,18 @@ class Worker(ServiceCommandSection):
                 # the shim treats empty IDs as "omit that header line".
                 from clearml_agent.snug.whitelist import build_whitelist_env
                 project_id = getattr(current_task, "project", "") or ""
+                # An app-mode profile ships the whitelist rows its own hosts need
+                # to be metered - notably the consumer-chat estimate predicates
+                # (estimate_unmeasured/completion_path) a usage-less wire like
+                # claude.ai is byte-estimated by, which carry no measured `usage`.
+                # The proxy already merges these (launch_proxy), so the shim must
+                # get the SAME merged base or a shim-hooked leg to such a host is
+                # metered against a field-poor rule and never estimates. None when
+                # app-mode is off, leaving the shim's whitelist config-only.
+                _app_profile = resolve_app_profile(self._session.config)
                 envs["CLEARML_SNUG_WHITELIST"] = build_whitelist_env(
-                    self._session
+                    self._session,
+                    extra_rules=_app_profile.whitelist_contribution if _app_profile else None,
                 )
                 # Per-task predefine: if the task already carries a
                 # "_snug_whitelist" User Property (set before launch), pass its

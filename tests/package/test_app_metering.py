@@ -1614,7 +1614,7 @@ def test_builtin_claude_desktop_profile_golden():
                 "inject_headers": False,
                 "tokenizer": "claude",
                 "estimate_unmeasured": True,
-                "completion_path": "*/completion",
+                "completion_path": "*/completion,*/cowork/sessions*",
                 "provider": "anthropic",
             },
         ),
@@ -1640,7 +1640,7 @@ def test_builtin_claude_desktop_profile_golden():
     assert rule["host"] == "claude.ai"
     assert rule["tokenizer"] == "claude"
     assert rule["estimate_unmeasured"] is True
-    assert rule["completion_path"] == "*/completion"
+    assert rule["completion_path"] == "*/completion,*/cowork/sessions*"
     assert rule["provider"] == "anthropic"
 
 

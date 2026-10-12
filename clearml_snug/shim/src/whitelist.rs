@@ -75,10 +75,11 @@ pub struct WhitelistRule {
     #[allow(dead_code)]
     pub estimate_unmeasured: bool,
     /// Default "" (never a completion). When `estimate_unmeasured` is set, a
-    /// `POST` whose decoded path matches this boundary-`*` wildcard (e.g.
-    /// `*/completion`, matched like `host` but case-sensitive, query stripped) is
-    /// treated as a real generation whose input is estimated from the request
-    /// body; every other request on the host stays at 0 tokens.
+    /// `POST` whose decoded path matches one of these comma-separated boundary-`*`
+    /// wildcards (e.g. `*/completion,*/cowork/sessions*`, matched like `host` but
+    /// case-sensitive, query stripped) is treated as a real generation whose input
+    /// is estimated from the request body; every other request on the host stays
+    /// at 0 tokens.
     #[serde(default)]
     #[allow(dead_code)]
     pub completion_path: String,
@@ -103,6 +104,12 @@ impl WhitelistRule {
     /// is never estimated from its request line. `method`/`path` are `None` when
     /// HPACK decoding gave up — treated as NOT a completion (fail closed).
     /// Read by the proxy's estimate gate; unused in the shim (shared source).
+    ///
+    /// `completion_path` is a comma-separated set of globs: an app whose
+    /// generations ride on more than one endpoint (e.g. claude.ai's chat
+    /// `*/completion` and Cowork `*/cowork/sessions*`) lists them all and a POST
+    /// matching ANY one is a completion. A lone pattern (no comma) is the common
+    /// single-endpoint case; blank fragments (a stray comma) never match.
     #[allow(dead_code)]
     pub fn is_completion(&self, method: Option<&str>, path: Option<&str>) -> bool {
         if self.completion_path.is_empty() {
@@ -111,10 +118,15 @@ impl WhitelistRule {
         if method != Some("POST") {
             return false;
         }
-        match path {
-            Some(p) => wildcard_matches(&self.completion_path, p.split('?').next().unwrap_or(p)),
-            None => false,
-        }
+        let p = match path {
+            Some(p) => p.split('?').next().unwrap_or(p),
+            None => return false,
+        };
+        self.completion_path
+            .split(',')
+            .map(str::trim)
+            .filter(|pat| !pat.is_empty())
+            .any(|pat| wildcard_matches(pat, p))
     }
 }
 
@@ -914,6 +926,41 @@ mod tests {
         assert!(!r.is_completion(Some("POST"), load), "history-load path is not a completion");
         assert!(!r.is_completion(None, None), "undecodable request fails closed");
         assert!(!r.is_completion(Some("POST"), None));
+    }
+
+    #[test]
+    fn is_completion_matches_any_of_comma_separated_patterns() {
+        // claude.ai carries generations on two endpoints: the chat panel's
+        // `*/completion` and Cowork's `*/cowork/sessions` (the create-session
+        // POST carries the turn; follow-up turns live under it). A POST matching
+        // EITHER pattern is a completion; auxiliary POSTs (title generation) match
+        // neither and stay at 0 tokens.
+        let wl: Whitelist = serde_json::from_str(
+            r#"{"version":1,"rules":[{"host":"claude.ai","estimate_unmeasured":true,"completion_path":"*/completion,*/cowork/sessions*"}]}"#,
+        )
+        .unwrap();
+        let r = &wl.rules[0];
+        let chat = Some("/api/organizations/o/chat_conversations/c/completion");
+        let cowork = Some("/api/organizations/o/cowork/sessions");
+        let cowork_turn = Some("/api/organizations/o/cowork/sessions/s/messages");
+        let title = Some("/api/organizations/o/dust/generate_session_title");
+        assert!(r.is_completion(Some("POST"), chat), "chat completion");
+        assert!(r.is_completion(Some("POST"), cowork), "cowork session create");
+        assert!(r.is_completion(Some("POST"), cowork_turn), "cowork follow-up turn");
+        assert!(!r.is_completion(Some("POST"), title), "title generation is not a completion");
+        assert!(!r.is_completion(Some("GET"), cowork), "GET is never a completion");
+    }
+
+    #[test]
+    fn is_completion_blank_comma_fragments_never_match() {
+        // A stray comma must not turn an empty fragment into a match-anything rule.
+        let wl: Whitelist = serde_json::from_str(
+            r#"{"version":1,"rules":[{"host":"claude.ai","estimate_unmeasured":true,"completion_path":"*/completion, ,"}]}"#,
+        )
+        .unwrap();
+        let r = &wl.rules[0];
+        assert!(r.is_completion(Some("POST"), Some("/x/completion")));
+        assert!(!r.is_completion(Some("POST"), Some("/x/anything-else")));
     }
 
     #[test]

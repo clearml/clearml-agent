@@ -81,7 +81,7 @@ def test_ld_preload_set_when_snug_enabled(monkeypatch):
     # so the function-local import inside _get_job_os_envs picks up the stub.
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     monkeypatch.delenv("LD_PRELOAD", raising=False)
 
@@ -98,7 +98,7 @@ def test_ld_preload_preserves_existing(monkeypatch):
     monkeypatch.setattr(worker_mod, "injection_env_var", lambda: "LD_PRELOAD")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     monkeypatch.setenv("LD_PRELOAD", "/opt/other.so")
 
@@ -115,7 +115,7 @@ def test_ld_preload_handles_empty_existing(monkeypatch):
     monkeypatch.setattr(worker_mod, "injection_env_var", lambda: "LD_PRELOAD")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     monkeypatch.setenv("LD_PRELOAD", "   ")
 
@@ -134,7 +134,7 @@ def test_dyld_insert_libraries_used_on_macos(monkeypatch):
     monkeypatch.setattr(worker_mod, "injection_env_var", lambda: "DYLD_INSERT_LIBRARIES")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     monkeypatch.delenv("DYLD_INSERT_LIBRARIES", raising=False)
     monkeypatch.delenv("LD_PRELOAD", raising=False)
@@ -191,7 +191,7 @@ def test_snug_config_env_vars_set_when_snug_enabled(monkeypatch):
     )
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "d2hpdGVsaXN0LWI2NA==",
+        lambda session, extra_rules=None: "d2hpdGVsaXN0LWI2NA==",
     )
 
     session = _FakeSession(
@@ -210,6 +210,66 @@ def test_snug_config_env_vars_set_when_snug_enabled(monkeypatch):
     assert envs.get("CLEARML_PROJECT_ID") == "project-xyz"
 
 
+def test_shim_whitelist_includes_app_profile_contribution(monkeypatch):
+    """When an app-mode profile is selected, the shim's whitelist MUST be
+    built with the profile's whitelist_contribution as the base - the same
+    rows the proxy gets - so a shim-hooked leg to a profile host (e.g. the
+    claude.ai consumer-chat estimate predicates) is metered against the
+    app-supplied rule, not a field-poor config rule. Locks the parity: the
+    proxy merges these via launch_proxy; the shim must too."""
+    from clearml_agent.helper.app_metering import BUILTIN_PROFILES
+
+    monkeypatch.setattr(worker_mod, "snug_enabled", lambda session: True)
+    monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
+
+    captured = {}
+
+    def _capture(session, extra_rules=None):
+        captured["extra_rules"] = extra_rules
+        return "c3R1Yi1iNjQ="
+
+    monkeypatch.setattr(
+        "clearml_agent.snug.whitelist.build_whitelist_env", _capture
+    )
+
+    session = _FakeSession({"agent.snug.app_mode": "claude_desktop"})
+    w = _stub_worker(session)
+    w._get_job_os_envs(_FakeTask(), "INFO")
+
+    assert (
+        captured["extra_rules"]
+        == BUILTIN_PROFILES["claude_desktop"].whitelist_contribution
+    )
+    # The contribution carries the consumer-chat estimate predicates a
+    # usage-less wire needs; a bare config rule would omit them.
+    assert any(
+        r.get("host") == "claude.ai" and r.get("estimate_unmeasured")
+        for r in captured["extra_rules"]
+    )
+
+
+def test_shim_whitelist_no_contribution_when_app_mode_off(monkeypatch):
+    """With app-mode off, the shim's whitelist is config-only (extra_rules
+    is None) - a plain agent is byte-identical to before the profile merge."""
+    monkeypatch.setattr(worker_mod, "snug_enabled", lambda session: True)
+    monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
+
+    captured = {"extra_rules": "unset"}
+
+    def _capture(session, extra_rules=None):
+        captured["extra_rules"] = extra_rules
+        return "c3R1Yi1iNjQ="
+
+    monkeypatch.setattr(
+        "clearml_agent.snug.whitelist.build_whitelist_env", _capture
+    )
+
+    w = _stub_worker()  # empty config -> no app_mode
+    w._get_job_os_envs(_FakeTask(), "INFO")
+
+    assert captured["extra_rules"] is None
+
+
 def test_call_history_defaults(monkeypatch):
     """Missing call-history keys -> CLEARML_SNUG_CALL_HISTORY='off' plus the
     shipped buffer/cap defaults (the agent.conf snug block defaults)."""
@@ -217,7 +277,7 @@ def test_call_history_defaults(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
 
     # No call-history keys in the config -> defaults kick in.
@@ -235,7 +295,7 @@ def test_empty_project_id_passed_through(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
 
     task = _FakeTask(project="")
@@ -279,7 +339,7 @@ def test_no_ipc_socket_env_var(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     w = _stub_worker(_FakeSession({}))
     envs = w._get_job_os_envs(_FakeTask(task_id="task-abc"), "INFO")
@@ -299,7 +359,7 @@ def test_predefined_whitelist_property_becomes_additions_env(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     session = _FakeSession(
         {}, user_properties={"_snug_whitelist": "api.foo.com, api.bar.com"}
@@ -316,7 +376,7 @@ def test_no_additions_env_when_no_predefined_whitelist(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     # absent property
     w = _stub_worker(_FakeSession({}))
@@ -336,7 +396,7 @@ def test_predefined_call_history_property_overrides_config(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     # Config says "off", but the task carries a pre-set "continuous" -> the
     # property wins.
@@ -355,7 +415,7 @@ def test_predefined_call_history_normalized_and_invalid_falls_back(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     # mixed case + whitespace -> normalized to "collect"
     s1 = _FakeSession(
@@ -385,7 +445,7 @@ def _snug_enabled_worker(monkeypatch, config):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
     return _stub_worker(_FakeSession(config))
 
@@ -643,7 +703,7 @@ def test_sdk_env_vars_still_present(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
 
     w = _stub_worker()
@@ -670,7 +730,7 @@ def test_snug_deferred_env_keys_cover_every_snug_env_returned(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
 
     # A reporting sink is on so CLEARML_SNUG_PARSE_USAGE is emitted and its
@@ -701,7 +761,7 @@ def test_snug_deferred_env_keys_only_contains_real_keys(monkeypatch):
     monkeypatch.setattr(worker_mod, "resolve_shim_path", lambda: "/opt/x.so")
     monkeypatch.setattr(
         "clearml_agent.snug.whitelist.build_whitelist_env",
-        lambda session: "c3R1Yi1iNjQ=",
+        lambda session, extra_rules=None: "c3R1Yi1iNjQ=",
     )
 
     # A reporting sink is on so CLEARML_SNUG_PARSE_USAGE (conditionally emitted)
