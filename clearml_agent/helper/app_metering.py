@@ -186,13 +186,13 @@ BUILTIN_PROFILES = {
                 # (The proxy reads these fields once it drives the estimate gate
                 # from the whitelist; older binaries ignore unknown fields and use
                 # their built-in claude.ai predicates.)
-                # Generations ride on two endpoints: the Chat panel's `*/completion`
-                # and Cowork's `*/cowork/sessions` (the create-session POST carries
-                # the turn; follow-up turns live under it, hence the trailing `*`).
-                # Auxiliary POSTs (e.g. `*/dust/generate_session_title`) match
-                # neither and are correctly left unestimated.
+                # Only the Chat panel's `*/completion` is estimated. Cowork reports
+                # real session usage that the proxy reads itself, and its
+                # `*/cowork/sessions` create POST is just a pre-warm, so it must not
+                # be estimated. Auxiliary POSTs (e.g. `*/dust/generate_session_title`)
+                # are left unestimated too.
                 "estimate_unmeasured": True,
-                "completion_path": "*/completion,*/cowork/sessions*",
+                "completion_path": "*/completion",
                 "provider": "anthropic",
             },
         ),

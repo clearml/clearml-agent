@@ -73,6 +73,9 @@ mod meter {
 }
 
 mod ca;
+mod claude_chat_cache;
+mod claude_cowork;
+mod dump;
 
 use body_scan::{
     conversation_fingerprint, looks_like_sse, model_from_request, provider_for_host,
@@ -117,20 +120,25 @@ fn tokenizer_for(provider: Provider) -> &'static str {
     }
 }
 
-/// Plaintext length of a (possibly gzip/zstd-compressed) request body, for the
-/// input-token estimate. claude.ai's consumer API compresses its request body,
-/// and over h2 the `Content-Encoding` is HPACK-hidden, so the encoding is
-/// detected from the body's own magic bytes and inflated before measuring; an
-/// identity body is measured as-is. Mirrors the request-body handling in the
-/// shim's completion path (state.rs).
-fn plaintext_len(body: &[u8]) -> u64 {
+/// Plaintext of a (possibly gzip/zstd-compressed) request body, for the input
+/// estimate and the exchange dump. claude.ai's consumer API compresses its request
+/// body, and over h2 the `Content-Encoding` is HPACK-hidden, so the encoding is
+/// detected from the body's own magic bytes and inflated; an identity body is
+/// returned as-is. Mirrors the request-body handling in the shim's completion
+/// path (state.rs).
+fn plaintext_bytes(body: &[u8]) -> Vec<u8> {
     let enc = decompress::detect(body);
     if enc.is_compressed() {
         if let Some(plain) = decompress::decompress(enc, body, REQ_DECOMP_CAP) {
-            return plain.len() as u64;
+            return plain;
         }
     }
-    body.len() as u64
+    body.to_vec()
+}
+
+#[cfg(test)]
+fn plaintext_len(body: &[u8]) -> u64 {
+    plaintext_bytes(body).len() as u64
 }
 
 /// Cap on request-body inflation for the input-token estimate (guards against a
@@ -329,6 +337,8 @@ fn main() {
         env_flag("CLEARML_SNUG_DEBUG_LOG"),
         std::sync::atomic::Ordering::Relaxed,
     );
+    dump::init_from_env();
+    claude_cowork::init(now_ms());
 
     let port: u16 = std::env::var("CLEARML_SNUG_PROXY_PORT")
         .ok()
@@ -612,6 +622,28 @@ fn intercept(
 type ServerTls = StreamOwned<ServerConnection, TcpStream>;
 type UpstreamTls = StreamOwned<ClientConnection, TcpStream>;
 
+/// Use a completed exchange's whole response body: seed a chat's history from a
+/// conversation load, and write the exchange to the developer-only dump.
+fn on_response_body(
+    conn_id: u64,
+    host: &str,
+    method: Option<&str>,
+    path: Option<&str>,
+    req_body: &[u8],
+    resp_plain: &[u8],
+) {
+    if claude_chat_cache::is_conversation_load(method, path) {
+        let conv = path.and_then(claude_chat_cache::conversation_id);
+        if let (Some(conv), Some(bytes)) = (conv, claude_chat_cache::history_bytes(resp_plain)) {
+            claude_chat_cache::global().seed_history(conv, bytes);
+            dlog(&format!("conn {} chat loaded: history seeded with {} bytes", conn_id, bytes));
+        }
+    }
+    if dump::wants(host) {
+        dump::write(conn_id, host, method, path, &plaintext_bytes(req_body), resp_plain);
+    }
+}
+
 /// Emit a completed request/response.
 ///
 /// Two independent outputs: (1) the capture-all traffic log gets one record for
@@ -691,8 +723,13 @@ fn emit(
     let estimate_this = rule
         .map(|r| r.estimate_unmeasured && r.is_completion(method, path))
         .unwrap_or(false);
-    let (tokens_in, tokens_out) = if tokens_measured {
-        (fin.tokens_in.unwrap_or(0), fin.tokens_out.unwrap_or(0))
+    let (tokens_in, tokens_out, cache_read_tokens, cache_write_tokens) = if tokens_measured {
+        (
+            fin.tokens_in.unwrap_or(0),
+            fin.tokens_out.unwrap_or(0),
+            fin.cache_read_tokens.unwrap_or(0),
+            fin.cache_write_tokens.unwrap_or(0),
+        )
     } else if estimate_this {
         // Per-host tokenizer: a matched rule pins its estimator; fall back to the
         // provider default only if the rule somehow lacks one.
@@ -701,10 +738,26 @@ fn emit(
             .unwrap_or_else(|| tokenizer_for(provider));
         let m = model.as_deref();
         let out_bytes = fin.output_text_bytes.unwrap_or(resp_text_bytes);
-        (
-            tokens::estimate_tokens(plaintext_len(req_body), tokenizer, m),
-            tokens::estimate_tokens(out_bytes, tokenizer, m),
-        )
+        let tokens_out = tokens::estimate_tokens(out_bytes, tokenizer, m);
+        // The request's tools/system prefix and the conversation's history are split
+        // into cache write/read (see `claude_chat_cache`); the rest is fresh. A body without
+        // such a prefix keeps the plain all-fresh byte estimate.
+        let plain = plaintext_bytes(req_body);
+        let conversation = path.and_then(claude_chat_cache::conversation_id);
+        match claude_chat_cache::global().split(&plain, conversation, out_bytes, now_ms()) {
+            Some(s) => {
+                let fresh = tokens::estimate_tokens(s.fresh_bytes, tokenizer, m);
+                let read = tokens::estimate_tokens(s.cache_read_bytes, tokenizer, m);
+                let write = tokens::estimate_tokens(s.cache_write_bytes, tokenizer, m);
+                (fresh + read + write, tokens_out, read, write)
+            }
+            None => (
+                tokens::estimate_tokens(plain.len() as u64, tokenizer, m),
+                tokens_out,
+                0,
+                0,
+            ),
+        }
     } else {
         // Not a real completion: a measured-only host with no usage (count_tokens
         // preflight / telemetry), or a consumer-wire non-generation request (a
@@ -720,12 +773,8 @@ fn emit(
                 conn_id, model, host, method, path
             ));
         }
-        (0, 0)
+        (0, 0, fin.cache_read_tokens.unwrap_or(0), fin.cache_write_tokens.unwrap_or(0))
     };
-    // Anthropic-only prompt-cache breakdown; 0 when absent (non-Anthropic /
-    // unmeasured), mirroring the shim.
-    let cache_read_tokens = fin.cache_read_tokens.unwrap_or(0);
-    let cache_write_tokens = fin.cache_write_tokens.unwrap_or(0);
     let tool_error_names = tool_error_names_in_request(provider, req_body);
     let _chat = conversation_fingerprint(provider, req_body); // session assignment is shim-side; left None here.
 
@@ -779,6 +828,31 @@ fn emit(
         };
         let _ = tx.try_send(ev);
     }
+}
+
+/// Report what a Cowork session spent as a measured completion. `tokens_in` is
+/// the billable total, like every other measured provider report.
+fn emit_session_usage(
+    shared: &Shared,
+    conn_id: u64,
+    provider: Option<Provider>,
+    host: &str,
+    spent: &claude_cowork::Delta,
+    method: Option<&str>,
+    path: Option<&str>,
+) {
+    dlog(&format!("conn {} cowork session {} spent {:?}", conn_id, spent.session, spent));
+    let fin = body_scan::Finalized {
+        tokens_in: Some(spent.input + spent.cache_read + spent.cache_write),
+        tokens_out: Some(spent.output),
+        cache_read_tokens: Some(spent.cache_read),
+        cache_write_tokens: Some(spent.cache_write),
+        model: spent.model.clone(),
+        ..Default::default()
+    };
+    emit(
+        shared, conn_id, provider, host, now_ms(), None, 0, 0, 0, &fin, None, &[], method, path,
+    );
 }
 
 /// HTTP/1.1 path: a clean sequential request→response loop (supports
@@ -1333,13 +1407,53 @@ fn relay_h2(
                         if is_data { "DATA" } else { "HEADERS" },
                     ));
                 }
-                let st = resp.entry(f.stream_id).or_insert_with(|| match provider {
-                    Some(p) => RespState::new(p),
-                    None => RespState::new_capture(),
+                let st = resp.entry(f.stream_id).or_insert_with(|| {
+                    // The request's method/path were decoded on the request leg.
+                    let (method, path) = streams_b
+                        .lock()
+                        .unwrap()
+                        .get(&f.stream_id)
+                        .map(|r| (r.method.clone(), r.path.clone()))
+                        .unwrap_or_default();
+                    let mut st = match (
+                        provider,
+                        claude_cowork::Feed::for_request(method.as_deref(), path.as_deref()),
+                    ) {
+                        (Some(_), Some(feed)) => RespState::new_live(feed),
+                        (Some(p), None) => RespState::new(p),
+                        (None, _) => RespState::new_capture(),
+                    };
+                    if dump::wants(&host_b)
+                        || claude_chat_cache::is_conversation_load(method.as_deref(), path.as_deref())
+                        || (provider.is_some() && claude_cowork::is_session_read(path.as_deref()))
+                    {
+                        st.keep_plain();
+                    }
+                    st
                 });
                 if is_data {
                     st.feed(&f.payload);
                     st.bytes_rx += f.payload.len() as u64;
+                    if let Some(live) = &mut st.live {
+                        if live.dump_name.is_none() && dump::wants(&host_b) {
+                            live.dump_name = Some(format!("c{}_s{}", conn_id, f.stream_id));
+                        }
+                        let spent = live.feed(&f.payload);
+                        if !spent.is_empty() {
+                            let (method, path) = streams_b
+                                .lock()
+                                .unwrap()
+                                .get(&f.stream_id)
+                                .map(|r| (r.method.clone(), r.path.clone()))
+                                .unwrap_or_default();
+                            for d in spent {
+                                emit_session_usage(
+                                    &shared_b, conn_id, provider, &host_b, &d,
+                                    method.as_deref(), path.as_deref(),
+                                );
+                            }
+                        }
+                    }
                 }
                 if ends {
                     let fin = st.finish();
@@ -1365,6 +1479,20 @@ fn relay_h2(
                     // attribution stays body-only here — the recovered path feeds
                     // only the capture log and the DONE line, not model resolution.
                     let req_model = provider.and_then(|p| model_from_request(p, &req_body, None));
+                    if let Some(resp_plain) = st.take_plain() {
+                        on_response_body(
+                            conn_id, &host_b, req_method.as_deref(), req_path.as_deref(),
+                            &req_body, &resp_plain,
+                        );
+                        if provider.is_some() && claude_cowork::is_session_read(req_path.as_deref()) {
+                            for d in claude_cowork::observe_body(&resp_plain) {
+                                emit_session_usage(
+                                    &shared_b, conn_id, provider, &host_b, &d,
+                                    req_method.as_deref(), req_path.as_deref(),
+                                );
+                            }
+                        }
+                    }
                     emit(
                         &shared_b, conn_id, provider, &host_b, started, status, bytes_tx, bytes_rx,
                         resp_text_bytes, &fin, req_model, &req_body,
@@ -1397,6 +1525,12 @@ fn relay_h2(
                 "conn {} resp stream {} finalized on connection close (no END_STREAM)",
                 conn_id, stream_id
             ));
+            if let Some(resp_plain) = st.take_plain() {
+                on_response_body(
+                    conn_id, &host_b, req_method.as_deref(), req_path.as_deref(),
+                    &req_body, &resp_plain,
+                );
+            }
             emit(
                 &shared_b, conn_id, provider, &host_b, started, status, bytes_tx, bytes_rx,
                 resp_text_bytes, &fin, req_model, &req_body,
@@ -1428,6 +1562,9 @@ struct StreamReq {
 /// Cap on a compressed h2 response body buffered for whole-stream inflation.
 const COMP_BODY_CAP: usize = 16 * 1024 * 1024;
 
+/// Cap on a response body kept whole, for the exchange dump or a conversation load.
+const RESP_PLAIN_CAP: usize = 8 * 1024 * 1024;
+
 struct RespState {
     parser: RespParse,
     started: bool,
@@ -1445,6 +1582,12 @@ struct RespState {
     /// inflate the whole thing at END_STREAM. `None` for identity bodies, which
     /// stream straight into the parser.
     comp: Option<(decompress::Encoding, Vec<u8>)>,
+    /// Decompressed response body kept for the exchange dump or a conversation
+    /// load; `Some` only for a stream that needs it.
+    plain: Option<Vec<u8>>,
+    /// Set for a Cowork live stream, which is metered per event as it arrives
+    /// instead of at the end of the response.
+    live: Option<claude_cowork::Feed>,
 }
 
 impl RespState {
@@ -1457,7 +1600,17 @@ impl RespState {
             bytes_rx: 0,
             plain_out: 0,
             comp: None,
+            plain: None,
+            live: None,
         }
+    }
+    /// Keep the decompressed response body (see `take_plain`).
+    fn keep_plain(&mut self) {
+        self.plain = Some(Vec::new());
+    }
+    /// Take the decompressed response body kept by `keep_plain`.
+    fn take_plain(&mut self) -> Option<Vec<u8>> {
+        self.plain.take()
     }
     /// Capture-only state for a non-provider h2 stream: tracks nothing but the
     /// byte count (kept by the caller), so no usage parsing runs. `parser.status`
@@ -1465,6 +1618,13 @@ impl RespState {
     fn new_capture() -> Self {
         let mut s = Self::new(Provider::Anthropic);
         s.usage = false;
+        s
+    }
+    /// A Cowork live stream: the regular path captures only bytes and timing, the
+    /// usage is read by `live`.
+    fn new_live(feed: claude_cowork::Feed) -> Self {
+        let mut s = Self::new_capture();
+        s.live = Some(feed);
         s
     }
     fn feed(&mut self, data: &[u8]) {
@@ -1499,6 +1659,11 @@ impl RespState {
             None => {
                 self.parser.feed(data);
                 self.plain_out += data.len() as u64;
+                if let Some(d) = &mut self.plain {
+                    if d.len() < RESP_PLAIN_CAP {
+                        d.extend_from_slice(data);
+                    }
+                }
             }
         }
     }
@@ -1511,6 +1676,10 @@ impl RespState {
             if let Some(plain) = decompress::decompress(enc, &buf, COMP_BODY_CAP) {
                 self.plain_out += plain.len() as u64;
                 self.parser.feed(&plain);
+                if let Some(d) = &mut self.plain {
+                    let n = plain.len().min(RESP_PLAIN_CAP);
+                    d.extend_from_slice(&plain[..n]);
+                }
             }
         }
         self.parser.finalize()

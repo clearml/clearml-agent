@@ -76,7 +76,7 @@ pub struct WhitelistRule {
     pub estimate_unmeasured: bool,
     /// Default "" (never a completion). When `estimate_unmeasured` is set, a
     /// `POST` whose decoded path matches one of these comma-separated boundary-`*`
-    /// wildcards (e.g. `*/completion,*/cowork/sessions*`, matched like `host` but
+    /// wildcards (e.g. `*/completion,*/generate`, matched like `host` but
     /// case-sensitive, query stripped) is treated as a real generation whose input
     /// is estimated from the request body; every other request on the host stays
     /// at 0 tokens.
@@ -106,8 +106,8 @@ impl WhitelistRule {
     /// Read by the proxy's estimate gate; unused in the shim (shared source).
     ///
     /// `completion_path` is a comma-separated set of globs: an app whose
-    /// generations ride on more than one endpoint (e.g. claude.ai's chat
-    /// `*/completion` and Cowork `*/cowork/sessions*`) lists them all and a POST
+    /// generations ride on more than one endpoint (e.g. `*/completion` and
+    /// `*/generate`) lists them all and a POST
     /// matching ANY one is a completion. A lone pattern (no comma) is the common
     /// single-endpoint case; blank fragments (a stray comma) never match.
     #[allow(dead_code)]
@@ -930,11 +930,9 @@ mod tests {
 
     #[test]
     fn is_completion_matches_any_of_comma_separated_patterns() {
-        // claude.ai carries generations on two endpoints: the chat panel's
-        // `*/completion` and Cowork's `*/cowork/sessions` (the create-session
-        // POST carries the turn; follow-up turns live under it). A POST matching
-        // EITHER pattern is a completion; auxiliary POSTs (title generation) match
-        // neither and stay at 0 tokens.
+        // A host whose generations ride on two endpoints lists both: a POST
+        // matching EITHER pattern is a completion; auxiliary POSTs (title
+        // generation) match neither and stay at 0 tokens.
         let wl: Whitelist = serde_json::from_str(
             r#"{"version":1,"rules":[{"host":"claude.ai","estimate_unmeasured":true,"completion_path":"*/completion,*/cowork/sessions*"}]}"#,
         )

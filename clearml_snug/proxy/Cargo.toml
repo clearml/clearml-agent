@@ -29,7 +29,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 # rustls/rcgen stack already compiles, so no new native build.
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 httparse = "1"
 # gzip/zstd inflation of compressed h2 bodies (decompress.rs), reused verbatim
 # from the shim. Pure-Rust backends only, same as the shim.
