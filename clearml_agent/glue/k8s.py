@@ -762,6 +762,31 @@ class K8sIntegration(Worker):
         # Set task as failed
         session.api_client.tasks.failed(task_id, force=True)
 
+    def _set_task_failed_owner_login(self, task_id: str, task_user: str, error: str):
+        # The task was already popped from its queue, so fail it (instead of leaving it queued forever) and tell
+        # the user why. We have no task session here, so use the agent's own session (best-effort, each call alone).
+        send_log = (
+            "ERROR: The agent could not run this task as its owner (user {}). Server response: {}. "
+            "The agent runs tasks with their owner's credentials (--use-owner-token), but the task's current user "
+            "can't be impersonated, for example because the owner is an internal admin. "
+            "Try running the task from a regular user.".format(task_user, error)
+        )
+        self.send_logs(task_id, [send_log + "\n"])
+        try:
+            self._session.get(
+                service='tasks',
+                action='failed',
+                json={
+                    "task": task_id,
+                    "force": True,
+                    "status_reason": "Agent could not log in as the task owner",
+                    "status_message": error,
+                },
+                method=Request.def_method,
+            )
+        except Exception as ex:
+            self.log.warning('Failed setting task {} to status "failed": {}'.format(task_id, ex))
+
     def set_task_info(
             self, task_id: str, task_session, task_data, queue_name: str, ports_mode: bool, pod_number, pod_count
     ):
@@ -1461,13 +1486,17 @@ class K8sIntegration(Worker):
                             print("Error: cannot retrieve owner user for the task '{}', skipping".format(task_id))
                             continue
 
-                        task_session = self.get_task_session(task_user, task_company, self._session)
-                        if not task_session:
+                        try:
+                            task_session = self.get_task_session(
+                                task_user, task_company, self._session, raise_error=True
+                            )
+                        except APIError as ex:
                             print(
-                                "Error: Could not login as the user '{}' for the task '{}', skipping".format(
-                                    task_user, task_id
+                                "Error: Could not login as the user '{}' for the task '{}', skipping: {}".format(
+                                    task_user, task_id, ex.message
                                 )
                             )
+                            self._set_task_failed_owner_login(task_id, task_user, ex.message)
                             continue
 
                     events_service.send_log_events(

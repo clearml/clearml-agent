@@ -1497,13 +1497,14 @@ class Worker(ServiceCommandSection):
         return status
 
     @staticmethod
-    def get_task_session(user, company, main_session):
+    def get_task_session(user, company, main_session, raise_error=False):
         """
         Get task session for the user by cloning the agent session
         and replacing the session credentials with the task owner auth token
         In case the task is not from the user company proceed with another login
         to get the auth token for the tenant and return the session for it
         Requires that agent session credentials will allow impersonation as task user
+        If raise_error is True, a failed login raises an APIError (with the server's reason) instead of returning None
         """
         def get_new_session(session, headers):
             result = session.send(
@@ -1515,6 +1516,8 @@ class Worker(ServiceCommandSection):
                     main_session.log.debug("Failed creating task session: %s", result.response)
                 except:
                     pass
+                if raise_error:
+                    raise APIError(result)
                 return
             new_session = copy(session)
             new_session.config = deepcopy(session.config)
