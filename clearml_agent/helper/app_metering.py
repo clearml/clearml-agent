@@ -232,7 +232,7 @@ BUILTIN_PROFILES = {
 _CLI_STD_DIRS = ("/usr/local/bin", "/usr/bin")
 
 # The CA-trust + proxy wrapper recipes render_sdk_wrapper implements, by runtime.
-_SUPPORTED_WRAP_KINDS = ("node_bun", "rust_ssl_cert", "go_ssl_cert")
+_SUPPORTED_WRAP_KINDS = ("node_bun", "rust_ssl_cert", "go_ssl_cert", "node_ssl_cert")
 
 # Legacy per-app app_mode names, kept working by routing them through the generic
 # synthesizer (bin, kind) so an already-built image that still sets e.g.
@@ -477,6 +477,15 @@ def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_b
         REPLACES the store, so it must carry the system roots too or every
         blind-tunnelled (non-provider) upstream would fail to verify;
         ``SSL_CERT_DIR`` is cleared so a hashed system dir can't shadow the file.
+      - ``node_ssl_cert`` (a hybrid whose process tree has BOTH a Node leg and
+        non-node legs, e.g. Hermes: Node CLI + an installer-managed python/uv venv
+        + ``git``) — sets the Node env AND the OpenSSL/python/git env. The proxy
+        env (``HTTPS_PROXY``) is inherited by the whole subtree, so every leg dials
+        the proxy; ``node_bun`` alone would leave the non-node legs rejecting the
+        proxy's MITM cert with ``received fatal alert: UnknownCA``. So this carries
+        ``NODE_EXTRA_CA_CERTS`` (Node, appends the proxy CA), plus ``SSL_CERT_FILE``
+        / ``REQUESTS_CA_BUNDLE`` / ``GIT_SSL_CAINFO`` pointed at the combined bundle
+        (OpenSSL / python-requests / git — all of which replace or set the store).
 
     ``$(dirname "$0")`` resolves paths relative to the wrapper itself so the CA
     and the real binary are found wherever the (possibly re-downloaded, possibly
@@ -498,6 +507,19 @@ def render_sdk_wrapper(proxy_url, ca_filename, binary_name, wrapper_kind="node_b
             'export SSL_CERT_FILE="$DIR/{bundle}"\n'
             'export SSL_CERT_DIR=""\n'
         ).format(bundle=_CA_BUNDLE_FILENAME)
+    elif wrapper_kind == "node_ssl_cert":
+        ca_env = (
+            '# Hybrid tree: NODE_EXTRA_CA_CERTS (append) for the Node leg, and the\n'
+            '# combined system+proxy bundle for the non-node legs (OpenSSL/python/\n'
+            '# git) that inherit HTTPS_PROXY but would otherwise reject the proxy\n'
+            '# MITM cert with "UnknownCA". SSL_CERT_DIR is cleared so SSL_CERT_FILE\n'
+            '# is authoritative.\n'
+            'export NODE_EXTRA_CA_CERTS="$DIR/{ca}"\n'
+            'export SSL_CERT_FILE="$DIR/{bundle}"\n'
+            'export SSL_CERT_DIR=""\n'
+            'export REQUESTS_CA_BUNDLE="$DIR/{bundle}"\n'
+            'export GIT_SSL_CAINFO="$DIR/{bundle}"\n'
+        ).format(ca=ca_filename, bundle=_CA_BUNDLE_FILENAME)
     else:
         raise ValueError("unsupported sdk wrapper_kind {!r}".format(wrapper_kind))
     return (
@@ -714,7 +736,7 @@ def install_sdk_wrapper(sdk_dir, ca_src_path, proxy_url, sdk):
     if not _is_wrappable_sdk(bin_path, sdk.target_kind):
         return False
 
-    ssl_cert_recipe = sdk.wrapper_kind in ("rust_ssl_cert", "go_ssl_cert")
+    ssl_cert_recipe = sdk.wrapper_kind in ("rust_ssl_cert", "go_ssl_cert", "node_ssl_cert")
     bundle_dst = os.path.join(sdk_dir, _CA_BUNDLE_FILENAME)
     try:
         # 1. Drop the CA beside the wrapper BEFORE we disturb the SDK binary (see

@@ -105,6 +105,47 @@ def test_render_sdk_wrapper_uses_dirname_for_relocatability():
     assert 'DIR="$(dirname "$0")"' in w
 
 
+def test_render_sdk_wrapper_node_ssl_cert_sets_node_and_openssl_ca():
+    # A hybrid app (e.g. Hermes: Node CLI + an installer-managed python/uv venv
+    # + git) whose wrapper exports HTTPS_PROXY to the whole subtree needs BOTH the
+    # Node CA env (append) AND the OpenSSL/python/git env (combined bundle); with
+    # node_bun's Node-only env the non-node legs reject the proxy MITM cert with
+    # "received fatal alert: UnknownCA" (DAG-20574).
+    w = am.render_sdk_wrapper("http://127.0.0.1:8888", "snug_ca.pem", "hermes", "node_ssl_cert")
+    assert 'export NODE_EXTRA_CA_CERTS="$DIR/snug_ca.pem"' in w
+    assert 'export SSL_CERT_FILE="$DIR/snug_ca_bundle.pem"' in w
+    assert 'export SSL_CERT_DIR=""' in w
+    assert 'export REQUESTS_CA_BUNDLE="$DIR/snug_ca_bundle.pem"' in w
+    assert 'export GIT_SSL_CAINFO="$DIR/snug_ca_bundle.pem"' in w
+    assert 'export HTTPS_PROXY="http://127.0.0.1:8888"' in w
+    assert 'exec "$DIR/hermes.real" "$@"' in w
+
+
+def test_install_sdk_wrapper_node_ssl_cert_builds_combined_bundle(tmp_path, monkeypatch):
+    # node_ssl_cert is an SSL_CERT_FILE recipe, so install must build the combined
+    # system+proxy bundle beside the wrapper (SSL_CERT_FILE REPLACES the store).
+    home, sdk_dir = _make_sdk_dir(tmp_path)
+    ca_src = _write_ca(tmp_path)
+    # Portable system store: the real _SYSTEM_CA_BUNDLES paths are Linux-only.
+    sysca = tmp_path / "system-ca.pem"
+    sysca.write_bytes(b"-----BEGIN CERTIFICATE-----\nsystemroot\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(am, "_SYSTEM_CA_BUNDLES", (str(sysca),))
+
+    sdk = _CLAUDE_SDK._replace(wrapper_kind="node_ssl_cert")
+    assert am.install_sdk_wrapper(sdk_dir, ca_src, "http://127.0.0.1:8888", sdk) is True
+
+    bundle = os.path.join(sdk_dir, "snug_ca_bundle.pem")
+    assert os.path.isfile(bundle)
+    with open(bundle, "rb") as fh:
+        body = fh.read()
+    # Combined: both the system root and the proxy CA.
+    assert b"systemroot" in body and b"BEGIN CERTIFICATE" in body
+    with open(os.path.join(sdk_dir, _CLAUDE_SDK.binary_name)) as fh:
+        w = fh.read()
+    assert 'export SSL_CERT_FILE="$DIR/snug_ca_bundle.pem"' in w
+    assert 'export NODE_EXTRA_CA_CERTS="$DIR/snug_ca.pem"' in w
+
+
 # -- find_sdk_dirs -----------------------------------------------------------
 
 def test_find_sdk_dirs_matches_elf(tmp_path):
