@@ -61,6 +61,11 @@ class K8sIntegration(Worker):
 
     KUBECTL_APPLY_CMD = "kubectl apply --namespace={namespace} -f"
 
+    # kubectl error when creating a resource would exceed a namespace ResourceQuota. Transient: the resource can be
+    # created once quota usage drops. Not to be confused with "is forbidden: failed quota: <name>: must specify ...",
+    # where the pod spec itself does not satisfy the quota (e.g. missing limits) and retrying cannot help.
+    QUOTA_EXCEEDED_ERROR_RE = re.compile(r"is forbidden: exceeded quota: (?P<details>[^\n]+)")
+
     BASH_INSTALL_SSH_CMD = [
         "(apt-get update -y ; apt-get install -y openssh-server) || "
         "(dnf install -y openssh-server)",
@@ -229,6 +234,9 @@ class K8sIntegration(Worker):
         self.ignore_kubectl_errors_re = (
             re.compile(ENV_KUBECTL_IGNORE_ERROR.get()) if ENV_KUBECTL_IGNORE_ERROR.get() else None
         )
+
+        # Last re-enqueue reason logged to each task that is waiting to be launched (see _report_reenqueued_task)
+        self._reenqueued_tasks_msgs = {}  # type: Dict[str, str]
 
     @property
     def agent_label(self):
@@ -732,6 +740,14 @@ class K8sIntegration(Worker):
 
         print('kubectl output:\n{}\n{}'.format(error, output))
         if error:
+            quota_exceeded = self.QUOTA_EXCEEDED_ERROR_RE.search(error)
+            if quota_exceeded:
+                # Same as the in-tree controllers (Deployment, Job): wait for quota instead of failing the task
+                raise ReenqueueTaskException(
+                    "Kubernetes ResourceQuota exceeded ({}). Task will be retried once quota is available".format(
+                        quota_exceeded.group("details").strip()
+                    )
+                )
             if self.ignore_kubectl_errors_re and self.ignore_kubectl_errors_re.match(error):
                 print(f"Ignoring error due to {ENV_KUBECTL_IGNORE_ERROR.key}")
             else:
@@ -1499,26 +1515,33 @@ class K8sIntegration(Worker):
                             self._set_task_failed_owner_login(task_id, task_user, ex.message)
                             continue
 
-                    events_service.send_log_events(
-                        self.worker_id,
-                        task_id=task_id,
-                        lines="task {} pulled from {} by worker {}".format(
-                            task_id, queue, self.worker_id
-                        ),
-                        level="INFO",
-                        session=task_session,
-                    )
+                    if task_id not in self._reenqueued_tasks_msgs:
+                        # a task waiting to be launched is pulled again on every retry, it was already logged
+                        events_service.send_log_events(
+                            self.worker_id,
+                            task_id=task_id,
+                            lines="task {} pulled from {} by worker {}".format(
+                                task_id, queue, self.worker_id
+                            ),
+                            level="INFO",
+                            session=task_session,
+                        )
 
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues, queue=queue, task=task_id))
                     try:
                         self.run_one_task(queue, task_id, worker_params, task_session)
                     except ReenqueueTaskException as ex:
-                        self._re_enqueue_task(queue=queue, task_id=task_id)
-                        send_log = f"INFO: {ex}"
-                        sleep_log = "Sleeping for {:.1f} seconds".format(self._polling_interval)
-                        self.send_logs(task_id, send_log.splitlines())
-                        print(f"{send_log}. {sleep_log}")
+                        if self._re_enqueue_task(queue=queue, task_id=task_id):
+                            self._report_reenqueued_task(task_id, str(ex))
+                        else:
+                            self._reenqueued_tasks_msgs.pop(task_id, None)
+                        self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
+                        # Lower priority queues wait until this task is launched (strict priority). Sleep before
+                        # starting over, the task is back at the front of its queue and is pulled again right away
+                        print("Sleeping for {:.1f} seconds".format(self._polling_interval))
                         sleep(self._polling_interval)
+                        break
+                    self._reenqueued_tasks_msgs.pop(task_id, None)
                     self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
                     break
             else:
@@ -1551,7 +1574,31 @@ class K8sIntegration(Worker):
             self._session, queue=queue, get_task_info=get_task_info
         )
 
+    def _remove_from_pending_queue(self, task_id):
+        # noinspection PyBroadException
+        try:
+            self._session.api_client.queues.remove_task(task=task_id, queue=self.k8s_pending_queue_id)
+        except Exception as ex:
+            # the task may not be in the pending queue (e.g. it was never pushed there)
+            self.log.debug("Could not remove task {} from the k8s pending queue: {}".format(task_id, ex))
+
+    def _report_reenqueued_task(self, task_id, msg):
+        msg = "INFO: {}".format(msg)
+        # The task is retried on every polling cycle, only log to the task when the reason changes
+        if self._reenqueued_tasks_msgs.get(task_id) == msg:
+            print(msg)
+            return
+        if len(self._reenqueued_tasks_msgs) > 1000:
+            # forget tasks that were dequeued or launched elsewhere
+            self._reenqueued_tasks_msgs.clear()
+        self._reenqueued_tasks_msgs[task_id] = msg
+        # also prints it
+        self.send_logs(task_id, [msg + "\n"])
+
     def _re_enqueue_task(self, queue, task_id):
+        # run_one_task pushed the task into the k8s pending queue, adding it back to its queue does not remove it
+        self._remove_from_pending_queue(task_id)
+
         request = {'queue': queue, 'task': task_id}
         result = self._session.send_request(
             service='queues',
@@ -1578,6 +1625,7 @@ class K8sIntegration(Worker):
                 )
             except Exception as exc:
                 self.log.warning('Failed setting task {} to status "{}": {}'.format(task_id, 'failed', exc))
+            return False
         result = self._session.send_request(
             service='queues',
             action='move_task_to_front',
@@ -1589,6 +1637,7 @@ class K8sIntegration(Worker):
             send_log = f"ERROR: Could not move task {task_id} to front after re-enqueue, error: {result.text}"
             self.log.error(send_log)
             self.send_logs(task_id, send_log.splitlines())
+        return True
 
     def _resolve_template(self, task_session, task_data, queue, task_id):
         if self.template_dict:
