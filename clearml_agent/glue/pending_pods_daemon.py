@@ -117,7 +117,9 @@ class PendingPodsDaemon(K8sDaemon):
                             self._last_tasks_msgs.pop(task_id, None)
                             continue
 
-                    self._update_pending_task_msg(task_id, msg, tags)
+                    self._update_pending_task_msg(
+                        task_id, msg, tags, enqueue_running_task=self._may_enqueue_running_task(pod)
+                    )
 
                 if task_id_to_pod:
                     self._process_tasks_for_pending_pods(task_id_to_pod)
@@ -215,11 +217,20 @@ class PendingPodsDaemon(K8sDaemon):
             async_enable=False,
         )
 
-    def _update_pending_task_msg(self, task_id: str, msg: str, tags: List[str] = None):
+    def _may_enqueue_running_task(self, pod: dict) -> bool:
+        """
+        Whether a pending pod means its running task lost its pod (e.g. it was preempted and replaced), so that the
+        task should be enqueued back in the k8s pending queue
+        """
+        return True
+
+    def _update_pending_task_msg(
+            self, task_id: str, msg: str, tags: List[str] = None, enqueue_running_task: bool = True
+    ):
         if not msg or self._last_tasks_msgs.get(task_id, None) == (msg, tags):
             return
         try:
-            if ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION.get():
+            if ENV_POD_MONITOR_DISABLE_ENQUEUE_ON_PREEMPTION.get() or not enqueue_running_task:
                 # This disables the option to enqueue the task which is supposed to sync the ClearML task status
                 # in case the pod was preempted. In some cases this does not happen due to preemption but due to
                 # cluster communication lag issues that cause us not to discover the pod is no longer pending and

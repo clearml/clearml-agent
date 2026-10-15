@@ -42,19 +42,25 @@ LIMIT_RANGE_ERROR = (
 
 
 class _Response:
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, data=None):
         self.ok = ok
         self.text = "" if ok else "error"
+        self._data = data or {}
+
+    def json(self):
+        return {"data": self._data}
 
 
-def _make_glue():
+def _make_glue(task_status="queued", ok=True):
     glue = object.__new__(K8sIntegration)
     glue.log = logging.getLogger("test")
     glue.k8s_pending_queue_id = PENDING_QUEUE
     glue.ignore_kubectl_errors_re = None
     glue._reenqueued_tasks_msgs = {}
     glue._session = mock.Mock()
-    glue._session.send_request.return_value = _Response()
+    glue._session.send_request.side_effect = lambda service, action, **_: (
+        _Response(data={"tasks": [{"status": task_status}]}) if action == "get_all" else _Response(ok=ok)
+    )
     glue.send_logs = mock.Mock()
     glue.resource_applied = mock.Mock()
     glue.set_task_info = mock.Mock()
@@ -128,6 +134,7 @@ class ReEnqueueTaskTests(unittest.TestCase):
             [
                 (name, kwargs if name == "remove_task" else kwargs["action"])
                 for name, _, kwargs in calls.mock_calls
+                if kwargs.get("action") != "get_all"
             ]
         )
 
@@ -136,18 +143,32 @@ class ReEnqueueTaskTests(unittest.TestCase):
         glue._session.api_client.queues.remove_task.side_effect = Exception("task not in queue")
 
         self.assertTrue(glue._re_enqueue_task(queue="queue", task_id=TASK))
-        self.assertEqual(
-            ["add_task", "move_task_to_front"],
-            [c.kwargs["action"] for c in glue._session.send_request.call_args_list]
-        )
+        self.assertEqual(["add_task", "move_task_to_front"], _sent_actions(glue))
 
     def test_task_that_cannot_be_enqueued_is_failed(self):
-        glue = _make_glue()
-        glue._session.send_request.return_value = _Response(ok=False)
+        glue = _make_glue(ok=False)
 
         self.assertFalse(glue._re_enqueue_task(queue="queue", task_id=TASK))
-        self.assertEqual(["add_task"], [c.kwargs["action"] for c in glue._session.send_request.call_args_list])
+        self.assertEqual(["add_task"], _sent_actions(glue))
         self.assertEqual("failed", glue._session.get.call_args.kwargs["action"])
+
+    def test_task_aborted_meanwhile_is_not_enqueued_back(self):
+        # e.g. aborted by a user while its pods were being created: the abort must stick
+        for status in ("stopped", "created", "failed"):
+            with self.subTest(status=status):
+                glue = _make_glue(task_status=status)
+                self.assertFalse(glue._re_enqueue_task(queue="queue", task_id=TASK))
+                self.assertEqual([], _sent_actions(glue))
+                glue._session.api_client.queues.remove_task.assert_called_once_with(task=TASK, queue=PENDING_QUEUE)
+                glue._session.get.assert_not_called()
+
+
+def _sent_actions(glue):
+    """ API requests sent (status reads aside) """
+    return [
+        c.kwargs.get("action") or c.args[1] for c in glue._session.send_request.call_args_list
+        if (c.kwargs.get("action") or c.args[1]) != "get_all"
+    ]
 
 
 class _StopLoop(Exception):

@@ -1595,9 +1595,27 @@ class K8sIntegration(Worker):
         # also prints it
         self.send_logs(task_id, [msg + "\n"])
 
+    def _get_task_status(self, task_id) -> Optional[str]:
+        # noinspection PyBroadException
+        try:
+            result = self._session.send_request(
+                service='tasks', action='get_all', json={"id": [task_id], "only_fields": ["status"]},
+                method=Request.def_method,
+            )
+            return get_path(result.json(), 'data', 'tasks', 0, 'status') if result.ok else None
+        except Exception as ex:
+            self.log.warning("Failed getting the status of task {}: {}".format(task_id, ex))
+            return None
+
     def _re_enqueue_task(self, queue, task_id):
         # run_one_task pushed the task into the k8s pending queue, adding it back to its queue does not remove it
         self._remove_from_pending_queue(task_id)
+
+        status = self._get_task_status(task_id)
+        if status and status != "queued":
+            # e.g. aborted or dequeued by a user while it was being launched: leave it as is
+            print("Task {} is {}, not re-enqueueing it".format(task_id, status))
+            return False
 
         request = {'queue': queue, 'task': task_id}
         result = self._session.send_request(
