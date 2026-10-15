@@ -42,6 +42,22 @@ class PendingPodsDaemon(K8sDaemon):
     def _get_k8s_resource_namespace(pod: dict) -> Optional[str]:
         return pod.get('metadata', {}).get('namespace', None)
 
+    @staticmethod
+    def _get_waiting_state(pod: dict) -> Optional[dict]:
+        """
+        The waiting state reported for a pending pod: the first container (init containers included) waiting for
+        an eviction reason, otherwise the first main container's. An init or sidecar container that can't pull its
+        image must fail the Task, while the main container waiting on it only reports PodInitializing.
+        """
+        eviction_reasons = ENV_POD_MONITOR_EVICTION_REASONS.get()
+        statuses = (get_path(pod, 'status', 'initContainerStatuses') or []) + \
+            (get_path(pod, 'status', 'containerStatuses') or [])
+        for status in statuses:
+            waiting = get_path(status, 'state', 'waiting')
+            if waiting and waiting.get('reason') in eviction_reasons:
+                return waiting
+        return get_path(pod, 'status', 'containerStatuses', 0, 'state', 'waiting')
+
     def target(self):
         """
             Handle pending objects (pods or jobs, depending on the agent mode).
@@ -81,7 +97,7 @@ class PendingPodsDaemon(K8sDaemon):
                     msg = None
                     tags = []
 
-                    waiting = get_path(pod, 'status', 'containerStatuses', 0, 'state', 'waiting')
+                    waiting = self._get_waiting_state(pod)
                     if not waiting:
                         condition = get_path(pod, 'status', 'conditions', 0)
                         if condition:
