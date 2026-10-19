@@ -18,6 +18,9 @@ Covers two bugs:
   ``CLEARML_AGENT_GPU_FRACTIONS=<fraction>`` so its ResourceMonitor reports the
   allocated fraction. ``Worker._docker_cmd_set_env`` performs the injection into the
   docker command; ``test_docker_cmd_set_env_*`` exercise it directly.
+
+It also covers server failures: a failed workers query must still return an (available, allocated)
+pair, so the daemon loop retries later instead of crashing and stopping the tasks it launched.
 """
 import logging
 from time import time
@@ -151,6 +154,20 @@ def test_whole_gpu_reservation_blocks_second_whole_gpu_pull():
 
     assert available_gpus == {"1": 1}
     assert allocated_gpus.get("0") == 1
+
+
+class _FailingSession(_FakeSession):
+    """A server that fails the workers query, e.g. with a 500 while it is unavailable."""
+    def send_api(self, request):  # noqa: ARG002 - request shape is irrelevant to the fake
+        raise RuntimeError("server unavailable")
+
+
+def test_server_failure_returns_no_availability_instead_of_crashing():
+    """The daemon loop unpacks two values and treats an empty result as "retry later"."""
+    worker = _make_worker()
+    worker._session = _FailingSession(registered_worker_ids=[], worker_name="test-worker")
+
+    assert worker._dynamic_gpu_get_available([0]) == (None, None)
 
 
 def test_reserve_dynamic_gpus_records_index_fraction_and_timestamp():

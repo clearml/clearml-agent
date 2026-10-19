@@ -1609,7 +1609,7 @@ class Worker(ServiceCommandSection):
                     # if something went wrong, or we have no free gpus
                     # start over from the highest priority queue
                     if not available_gpus:
-                        if self._daemon_foreground or worker_params.debug:
+                        if available_gpus is not None and (self._daemon_foreground or worker_params.debug):
                             print("All GPUs allocated, sleeping for {:.1f} seconds".format(self._polling_interval))
                         sleep(self._polling_interval)
                         continue
@@ -1881,8 +1881,10 @@ class Worker(ServiceCommandSection):
                 worker_pattern="{}*".format(worker_name),
                 _allow_extra_fields_=True
             ))
-        except Exception:
-            return None
+        except Exception as ex:
+            # callers unpack two values and retry later when no GPUs are available
+            print("WARNING: failed getting GPU workers from the server, will retry: {}".format(ex))
+            return None, None
 
         # filter only our workers, in case the selector pattern above was ignored due to lower version API server
         our_workers = [
@@ -1973,6 +1975,9 @@ class Worker(ServiceCommandSection):
             allocated_gpus[gpu_suffix] = fraction
 
     def _setup_dynamic_gpus(self, gpu_queues, gpu_indexes):
+        # the daemon cannot run in this mode without runtime properties and re-enters here after every
+        # failure, so ask the server again instead of trusting a cached failure that may have been transient
+        self._runtime_props_support = None
         available_gpus = self.get_runtime_properties()
         if available_gpus is None:
             raise ValueError("Dynamic GPU allocation is not supported by your ClearML-server")
@@ -2018,6 +2023,14 @@ class Worker(ServiceCommandSection):
         runtime_props = self.get_runtime_properties()
         return queue_tags, runtime_props
 
+    def _warn_runtime_props_error(self, action, error):
+        # type: (str, APIError) -> None
+        # the request id is the apiserver transaction id, read from the raw response body because the
+        # parsed meta raises on missing fields; it is empty when the error did not come from the
+        # apiserver (e.g. a load balancer error page)
+        request_id = (error.data or {}).get("meta", {}).get("trx")
+        print("WARNING: {} failed (worker={}, request id={}): {}".format(action, self.worker_id, request_id, error))
+
     def get_runtime_properties(self):
         # TODO: refactor to use the Session env State
         if self._runtime_props_support is not True:
@@ -2034,7 +2047,8 @@ class Worker(ServiceCommandSection):
             # definitely supported
             self._runtime_props_support = True
             return res
-        except APIError:
+        except APIError as ex:
+            self._warn_runtime_props_error(action="get_runtime_properties", error=ex)
             self._runtime_props_support = self._session.api_version
         return None
 
@@ -2059,6 +2073,7 @@ class Worker(ServiceCommandSection):
             self._runtime_props_support = True
             return True
         except APIError as ex:
+            self._warn_runtime_props_error(action="set_runtime_properties", error=ex)
             self._runtime_props_support = self._session.api_version
         except Exception as ex:
             # not sure what happened
@@ -2344,8 +2359,10 @@ class Worker(ServiceCommandSection):
                 self._session.print_configuration()
                 print_table(queues_info, columns=columns, titles=columns)
 
+        crash_backoff_sec = 1
         try:
             while True:
+                loop_start = time()
                 try:
                     self.new_monitor(ResourceMonitor.StatusReport(queues=queues))
                     self.run_tasks_loop(
@@ -2382,7 +2399,13 @@ class Worker(ServiceCommandSection):
                                 name, tb
                             )
                         )
-                    sleep(1)
+                    # with agent.crash_backoff, repeated crashes back off exponentially (up to a minute) so a
+                    # failing server is not called every second; a crash after a healthy run starts over from
+                    # one second. Without it every crash is retried after one second.
+                    if not self._session.config.get("agent.crash_backoff", False) or time() - loop_start > 60:
+                        crash_backoff_sec = 1
+                    sleep(crash_backoff_sec)
+                    crash_backoff_sec = min(crash_backoff_sec * 2, 60)
         finally:
             self._unregister(queues)
             safe_remove_file(self.temp_config_path)

@@ -129,6 +129,7 @@ ENVIRONMENT_CONFIG = {
     "agent.cudnn_version": EnvironmentConfig("CLEARML_CUDNN_VERSION", "TRAINS_CUDNN_VERSION", "CUDNN_VERSION"),
     "agent.cpu_only": EnvironmentConfig(names=("CLEARML_CPU_ONLY", "TRAINS_CPU_ONLY", "CPU_ONLY"), type=bool),
     "agent.crash_on_exception": EnvironmentConfig("CLEARML_AGENT_CRASH_ON_EXCEPTION", type=bool),
+    "agent.crash_backoff": EnvironmentConfig("CLEARML_AGENT_CRASH_BACKOFF", type=bool),
     "agent.snug.enabled": ENV_AGENT_SNUG_ENABLED,
     "agent.snug.report_usage_events": ENV_AGENT_SNUG_REPORT_USAGE_EVENTS,
     "agent.snug.report_task_metrics": ENV_AGENT_SNUG_REPORT_TASK_METRICS,
