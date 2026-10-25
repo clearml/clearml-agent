@@ -83,8 +83,9 @@ from clearml_agent.snug.whitelist import build_whitelist_env
 #                                               path in the image; check the dirs
 #                                               named in `explicit_dirs`.
 #                             "path_lookup"   — reserved; not implemented (raise).
-#   container_substr      : home_glob only — the SDK dir's grandparent must
-#                           contain this substring (e.g. "claude-code").
+#   container_substr      : home_glob only — the SDK dir's grandparent (or
+#                           great-grandparent) must contain this substring
+#                           (e.g. "claude-code").
 #   expects_version_parent: home_glob only — require an intermediate version dir.
 #   explicit_dirs         : explicit_path only — absolute dirs to shadow the
 #                           binary in. Wrap the dir the app INVOKES (a PATH entry,
@@ -601,9 +602,13 @@ def find_sdk_dirs(home, sdk):
             continue
         # Match the '<*container_substr*>/<version>/' shape: the grandparent dir
         # name contains container_substr and the parent is a version segment.
+        # Claude Desktop 3.3+ adds a build-hash level for the Code tab CLI
+        # ('claude-code/<version>/<hash>/claude'), so the great-grandparent counts too.
         parent = os.path.basename(root)
         grandparent = os.path.basename(os.path.dirname(root))
-        if sdk.container_substr and sdk.container_substr not in grandparent:
+        great_grandparent = os.path.basename(os.path.dirname(os.path.dirname(root)))
+        if sdk.container_substr and sdk.container_substr not in grandparent \
+                and sdk.container_substr not in great_grandparent:
             continue
         if sdk.expects_version_parent and not parent:
             continue

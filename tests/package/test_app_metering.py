@@ -163,6 +163,14 @@ def test_find_sdk_dirs_skips_already_wrapped(tmp_path):
     assert am.find_sdk_dirs(home, _CLAUDE_SDK) == []
 
 
+def test_find_sdk_dirs_matches_version_hash_layout(tmp_path):
+    # Claude Desktop 3.3+ Code tab: claude-code/<version>/<build-hash>/claude.
+    sdk_dir = tmp_path / "home" / ".config" / "Claude" / "claude-code" / "2.1.304" / "0f3468fa285f"
+    sdk_dir.mkdir(parents=True)
+    (sdk_dir / _CLAUDE_SDK.binary_name).write_bytes(_FAKE_ELF)
+    assert am.find_sdk_dirs(str(tmp_path / "home"), _CLAUDE_SDK) == [str(sdk_dir)]
+
+
 def test_find_sdk_dirs_ignores_non_claude_code_dirs(tmp_path):
     # A `claude` binary that isn't under a *claude-code* package is not ours
     # (container_substr must appear in the grandparent dir name).
