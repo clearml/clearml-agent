@@ -13,10 +13,6 @@ clearml_agent/snug/bin/
 # IntelliJ
 .idea
 
-# Zed
-.zed
-.rules
-
 # Python
 *.pyc
 __pycache__
