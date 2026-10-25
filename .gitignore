@@ -1,3 +1,7 @@
+# Zed files
+.zed/
+MEMORY.md
+
 # Rust / SNUG build artifacts
 clearml_snug/target/
 clearml_agent/snug/lib/
