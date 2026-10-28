@@ -21,6 +21,21 @@ if TYPE_CHECKING:
     from clearml_agent.session import Session
 
 
+# Env var names that look like credentials (e.g. ANTHROPIC_API_KEY, HF_TOKEN, DB_PASSWORD). Vault `environment`
+# sections and extra_docker_arguments carry arbitrary user secrets whose names are not known in advance.
+_SECRET_NAME = r"[A-Za-z0-9_]*(?:key|secret|token|pass|credential)[A-Za-z0-9_]*"
+_SECRET_ENV_NAME_RE = re.compile(r"(?i)^{}$".format(_SECRET_NAME))
+_SECRET_ASSIGNMENT_RE = re.compile(r"(?i)\b({})(\\?=)[^\s\"',;\]]+".format(_SECRET_NAME))
+
+
+def sanitize_secret_assignments(s: str) -> str:
+    """
+    Replaces the value of every NAME=VALUE assignment whose NAME looks like a credential with asterisks,
+    for free text (bash scripts, embedded clearml.conf snippets) where the env var names are not known.
+    """
+    return _SECRET_ASSIGNMENT_RE.sub("\\1\\2********", s)
+
+
 def sanitize_urls(s: str) -> Tuple[str, bool]:
     """
     Replaces passwords in URLs with asterisks.
@@ -89,7 +104,7 @@ class DockerArgsSanitizer:
                     if key in ENV_DOCKER_IMAGE.vars:
                         # special case - this contains a complete docker command
                         val = " ".join(cls.sanitize_docker_command(session, re.split(r"\s", val)))
-                    elif key in keys:
+                    elif key in keys or _SECRET_ENV_NAME_RE.match(key):
                         val = "********"
                     elif parse_embedded_urls:
                         val = sanitize_urls(val)[0]

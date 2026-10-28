@@ -3,7 +3,7 @@ Test docker args processing
 """
 import logging
 
-from clearml_agent.helper.docker_args import DockerArgsSanitizer
+from clearml_agent.helper.docker_args import DockerArgsSanitizer, sanitize_secret_assignments
 
 
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
@@ -299,3 +299,27 @@ def test_merge_docker_args_empty_value_of_non_forbidden_switch_is_dropped():
     )
     assert stripped_switches == []
     assert merged == ["--label", "--rm"]
+
+
+def test_sanitize_docker_command_hides_secret_looking_env_vars():
+    class Session:
+        class config:
+            @staticmethod
+            def get(key, default=None):
+                return default if key != "agent.hide_docker_command_env_vars.enabled" else True
+
+    cmd = [
+        "docker", "run", "-e", "ANTHROPIC_API_KEY=sk-ant-x", "-e", "NGC_API_KEY=nvapi-x", "-e", "HF_TOKEN=hf_x",
+        "-e", "CLEARML_DEPLOYMENT_APPLY_IPv6_HACK=1", "img",
+    ]
+    assert DockerArgsSanitizer.sanitize_docker_command(Session, cmd) == [
+        "docker", "run", "-e", "ANTHROPIC_API_KEY=********", "-e", "NGC_API_KEY=********", "-e", "HF_TOKEN=********",
+        "-e", "CLEARML_DEPLOYMENT_APPLY_IPv6_HACK=1", "img",
+    ]
+
+
+def test_sanitize_secret_assignments():
+    conf = 'agent.extra_docker_arguments: ["-e", "NGC_API_KEY=nvapi-x", "-e", "MODE=1"]\nexport DB_PASSWORD=p ; ls'
+    assert sanitize_secret_assignments(conf) == (
+        'agent.extra_docker_arguments: ["-e", "NGC_API_KEY=********", "-e", "MODE=1"]\nexport DB_PASSWORD=******** ; ls'
+    )

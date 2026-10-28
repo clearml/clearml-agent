@@ -20,7 +20,7 @@ from clearml_agent.definitions import ENVIRONMENT_CONFIG, ENV_TASK_EXECUTE_AS_US
 from clearml_agent.errors import APIError
 from clearml_agent.helper.base import HOCONEncoder
 from clearml_agent.helper.process import Argv
-from clearml_agent.helper.docker_args import DockerArgsSanitizer, sanitize_urls
+from clearml_agent.helper.docker_args import DockerArgsSanitizer, sanitize_urls, sanitize_secret_assignments
 from .version import __version__
 
 POETRY = "poetry"
@@ -276,9 +276,14 @@ class Session(_Session):
                 elif isinstance(dictionary.get(k, None), (list, tuple)):
                     if any(r.match(k) for r in docker_cmd_keys):
                         dictionary[k] = DockerArgsSanitizer.sanitize_docker_command(self, dictionary[k])
+                    dictionary[k] = [
+                        sanitize_secret_assignments(item) if isinstance(item, str) else item for item in dictionary[k]
+                    ]
                     for item in dictionary[k]:
                         if isinstance(item, dict):
                             recursive_remove_secrets(item)
+                elif isinstance(dictionary.get(k, None), str):
+                    dictionary[k] = sanitize_secret_assignments(dictionary[k])
 
         config = deepcopy(self.config.to_dict())
         # remove the env variable, it's not important
