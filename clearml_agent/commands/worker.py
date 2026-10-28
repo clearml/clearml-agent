@@ -1535,6 +1535,48 @@ class Worker(ServiceCommandSection):
 
         return get_new_session(task_session, headers={"X-Clearml-Tenant": company})
 
+    def _fail_task_on_impersonation_failure(self, task_id, task_user, dequeue=False):
+        # With --use-owner-token the agent runs each task as its owner, but a regular/admin
+        # agent session is not allowed to impersonate a hidden/support user, so
+        # get_task_session() returns None. Fail the task through the agent's own session
+        # (self._session, the same session that pulled the task and is allowed to change its
+        # status), otherwise the task is silently abandoned - the error only reaches the
+        # agent stdout and the task itself is left stuck with no error in its console log.
+        # Best-effort: swallow backend errors so failing the task can never crash the loop.
+        if task_user:
+            reason = "Could not login as the task owner '{}' to run the task".format(task_user)
+        else:
+            reason = "Could not resolve the task owner to run the task"
+        message = "{}: the agent is not allowed to impersonate this user. Failing the task.".format(reason)
+        # noinspection PyBroadException
+        try:
+            self.send_logs(task_id=task_id, lines=[message], level="ERROR", session=self._session)
+        except Exception as ex:
+            self.log.warning("Failed sending impersonation error to task {} log: {}".format(task_id, ex))
+
+        status_payload = {
+            "task": task_id,
+            "force": True,
+            "status_reason": reason,
+            "status_message": message,
+        }
+        # The k8s glue does not mark the task started before impersonating, so the task is
+        # still queued; take it out of the queue first. Done as a separate best-effort step
+        # so that failing the task still happens even if the dequeue is rejected.
+        if dequeue:
+            # noinspection PyBroadException
+            try:
+                self._session.get(
+                    service="tasks", action="dequeue", json=status_payload, method=Request.def_method)
+            except Exception as ex:
+                self.log.warning("Failed dequeuing task {} before failing it: {}".format(task_id, ex))
+        # noinspection PyBroadException
+        try:
+            self._session.get(
+                service="tasks", action="failed", json=status_payload, method=Request.def_method)
+        except Exception as ex:
+            self.log.warning('Failed setting task {} to status "failed": {}'.format(task_id, ex))
+
     def run_tasks_loop(self, queues, worker_params, priority_order=True, gpu_indexes=None, gpu_queues=None):
         """
         :summary: Pull and run tasks from queues.
@@ -1700,6 +1742,9 @@ class Worker(ServiceCommandSection):
                                 task_company = response["task_info"]["company"]
                             except (KeyError, TypeError, AttributeError):
                                 print("Error: cannot retrieve owner user for the task '{}', skipping".format(task_id))
+                                # only the rank-0 node marked the task started above, so only it fails it
+                                if not self._get_node_rank():
+                                    self._fail_task_on_impersonation_failure(task_id=task_id, task_user=None)
                                 continue
 
                             task_session = self.get_task_session(task_user, task_company, self._session)
@@ -1709,6 +1754,9 @@ class Worker(ServiceCommandSection):
                                         task_user, task_id
                                     )
                                 )
+                                # only the rank-0 node marked the task started above, so only it fails it
+                                if not self._get_node_rank():
+                                    self._fail_task_on_impersonation_failure(task_id=task_id, task_user=task_user)
                                 continue
 
                         self.report_monitor(ResourceMonitor.StatusReport(queues=queues, queue=queue, task=task_id))

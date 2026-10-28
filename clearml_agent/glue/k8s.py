@@ -1500,6 +1500,7 @@ class K8sIntegration(Worker):
                             task_company = response["task_info"]["company"]
                         except (KeyError, TypeError, AttributeError):
                             print("Error: cannot retrieve owner user for the task '{}', skipping".format(task_id))
+                            self._fail_task_on_impersonation_failure(task_id=task_id, task_user=None, dequeue=True)
                             continue
 
                         try:
