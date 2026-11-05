@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -40,9 +40,12 @@ use clearml_snug_messages::Event;
 use clearml_snug_reporter::{start_reporter, Descriptor, ReporterHandle};
 
 // Parsing modules reused verbatim from the shim. `body_scan` refers to
-// `crate::parser`, satisfied by declaring `parser` at the crate root here.
+// `crate::parser` and `crate::kiro`, satisfied by declaring them at the crate
+// root here.
 #[path = "../../shim/src/parser.rs"]
 mod parser;
+#[path = "../../shim/src/kiro.rs"]
+mod kiro;
 #[path = "../../shim/src/body_scan.rs"]
 mod body_scan;
 #[path = "../../shim/src/h2.rs"]
@@ -105,6 +108,7 @@ fn provider_from_name(name: &str) -> Option<Provider> {
         "anthropic" => Some(Provider::Anthropic),
         "openai" => Some(Provider::OpenAi),
         "gemini" => Some(Provider::Gemini),
+        "kiro" => Some(Provider::Kiro),
         _ => None,
     }
 }
@@ -117,6 +121,9 @@ fn tokenizer_for(provider: Provider) -> &'static str {
         Provider::Anthropic => "claude",
         Provider::OpenAi => "cl100k",
         Provider::Gemini => "approx",
+        // Kiro's catalog is Claude-led (2.x's `auto` routes to Claude on
+        // Bedrock); its GPT models are picked out by name in `emit`.
+        Provider::Kiro => "claude",
     }
 }
 
@@ -181,6 +188,28 @@ fn dlog(msg: &str) {
 fn is_benign_disconnect(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
     matches!(e.kind(), UnexpectedEof | ConnectionReset | BrokenPipe)
+}
+
+/// A CONNECT target whose name does not resolve (`connect_upstream`). The client
+/// asked for a host that doesn't exist from here, and gets the same failure it
+/// would get without the proxy, so it is logged at debug level only. kiro-cli
+/// does this on every start: it probes its control plane in every AWS
+/// partition, including isolated regions (`*.ic.gov`, `*.sgov.gov`) that have
+/// no public DNS.
+fn is_unresolvable(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Dial a CONNECT target, naming the host in a resolution failure (reported
+/// as `NotFound`, see `is_unresolvable`).
+fn connect_upstream(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("cannot resolve {}: {}", host, e))
+        })?
+        .collect();
+    TcpStream::connect(&addrs[..])
 }
 
 /// Shared process state: the CA, prebuilt upstream configs, the decrypt policy, the
@@ -458,6 +487,8 @@ fn main() {
                     if let Err(e) = handle_conn(s, shared) {
                         if is_benign_disconnect(&e) {
                             dlog(&format!("conn closed early: {}", e));
+                        } else if is_unresolvable(&e) {
+                            dlog(&format!("conn skipped: {}", e));
                         } else {
                             log(&format!("conn error: {}", e));
                         }
@@ -530,7 +561,7 @@ fn handle_conn(mut client: TcpStream, shared: Arc<Shared>) -> std::io::Result<()
 
 /// Raw TCP relay for non-provider hosts. No TLS termination, no decryption.
 fn blind_tunnel(client: TcpStream, host: &str, port: u16) -> std::io::Result<()> {
-    let upstream = TcpStream::connect((host, port))?;
+    let upstream = connect_upstream(host, port)?;
     upstream.set_nodelay(true).ok();
     let c2 = client.try_clone()?;
     let u2 = upstream.try_clone()?;
@@ -587,7 +618,7 @@ fn intercept(
     // Open the upstream leg with the SAME ALPN so the verbatim byte relay stays
     // protocol-consistent.
     let up_cfg = if is_h2 { shared.upstream_h2.clone() } else { shared.upstream_h1.clone() };
-    let up_tcp = TcpStream::connect((host.as_str(), port))?;
+    let up_tcp = connect_upstream(&host, port)?;
     up_tcp.set_nodelay(true).ok();
     let sni = ServerName::try_from(host.clone())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "bad sni"))?;
@@ -730,6 +761,28 @@ fn emit(
             fin.cache_read_tokens.unwrap_or(0),
             fin.cache_write_tokens.unwrap_or(0),
         )
+    } else if provider == Provider::Kiro && fin.output_text_bytes.is_some() {
+        // Kiro reports no tokens on any request, so every parsed generation is
+        // estimated: input from the whole request body (the conversation, tool
+        // specs and editor context are resent on every call), output from the
+        // streamed text and tool arguments. Kiro's server-side system prompt
+        // never crosses the wire, so the input estimate undercounts by its size.
+        let m = model.as_deref();
+        let tokenizer = match rule {
+            Some(r) => r.tokenizer.as_str(),
+            None if m.is_some_and(|m| m.starts_with("gpt")) => tokenizer_for(Provider::OpenAi),
+            None => tokenizer_for(provider),
+        };
+        // A body past the scan cap was still forwarded whole; `bytes_tx` counts it
+        // (plus the request head, small next to such a body).
+        let in_bytes = if req_body.len() >= REQ_BODY_CAP { bytes_tx } else { req_body.len() as u64 };
+        let out_bytes = fin.output_text_bytes.unwrap_or(0);
+        (
+            tokens::estimate_tokens(in_bytes, tokenizer, m),
+            tokens::estimate_tokens(out_bytes, tokenizer, m),
+            0,
+            0,
+        )
     } else if estimate_this {
         // Per-host tokenizer: a matched rule pins its estimator; fall back to the
         // provider default only if the rule somehow lacks one.
@@ -785,10 +838,10 @@ fn emit(
         .saturating_sub(cache_read_tokens)
         .saturating_sub(cache_write_tokens);
     dlog(&format!(
-        "conn {} DONE method={:?} path={:?} status={:?} model={:?} tokens_in={} (fresh={} cache_read={} cache_write={}) tokens_out={} measured={} whitelisted={} tool_calls={} tools={:?} bytes_tx={} bytes_rx={} latency_ms={}",
+        "conn {} DONE method={:?} path={:?} status={:?} model={:?} tokens_in={} (fresh={} cache_read={} cache_write={}) tokens_out={} measured={} whitelisted={} tool_calls={} tools={:?} credits={:?} bytes_tx={} bytes_rx={} latency_ms={}",
         conn_id, method, path, status, model, tokens_in, fresh_in, cache_read_tokens, cache_write_tokens,
         tokens_out, tokens_measured, whitelisted,
-        fin.tool_calls, fin.tool_call_names, bytes_tx, bytes_rx, latency_ms
+        fin.tool_calls, fin.tool_call_names, fin.credits, bytes_tx, bytes_rx, latency_ms
     ));
 
     if let Some(tx) = &shared.tx {
@@ -2718,6 +2771,89 @@ mod tests {
             }
             e => panic!("expected RequestCompleted, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn emit_estimates_kiro_generation() {
+        // Kiro's wire has no token counts: a parsed generation (output text bytes
+        // present) is estimated from the whole request body and the streamed text,
+        // under the request's `modelId`, with no whitelist rule needed.
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let shared = test_shared(tx);
+        let req_body = br#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"Reply with exactly: hello world","modelId":"auto"}}}}"#;
+        let fin = body_scan::Finalized {
+            output_text_bytes: Some(11),
+            credits: Some(0.05),
+            ..Default::default()
+        };
+        let req_model = model_from_request(Provider::Kiro, req_body, Some("/"));
+        emit(
+            &shared, 30, Some(Provider::Kiro), "runtime.us-east-1.kiro.dev", now_ms(), Some(200),
+            700 + req_body.len() as u64, 1136, 1136, &fin, req_model, req_body, Some("POST"), Some("/"),
+        );
+        let _ = rx.try_recv().expect("RequestStarted emitted");
+        match rx.try_recv().expect("RequestCompleted emitted") {
+            Event::RequestCompleted { tokens_in, tokens_out, tokens_measured, model, .. } => {
+                assert!(!tokens_measured);
+                assert_eq!(model.as_deref(), Some("auto"));
+                assert_eq!(tokens_in, tokens::estimate_tokens(req_body.len() as u64, "claude", Some("auto")));
+                assert_eq!(tokens_out, tokens::estimate_tokens(11, "claude", Some("auto")));
+                assert!(tokens_in > 0 && tokens_out > 0);
+            }
+            e => panic!("expected RequestCompleted, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_estimates_a_kiro_gpt_model_with_the_openai_ratio() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let shared = test_shared(tx);
+        let req_body = br#"{"model":"gpt-5.6-sol","input":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let fin = body_scan::Finalized {
+            output_text_bytes: Some(40),
+            model: Some("gpt-5.6-sol".to_string()),
+            ..Default::default()
+        };
+        emit(
+            &shared, 32, Some(Provider::Kiro), "runtime.us-east-1.kiro.dev", now_ms(), Some(200),
+            900, 4000, 4000, &fin, None, req_body, Some("POST"), Some("/v1/responses"),
+        );
+        let _ = rx.try_recv().expect("RequestStarted emitted");
+        match rx.try_recv().expect("RequestCompleted emitted") {
+            Event::RequestCompleted { tokens_in, tokens_out, model, .. } => {
+                assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(tokens_in, tokens::estimate_tokens(req_body.len() as u64, "cl100k", Some("gpt-5.6-sol")));
+                assert_eq!(tokens_out, tokens::estimate_tokens(40, "cl100k", Some("gpt-5.6-sol")));
+            }
+            e => panic!("expected RequestCompleted, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_reports_nothing_for_unparsed_kiro_response() {
+        // A Kiro JSON reply (an error, or a non-chat call) is not a generation.
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let shared = test_shared(tx);
+        let fin = body_scan::Finalized::default();
+        emit(
+            &shared, 31, Some(Provider::Kiro), "runtime.us-east-1.kiro.dev", now_ms(), Some(400),
+            900, 200, 200, &fin, Some("auto".into()), b"{}", Some("POST"), Some("/"),
+        );
+        let _ = rx.try_recv().expect("RequestStarted emitted");
+        match rx.try_recv().expect("RequestCompleted emitted") {
+            Event::RequestCompleted { tokens_in, tokens_out, .. } => {
+                assert_eq!((tokens_in, tokens_out), (0, 0), "dropped by the zero-token guard");
+            }
+            e => panic!("expected RequestCompleted, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolvable_upstream_is_named_and_quiet() {
+        let e = connect_upstream("kiro-management.us-iso-east-1.c2s.invalid", 443).unwrap_err();
+        assert!(is_unresolvable(&e));
+        assert!(e.to_string().contains("kiro-management.us-iso-east-1.c2s.invalid"), "{e}");
+        assert!(!is_benign_disconnect(&e));
     }
 
     #[test]

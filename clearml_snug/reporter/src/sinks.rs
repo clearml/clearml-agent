@@ -1163,6 +1163,8 @@ fn host_to_model_name(host: &str) -> String {
         "api.anthropic.com" => "anthropic".to_string(),
         "claude.ai" => "anthropic".to_string(),
         "generativelanguage.googleapis.com" => "gemini".to_string(),
+        // Kiro's regional chat endpoints, `runtime.<region>.kiro.dev`.
+        h if h.ends_with(".kiro.dev") => "kiro".to_string(),
         other => other.to_string(),
     }
 }
@@ -1369,6 +1371,7 @@ mod tests {
         assert_eq!(host_to_model_name("generativelanguage.googleapis.com"), "gemini");
         // The consumer chat wire rolls up under the same provider as the API path.
         assert_eq!(host_to_model_name("claude.ai"), "anthropic");
+        assert_eq!(host_to_model_name("runtime.us-east-1.kiro.dev"), "kiro");
         assert_eq!(host_to_model_name("unknown.example.com"), "unknown.example.com");
         assert_eq!(host_to_model_name(""), "unknown");
     }

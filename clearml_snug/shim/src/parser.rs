@@ -64,11 +64,13 @@ pub fn parse_first_write(buf: &[u8]) -> ParseOutcome {
 
 /// What we extract from an HTTP/1.x response head (status line + headers).
 /// Just the bits the usage scanner needs: the status code, whether the body
-/// is an SSE stream vs a JSON document, and whether it's chunked.
+/// is an SSE stream, an AWS event stream (Kiro) or a JSON document, and whether
+/// it's chunked.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResponseHead {
     pub status: u16,
     pub is_event_stream: bool,
+    pub is_aws_event_stream: bool,
     pub is_json: bool,
     pub chunked: bool,
 }
@@ -84,6 +86,7 @@ pub fn parse_response_head(buf: &[u8]) -> Option<ResponseHead> {
         Ok(httparse::Status::Complete(_)) => {
             let status = resp.code?;
             let mut is_event_stream = false;
+            let mut is_aws_event_stream = false;
             let mut is_json = false;
             let mut chunked = false;
             for h in resp.headers.iter() {
@@ -91,6 +94,9 @@ pub fn parse_response_head(buf: &[u8]) -> Option<ResponseHead> {
                     let v = h.value.to_ascii_lowercase();
                     if bytes_contains(&v, b"text/event-stream") {
                         is_event_stream = true;
+                    }
+                    if bytes_contains(&v, b"application/vnd.amazon.eventstream") {
+                        is_aws_event_stream = true;
                     }
                     if bytes_contains(&v, b"application/json") {
                         is_json = true;
@@ -105,6 +111,7 @@ pub fn parse_response_head(buf: &[u8]) -> Option<ResponseHead> {
             Some(ResponseHead {
                 status,
                 is_event_stream,
+                is_aws_event_stream,
                 is_json,
                 chunked,
             })

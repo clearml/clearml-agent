@@ -32,6 +32,7 @@ use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
 
+use crate::kiro;
 use crate::parser;
 
 /// Cap on bytes accumulated while hunting for the end of the response head.
@@ -49,12 +50,16 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// estimate — acceptable for the rare multi-megabyte non-streaming response.
 const JSON_CAP: usize = 1024 * 1024;
 
-/// LLM providers whose response `usage` schema we know how to read.
+/// LLM providers whose response wire we know how to read.
+///
+/// `Kiro` is AWS's Kiro CLI backend: its responses carry no token counts, so its
+/// tokens are always byte-estimated (see `crate::kiro`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
     OpenAi,
     Gemini,
+    Kiro,
 }
 
 /// Map a request `Host` to a known provider, or `None` if we don't have a
@@ -64,6 +69,7 @@ pub fn provider_for_host(host: &str) -> Option<Provider> {
         "api.anthropic.com" => Some(Provider::Anthropic),
         "api.openai.com" => Some(Provider::OpenAi),
         "generativelanguage.googleapis.com" => Some(Provider::Gemini),
+        h if kiro::is_runtime_host(h) => Some(Provider::Kiro),
         _ => None,
     }
 }
@@ -75,6 +81,8 @@ enum RespMode {
     Sse,
     /// `application/json` — accumulate then parse once.
     Json,
+    /// `application/vnd.amazon.eventstream` from Kiro 2.x — decoded by `kiro::Response`.
+    AwsEventStream,
     /// Anything else (or head we couldn't classify) — don't parse a body.
     Unknown,
 }
@@ -112,8 +120,13 @@ pub struct Finalized {
     /// and `None` for any non-SSE response — including the common consumer-wire
     /// case, where a `POST .../completion` returns a buffered JSON ack rather than
     /// an SSE stream, so the estimate falls back to the whole body. Unused when
-    /// usage is measured.
+    /// usage is measured. A Kiro event stream always sets it (assistant text +
+    /// tool-argument bytes): Kiro reports no tokens, so this is its only output
+    /// measure, and `Some` marks the response as a parsed generation.
     pub output_text_bytes: Option<u64>,
+    /// Kiro's `meteringEvent` charge for the request, in Kiro credits (its
+    /// billing unit). Diagnostic only; `None` for every other provider.
+    pub credits: Option<f64>,
 }
 
 /// Per-response usage scanner. One is created lazily on the first response
@@ -163,6 +176,10 @@ pub struct RespParse {
     /// Running sum of generated-text bytes when `count_output_text` is on.
     output_text_bytes: u64,
 
+    /// The Kiro decoder: its event stream (`RespMode::AwsEventStream`) and its
+    /// SSE (`RespMode::Sse` for `Provider::Kiro`).
+    kiro: kiro::Response,
+
     /// Set once we give up (unparseable/unknown head). Makes further `feed`
     /// calls cheap no-ops. `status` is preserved if it was already parsed.
     finished: bool,
@@ -188,6 +205,7 @@ impl RespParse {
             tool_call_names: Vec::new(),
             count_output_text: false,
             output_text_bytes: 0,
+            kiro: kiro::Response::default(),
             finished: false,
         }
     }
@@ -249,6 +267,8 @@ impl RespParse {
                     self.chunked = h.chunked;
                     self.mode = if h.is_event_stream {
                         RespMode::Sse
+                    } else if h.is_aws_event_stream && self.provider == Provider::Kiro {
+                        RespMode::AwsEventStream
                     } else if h.is_json {
                         RespMode::Json
                     } else {
@@ -279,6 +299,14 @@ impl RespParse {
     /// is parsed here once.
     pub fn finalize(&self) -> Finalized {
         match self.mode {
+            RespMode::Sse | RespMode::AwsEventStream if self.provider == Provider::Kiro => Finalized {
+                tool_calls: self.kiro.tool_call_names.len() as u64,
+                tool_call_names: self.kiro.tool_call_names.clone(),
+                model: self.kiro.model.clone(),
+                output_text_bytes: Some(self.kiro.output_text_bytes),
+                credits: self.kiro.credits,
+                ..Finalized::default()
+            },
             RespMode::Sse => Finalized {
                 tokens_in: self.measured_in,
                 tokens_out: self.measured_out,
@@ -288,7 +316,9 @@ impl RespParse {
                 tool_call_names: self.tool_call_names.clone(),
                 model: self.measured_model.clone(),
                 output_text_bytes: self.count_output_text.then_some(self.output_text_bytes),
+                credits: None,
             },
+            RespMode::AwsEventStream => Finalized::default(),
             RespMode::Json => match serde_json::from_slice::<Value>(&self.json_buf) {
                 Ok(v) => {
                     let u = extract_usage(self.provider, &v);
@@ -304,6 +334,7 @@ impl RespParse {
                         // Non-streaming bodies are the measured api.anthropic.com
                         // path (never estimated); leave text-byte counting to SSE.
                         output_text_bytes: None,
+                        credits: None,
                     }
                 }
                 Err(_) => Finalized::default(),
@@ -349,9 +380,18 @@ impl RespParse {
         match self.mode {
             RespMode::Sse => self.consume_sse(body),
             RespMode::Json => self.consume_json(body),
+            RespMode::AwsEventStream => {
+                if !self.kiro.feed(body) {
+                    // Not an event stream after all: stop, and report nothing
+                    // rather than a generation built from misread bytes.
+                    self.mode = RespMode::Unknown;
+                    self.give_up();
+                }
+            }
             RespMode::Unknown => {}
         }
     }
+
 
     fn consume_sse(&mut self, body: &[u8]) {
         self.line_buf.extend_from_slice(body);
@@ -376,6 +416,10 @@ impl RespParse {
             Some(p) => trim_ascii_start(p),
             None => return,
         };
+        if self.provider == Provider::Kiro {
+            self.kiro.feed_sse(payload);
+            return;
+        }
         // Cheap pre-filter: only `serde_json`-parse lines that could carry
         // usage, a tool call, or (until we've captured it) the served model.
         // "usage" is a substring of "usageMetadata", so it covers all three
@@ -453,6 +497,7 @@ impl RespParse {
         self.json_buf = Vec::new();
     }
 }
+
 
 /// Token usage extracted from one parsed provider JSON value. `None` per field
 /// so callers can merge with latest-wins semantics across streamed events.
@@ -585,6 +630,8 @@ fn extract_usage(provider: Provider, v: &Value) -> Usage {
             },
             None => Usage::default(),
         },
+        // Kiro's wire carries no token counts (see `RespMode::AwsEventStream`).
+        Provider::Kiro => Usage::default(),
     }
 }
 
@@ -611,6 +658,8 @@ fn extract_model(provider: Provider, v: &Value) -> Option<String> {
             .get("model")
             .or_else(|| v.get("response").and_then(|r| r.get("model"))),
         Provider::Gemini => v.get("modelVersion"),
+        // Kiro never echoes the served model; the request's `modelId` stands in.
+        Provider::Kiro => None,
     };
     let m = raw.and_then(Value::as_str)?.trim();
     (!m.is_empty()).then(|| m.to_string())
@@ -630,6 +679,7 @@ pub fn model_from_request(provider: Provider, body: &[u8], path: Option<&str>) -
             (!m.is_empty()).then(|| m.to_string())
         }
         Provider::Gemini => model_from_gemini_path(path?),
+        Provider::Kiro => kiro::model_from_request(body),
     }
 }
 
@@ -673,7 +723,7 @@ fn sse_output_delta_len(provider: Provider, v: &Value) -> u64 {
                 .map(|t| t.len() as u64)
                 .unwrap_or(0)
         }
-        Provider::OpenAi | Provider::Gemini => 0,
+        Provider::OpenAi | Provider::Gemini | Provider::Kiro => 0,
     }
 }
 
@@ -698,7 +748,7 @@ fn tool_use_names_sse_event(provider: Provider, v: &Value) -> Vec<String> {
             }
         }
         Provider::Gemini => gemini_function_names(v),
-        Provider::OpenAi => Vec::new(),
+        Provider::OpenAi | Provider::Kiro => Vec::new(),
     }
 }
 
@@ -740,6 +790,7 @@ fn tool_call_names_json(provider: Provider, v: &Value) -> Vec<String> {
             })
             .unwrap_or_default(),
         Provider::Gemini => gemini_function_names(v),
+        Provider::Kiro => Vec::new(),
     }
 }
 
@@ -899,6 +950,7 @@ pub fn conversation_fingerprint(provider: Provider, body: &[u8]) -> Option<Finge
             let sh = v.get("systemInstruction").map(hash_value).unwrap_or(0);
             (sh, contents.iter().map(hash_value).collect())
         }
+        Provider::Kiro => return None,
     };
     if turn_hashes.is_empty() {
         return None;

@@ -28,6 +28,7 @@ mod h2;
 mod hooks;
 mod init;
 mod inject;
+mod kiro;
 mod meter;
 mod parser;
 mod reentrancy;
