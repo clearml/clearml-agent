@@ -15,6 +15,7 @@ import psutil
 from .._vendor.pathlib2 import Path
 
 from clearml_agent.definitions import ENV_WORKER_TAGS, ENV_GPU_FRACTIONS
+from clearml_agent.helper.cgroup import get_cgroup_cpu_sample
 from clearml_agent.session import Session
 
 try:
@@ -96,6 +97,8 @@ class ResourceMonitor(object):
         self._gpustat_fail = 0
         self._gpustat = gpustat
         self._active_gpus = None
+        self._cgroup_cpu_enabled = True
+        self._cgroup_cpu_last = None  # (timestamp, usage_usec)
         self._default_gpu_utilization = session.config.get("agent.resource_monitoring.default_gpu_utilization", 100)
         # allow default_gpu_utilization as null in the config, in which case we don't log anything
         if self._default_gpu_utilization is not None:
@@ -464,12 +467,46 @@ class ResourceMonitor(object):
         self._readouts = {}
         self._num_readouts = 0
 
+    def _get_container_cpu_usage(self) -> Optional[float]:
+        """
+        :return: CPU usage of this container as a percentage of its CPU limit, or None when not running in a
+            container (or its cgroup files cannot be read), in which case machine-wide CPU usage is reported
+        """
+        if not self._cgroup_cpu_enabled:
+            return None
+        # noinspection PyBroadException
+        try:
+            sample = get_cgroup_cpu_sample()
+            if sample is None:
+                self._cgroup_cpu_enabled = False
+                log.info("No container cgroup found, CPU usage is reported for the whole machine")
+                return None
+            usage, cpus = sample
+            now = time()
+            last, self._cgroup_cpu_last = self._cgroup_cpu_last, (now, usage)
+            if not last:
+                log.info(
+                    "Container cgroup found, CPU usage is reported relative to "
+                    "the container's CPU allocation ({:g} CPUs)".format(cpus)
+                )
+                return None
+            if now <= last[0] or cpus <= 0:
+                return None
+            return min(100.0, max(0.0, (usage - last[1]) / 1e6 / (now - last[0]) / cpus * 100.0))
+        except Exception as ex:
+            self._cgroup_cpu_enabled = False
+            log.warning("Could not find container CPU stats ({}), defaulting to machine stats".format(ex))
+            return None
+
     def _machine_stats(self):
         """
         :return: machine stats dictionary, all values expressed in megabytes
         """
-        cpu_usage = psutil.cpu_percent(percpu=True)
-        stats = {"cpu_usage": sum(cpu_usage) / len(cpu_usage)}
+        cpu_usage = self._get_container_cpu_usage()
+        if cpu_usage is None:
+            per_cpu_usage = psutil.cpu_percent(percpu=True)
+            cpu_usage = sum(per_cpu_usage) / len(per_cpu_usage)
+        stats = {"cpu_usage": cpu_usage}
 
         virtual_memory = psutil.virtual_memory()
         stats["memory_used"] = BytesSizes.megabytes(virtual_memory.used)
