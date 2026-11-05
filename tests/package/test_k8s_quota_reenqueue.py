@@ -178,11 +178,12 @@ class _StopLoop(Exception):
 FOREVER = 1000
 
 
-def _run_tasks_loop(queued_tasks, quota_rejections, max_sleeps=20):
+def _run_tasks_loop(queued_tasks, quota_rejections, max_sleeps=20, strict_priority=True):
     """
     Run run_tasks_loop until a polling cycle finds nothing to launch (or after max_sleeps sleeps).
     queued_tasks: queue -> list of task ids, popped in order (a re-enqueued task goes back to the front)
     quota_rejections: task id -> number of launch attempts that raise ReenqueueTaskException
+    strict_priority: set on the ReenqueueTaskException raised
     Returns the glue, the task ids launch was attempted for, and the events service mock.
     """
     quota_rejections = dict(quota_rejections)
@@ -218,7 +219,9 @@ def _run_tasks_loop(queued_tasks, quota_rejections, max_sleeps=20):
         attempts.append(task_id)
         if quota_rejections.get(task_id, 0) > 0:
             quota_rejections[task_id] -= 1
-            raise ReenqueueTaskException("Kubernetes ResourceQuota exceeded (team-quota)")
+            ex = ReenqueueTaskException("Kubernetes ResourceQuota exceeded (team-quota)")
+            ex.strict_priority = strict_priority
+            raise ex
 
     sleeps = []
 
@@ -284,6 +287,21 @@ class RunTasksLoopTests(unittest.TestCase):
         self.assertEqual(1, events_service.send_log_events.call_count)
         # launched: a later wait (e.g. after being re-enqueued by a user) is logged again
         self.assertEqual({}, glue._reenqueued_tasks_msgs)
+
+    def test_lower_priority_queues_are_served_while_a_task_waits_without_strict_priority(self):
+        # a single sleep: only once nothing is left to launch, not after each attempt of the waiting task
+        _, attempts, _ = _run_tasks_loop(
+            {"high": ["gpu-task"], "low": ["cpu-1", "cpu-2"]}, {"gpu-task": FOREVER}, max_sleeps=1,
+            strict_priority=False,
+        )
+        # the waiting task is tried again before each launch from the lower priority queue
+        self.assertEqual(["gpu-task", "cpu-1", "gpu-task", "cpu-2", "gpu-task"], attempts)
+
+    def test_tasks_behind_it_in_its_queue_still_wait_without_strict_priority(self):
+        _, attempts, _ = _run_tasks_loop(
+            {"high": ["gpu-task", "gpu-task-2"], "low": ["cpu-1"]}, {"gpu-task": 2}, strict_priority=False
+        )
+        self.assertEqual(["gpu-task", "cpu-1", "gpu-task", "gpu-task", "gpu-task-2"], attempts)
 
 
 if __name__ == "__main__":

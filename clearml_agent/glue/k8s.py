@@ -1537,6 +1537,10 @@ class K8sIntegration(Worker):
                         else:
                             self._reenqueued_tasks_msgs.pop(task_id, None)
                         self.report_monitor(ResourceMonitor.StatusReport(queues=queues))
+                        if not ex.strict_priority:
+                            # Go on with the lower priority queues. The task is pulled again on the next pass, which
+                            # starts right away if one of them launches a task, or after the polling interval
+                            continue
                         # Lower priority queues wait until this task is launched (strict priority). Sleep before
                         # starting over, the task is back at the front of its queue and is pulled again right away
                         print("Sleeping for {:.1f} seconds".format(self._polling_interval))
