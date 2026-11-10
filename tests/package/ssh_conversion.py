@@ -16,6 +16,7 @@ from clearml_agent.helper.repo import VCS
         ("ftp://example.com/a/b/", None),
         ("github.com:foo/bar.git", "https://github.com/foo/bar.git"),
         ("git@github.com:foo/bar.git", "https://github.com/foo/bar.git"),
+        ("git@ssh.dev.azure.com:v3/org/project/repo", "https://dev.azure.com/org/project/_git/repo"),
         ("bitbucket.org:foo/bar.git", "https://bitbucket.org/foo/bar.git"),
         ("hg@bitbucket.org:foo/bar.git", "https://bitbucket.org/foo/bar.git"),
         ("ssh://bitbucket.org/foo/bar.git", "https://bitbucket.org/foo/bar.git"),
