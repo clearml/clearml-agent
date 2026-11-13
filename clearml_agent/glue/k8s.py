@@ -392,7 +392,7 @@ class K8sIntegration(Worker):
             self.log.debug(" - found {} pods in namespaces {}".format(current_pod_count, ", ".join(namespaces)))
             return current_pod_count, namespaces
         except Exception as ex:
-            self.log.debug("Failed getting used pods: {}", ex)
+            self.log.debug("Failed getting used pods: {}".format(ex))
             return -1, set([])
 
     def _is_same_tenant(self, task_session):
