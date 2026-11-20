@@ -10,11 +10,25 @@ from ..._vendor.pathlib2 import Path
 import shutil
 
 from clearml_agent.definitions import ENV_AGENT_FORCE_UV, PIP_EXTRA_INDICES, ENV_BOOTSTRAP_UV_EXEC
-from clearml_agent.helper.base import python_version_string, rm_tree
+from clearml_agent.helper.base import python_version_string, rm_tree, is_windows_platform
 from clearml_agent.helper.package.base import get_specific_package_version
 from clearml_agent.helper.package.pip_api.venv import VirtualenvPip
 from clearml_agent.helper.process import Argv, DEVNULL, check_if_command_exists, find_executable
 from clearml_agent.session import UV
+
+
+def venv_python_path(venv_path, python_version=None):
+    """ Return the python executable path inside a virtual environment, according to the OS """
+    if is_windows_platform():
+        return Path(venv_path) / "Scripts" / "python.exe"
+    return Path(venv_path) / "bin" / "python{}".format(python_version if python_version else "")
+
+
+def venv_uv_path(venv_path):
+    """ Return the uv executable path inside a virtual environment, according to the OS """
+    if is_windows_platform():
+        return Path(venv_path) / "Scripts" / "uv.exe"
+    return Path(venv_path) / "bin" / "uv"
 
 
 def prop_guard(prop, log_prop=None):
@@ -390,7 +404,7 @@ class UvAPI(VirtualenvPip):
     def get_python_command(self, extra=()):
         if self.lock_config and self.lockfile_path and self.is_installed:
             return self.lock_config.get_run_argv(
-                "run", "--python", str(self.lockfile_path / ".venv" / "bin" / "python"), "python", *extra, cwd=self.lockfile_path)
+                "run", "--python", str(venv_python_path(self.lockfile_path / ".venv")), "python", *extra, cwd=self.lockfile_path)
 
         # if not self.lock_config.get_venv_binary() and check_if_command_exists("uv"):
         #     return Argv("uv", "run", "--no-project", "--python", self.lock_config.get_venv_binary(), "python", *extra)
@@ -491,7 +505,7 @@ class UvAPI(VirtualenvPip):
             # raise ex
 
         self._created = True
-        self._bin = Path(self.path) / "bin" / "python{}".format(python_version if python_version else "3")
+        self._bin = venv_python_path(self.path, python_version if python_version else "3")
         self.lock_config.set_venv_binary(self._bin)
 
         return self
@@ -594,8 +608,9 @@ class UvAPI(VirtualenvPip):
                 self.lock_config.log.warning("failed installing uv: {}".format(ex))
 
             self.lock_config.set_binary(pip_venv.bin)
-            if (Path(self._uv_install_path) / "bin" / "uv").exists():
-                self.lock_config.set_uv_bin(Path(self._uv_install_path) / "bin" / "uv")
+            uv_path = venv_uv_path(self._uv_install_path)
+            if uv_path.exists():
+                self.lock_config.set_uv_bin(uv_path)
                 UvConfig.USE_UV_BIN = True
         else:
             print(
