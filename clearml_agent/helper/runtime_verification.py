@@ -72,7 +72,7 @@ def get_start_end_hours(hours):
         )
     except Exception as ex:
         print(
-            "Warning: hours interval '{}' is invalid, use intervals of the format <start>-<end>".format(
+            "Warning: hours interval '{}' is invalid, use intervals of the format <start>-<end> ({})".format(
                 hours, ex
             )
         )
