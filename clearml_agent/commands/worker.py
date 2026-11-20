@@ -458,7 +458,7 @@ def get_task_fields(session, task_id, fields: list, log=None) -> dict:
         return results
     except Exception as ex:
         if log:
-            log.error("Failed obtaining values for task fields {}: {}", fields, ex)
+            log.error("Failed obtaining values for task fields {}: {}".format(fields, ex))
         pass
     return {}
 
