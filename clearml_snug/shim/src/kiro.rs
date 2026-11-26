@@ -4,17 +4,18 @@
 //! (a tool turn is two requests), over one of two wires. Neither carries token
 //! counts, so a Kiro generation is always byte-estimated by the caller.
 //!
-//! kiro-cli 3.x: `POST /v1/responses`, the OpenAI Responses API. The JSON
-//! request names the `model`; the `text/event-stream` answer carries
+//! kiro-cli 3.x's v3 engine: `POST /v1/responses`, the OpenAI Responses API.
+//! The JSON request names the `model`; the `text/event-stream` answer carries
 //! `response.output_text.delta` and `response.function_call_arguments.delta`
 //! (the generated text and tool arguments), a `response.output_item.added`
 //! per `function_call`, and a closing `response.completed` whose `response`
 //! holds the served `model` and a `usage` of only `kiro:credits` and
 //! `kiro:context_usage_percentage`.
 //!
-//! kiro-cli 2.x: `POST /` with
-//! `x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`,
-//! a JSON request answered with an `application/vnd.amazon.eventstream` body.
+//! kiro-cli 2.x, and 3.x's default v2 engine: `POST /` with
+//! `x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+//! (`KiroRuntimeService.GenerateAssistantResponse` from 3.x), a JSON request
+//! answered with an `application/vnd.amazon.eventstream` body.
 //! The stream is binary frames, each a 12-byte prelude (total length, headers
 //! length, CRC), typed headers and a JSON payload. Its events:
 //! `assistantResponseEvent` (`content`, a text delta), `toolUseEvent` (one call

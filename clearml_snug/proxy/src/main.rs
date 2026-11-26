@@ -79,6 +79,7 @@ mod ca;
 mod claude_chat_cache;
 mod claude_cowork;
 mod dump;
+mod kiro_cache;
 
 use body_scan::{
     conversation_fingerprint, looks_like_sse, model_from_request, provider_for_host,
@@ -729,7 +730,7 @@ fn emit(
         rule.is_some() || shared.whitelist.default_action.eq_ignore_ascii_case("meter");
 
     let tokens_measured = fin.tokens_in.is_some() || fin.tokens_out.is_some();
-    let model = fin.model.clone().or(req_model);
+    let model = fin.model.clone().or_else(|| req_model.clone());
     // A host's UNMEASURED requests are byte-estimated only when its whitelist rule
     // opts in (`estimate_unmeasured`) AND the decoded request line matches the
     // rule's `completion_path` as a `POST` (`WhitelistRule::is_completion`). This
@@ -767,22 +768,33 @@ fn emit(
         // specs and editor context are resent on every call), output from the
         // streamed text and tool arguments. Kiro's server-side system prompt
         // never crosses the wire, so the input estimate undercounts by its size.
+        // The prompt prefix an earlier request carried is split out as cache read,
+        // and the rest of the prompt as cache write unless the served model is a
+        // `gpt` one (OpenAI bills no writes; `auto` serves Claude). See `kiro_cache`.
         let m = model.as_deref();
+        let gpt = m.is_some_and(|m| m.starts_with("gpt"));
         let tokenizer = match rule {
             Some(r) => r.tokenizer.as_str(),
-            None if m.is_some_and(|m| m.starts_with("gpt")) => tokenizer_for(Provider::OpenAi),
+            None if gpt => tokenizer_for(Provider::OpenAi),
             None => tokenizer_for(provider),
         };
         // A body past the scan cap was still forwarded whole; `bytes_tx` counts it
         // (plus the request head, small next to such a body).
         let in_bytes = if req_body.len() >= REQ_BODY_CAP { bytes_tx } else { req_body.len() as u64 };
         let out_bytes = fin.output_text_bytes.unwrap_or(0);
-        (
-            tokens::estimate_tokens(in_bytes, tokenizer, m),
-            tokens::estimate_tokens(out_bytes, tokenizer, m),
-            0,
-            0,
-        )
+        let tokens_out = tokens::estimate_tokens(out_bytes, tokenizer, m);
+        // The cache is scoped by the requested model: the served one is missing
+        // from a stream cut before its end, and from the v2 wire.
+        let cache_model = req_model.as_deref().or(m).unwrap_or("");
+        match kiro_cache::global().split(&plaintext_bytes(req_body), cache_model, !gpt, now_ms()) {
+            Some(s) => {
+                let fresh = tokens::estimate_tokens(s.fresh_bytes, tokenizer, m);
+                let read = tokens::estimate_tokens(s.cache_read_bytes, tokenizer, m);
+                let write = tokens::estimate_tokens(s.cache_write_bytes, tokenizer, m);
+                (fresh + read + write, tokens_out, read, write)
+            }
+            None => (tokens::estimate_tokens(in_bytes, tokenizer, m), tokens_out, 0, 0),
+        }
     } else if estimate_this {
         // Per-host tokenizer: a matched rule pins its estimator; fall back to the
         // provider default only if the rule somehow lacks one.
@@ -2827,6 +2839,44 @@ mod tests {
             }
             e => panic!("expected RequestCompleted, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn emit_splits_a_kiro_tool_turn_into_cache_read_and_write() {
+        // The second call of a tool turn resends the first call's prompt: that
+        // prefix is reported as cache read, the appended items as cache write.
+        // `emit` uses the process-wide cache, which other tests share: the unique
+        // `emit-split-` context keeps this test's prefixes its own.
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let shared = test_shared(tx);
+        let ctx = format!(r#"{{"role":"user","content":"emit-split-{}"}}"#, "x".repeat(20_000));
+        let body = |items: &str| {
+            format!(r#"{{"model":"auto","input":[{ctx}{items}],"tools":[],"stream":true}}"#).into_bytes()
+        };
+        let fin = body_scan::Finalized { output_text_bytes: Some(10), ..Default::default() };
+        let mut completed = Vec::new();
+        for (conn, req_body) in [(33, body("")), (34, body(r#",{"type":"function_call_output","output":"etc"}"#))] {
+            emit(
+                &shared, conn, Some(Provider::Kiro), "runtime.us-east-1.kiro.dev", now_ms(), Some(200),
+                req_body.len() as u64, 900, 900, &fin, Some("auto".to_string()), &req_body, Some("POST"),
+                Some("/v1/responses"),
+            );
+            let _ = rx.try_recv().expect("RequestStarted emitted");
+            match rx.try_recv().expect("RequestCompleted emitted") {
+                Event::RequestCompleted { tokens_in, cache_read_tokens, cache_write_tokens, .. } => {
+                    // The split keeps the all-fresh total, give or take each part's rounding.
+                    let whole = tokens::estimate_tokens(req_body.len() as u64, "claude", Some("auto"));
+                    assert!(tokens_in.abs_diff(whole) <= 2, "{tokens_in} vs {whole}");
+                    completed.push((cache_read_tokens, cache_write_tokens));
+                }
+                e => panic!("expected RequestCompleted, got {e:?}"),
+            }
+        }
+        let ((read1, write1), (read2, write2)) = (completed[0], completed[1]);
+        assert_eq!(read1, 0);
+        assert!(write1 > 6000, "{write1}");
+        assert_eq!(read2, write1);
+        assert!(write2 > 0 && write2 < 100, "{write2}");
     }
 
     #[test]

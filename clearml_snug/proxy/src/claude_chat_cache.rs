@@ -56,11 +56,11 @@ use crate::tokens;
 /// one-hour lifetime is opt-in, and the claude.ai wire does not show it being
 /// used). Each read refreshes it. A longer gap is counted as a new cache write,
 /// which prices a sparse chat conservatively rather than as a cheap read.
-const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+pub const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Below this the prefix is not cacheable (Anthropic requires at least ~1024
 /// tokens, ~3 KB of prose), so it stays fresh.
-const MIN_CACHEABLE_BYTES: u64 = 3072;
+pub const MIN_CACHEABLE_BYTES: u64 = 3072;
 
 /// Bytes per token of tool schemas, and the tokens a tool list adds on its own (the
 /// tool-use instructions), measured with Anthropic's `count_tokens` on a real
